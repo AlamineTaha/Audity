@@ -275,6 +275,17 @@ export class SalesforceAuthService {
   }
 
   /**
+   * Get all registered organization IDs from Redis
+   */
+  async getAllOrgIds(): Promise<string[]> {
+    await this.connect();
+    const keys = await this.redisClient.keys('org:*');
+    // Extract org IDs from keys (format: "org:00D000000000000AAA")
+    return keys.map(key => key.replace('org:', ''));
+  }
+
+
+  /**
    * Refresh access token for an organization
    * This is crucial for maintaining active sessions
    */
