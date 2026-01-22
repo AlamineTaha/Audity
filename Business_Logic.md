@@ -1,0 +1,1 @@
+Users can pay via 'Personal Key' or 'Enterprise OAuth'. If Enterprise, use the X-Goog-User-Project header.

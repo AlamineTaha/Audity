@@ -1,0 +1,16 @@
+# Project Context
+This is a Node.js (TypeScript) middleware application that acts as an "Automated Auditor" for a Salesforce Org.
+- We do NOT use local Git for Salesforce metadata.
+- Salesforce is the Source of Truth.
+- We use the Tooling API and Connect API to fetch metadata.
+
+# Coding Standards
+- Use `jsforce` for all Salesforce interactions.
+- Use `axios` for external AI calls (Vertex AI/Gemini).
+- STRICTLY Type all Salesforce API responses (create interfaces for `FlowMetadata`, `SetupAuditTrail`).
+- Never leak sensitive keys in logs. Use `dotenv`.
+
+# Architectural Rules
+1. **No Local State:** Do not assume we have a local copy of the Flow XML. Always fetch it fresh using `tooling.query()`.
+2. **Noise Reduction:** When diffing JSON/XML, always strip `<locationX>`, `<locationY>`, and `<processMetadataValues>` tags before sending to the LLM to save tokens.
+3. **Billing:** Always check the `X-Goog-User-Project` header logic for enterprise billing.
