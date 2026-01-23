@@ -177,7 +177,15 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  * /api/v1/analyze-permission:
  *   post:
  *     summary: Trace User Permissions
- *     description: Analyzes a specific user's permissions. Useful for Agentforce to answer 'Why can User X do Y?'.
+ *     description: |
+ *       Analyzes a specific user's permissions. Traces exactly which Profile or Permission Set grants a permission.
+ *       Useful for Agentforce to answer 'Why can User X do Y?'.
+ *       
+ *       **System Permissions:** Supports natural language queries (e.g., "create report", "export reports", "modify all data") 
+ *       or exact API names (e.g., "PermissionsCreateReport", "PermissionsExportReport").
+ *       
+ *       **Object Permissions:** Use format "Action Object" (e.g., "Edit Account", "Delete Lead", "Create Contact", "Read Opportunity").
+ *       Supported actions: Read, Create, Edit, Delete, ViewAll, ModifyAll.
  *     tags:
  *       - Security
  *     requestBody:
@@ -188,19 +196,27 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  *             type: object
  *             required:
  *               - userId
+ *               - orgId
  *             properties:
  *               userId:
  *                 type: string
- *                 description: Salesforce User ID or Username
- *               permissionName:
- *                 type: string
- *                 description: Optional: Specific permission api name to check
+ *                 description: Salesforce User ID (18-character) or Username (email)
+ *                 example: "005J6000002RB2uIAG"
  *               orgId:
  *                 type: string
  *                 description: Salesforce Organization ID
+ *                 example: "00DJ6000001H7etMAC"
+ *               permissionName:
+ *                 type: string
+ *                 description: |
+ *                   Permission to check. Supports:
+ *                   - System Permissions: natural language (e.g., "create report", "export reports") or exact API name (e.g., "PermissionsCreateReport")
+ *                   - Object Permissions: format "Action Object" (e.g., "Edit Account", "Delete Lead", "Create Contact")
+ *                   If not provided, returns basic user info without permission analysis.
+ *                 example: "Edit Account"
  *     responses:
  *       200:
- *         description: Analysis result
+ *         description: Permission analysis result
  *         content:
  *           application/json:
  *             schema:
@@ -208,17 +224,50 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  *               properties:
  *                 username:
  *                   type: string
- *                 permissionSets:
- *                   type: integer
- *                 riskAnalysis:
+ *                   description: User's full name
+ *                   example: "Alice Smith"
+ *                 userId:
  *                   type: string
+ *                   description: Salesforce User ID
+ *                   example: "005J6000002RB2uIAG"
+ *                 checkingPermission:
+ *                   type: string
+ *                   description: The resolved API name of the permission checked
+ *                   example: "PermissionsCreateReport"
+ *                 resolvedLabel:
+ *                   type: string
+ *                   description: Human-readable label of the permission checked
+ *                   example: "Create Report"
+ *                 hasAccess:
+ *                   type: boolean
+ *                   description: Whether the user has the requested permission
+ *                   example: true
+ *                 sources:
+ *                   type: array
+ *                   description: List of Profiles/Permission Sets that grant this permission
+ *                   items:
+ *                     type: string
+ *                   example: ["Profile: System Administrator", "Permission Set: Marketing Manager"]
+ *                 explanation:
+ *                   type: string
+ *                   description: Human-readable explanation of the permission analysis
+ *                   example: "User can do this because it is granted by: Profile: System Administrator, Permission Set: Marketing Manager"
  *       400:
- *         description: Bad request - missing required fields
+ *         description: Bad request - missing required fields or invalid JSON
+ *       404:
+ *         description: User not found
  *       500:
  *         description: Internal server error
  */
 router.post('/analyze-permission', async (req: Request, res: Response) => {
   try {
+    // Validate request body exists
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({
+        error: 'Invalid request body. Expected JSON object.',
+      });
+    }
+
     const { userId, permissionName, orgId } = req.body;
 
     if (!userId) {
@@ -245,6 +294,7 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
           username: analysis.username,
           userId: analysis.userId,
           checkingPermission: analysis.checkingPermission,
+          resolvedLabel: analysis.resolvedLabel,
           hasAccess: analysis.hasAccess,
           sources: analysis.sources,
           explanation: analysis.explanation,
