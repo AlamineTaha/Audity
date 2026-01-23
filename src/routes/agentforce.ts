@@ -59,6 +59,29 @@ const router = Router();
  *                   items:
  *                     type: string
  *                   example: ["Added new decision element", "Modified field update logic"]
+ *                 revertOptions:
+ *                   type: object
+ *                   description: Safe-revert options for Flow version management
+ *                   properties:
+ *                     summary:
+ *                       type: string
+ *                       description: Summary of changes detected
+ *                       example: "5 change(s) detected today."
+ *                     versionsToday:
+ *                       type: array
+ *                       description: List of version numbers modified today
+ *                       items:
+ *                         type: integer
+ *                       example: [39, 38, 37, 36, 35]
+ *                     recommendedStableVersion:
+ *                       type: integer
+ *                       nullable: true
+ *                       description: Recommended stable version number before today's changes
+ *                       example: 34
+ *                     revertPrompt:
+ *                       type: string
+ *                       description: Prompt message for revert action
+ *                       example: "Would you like to activate Version 34 (Last Stable), a specific version, or keep the current changes?"
  *       400:
  *         description: Bad request - missing required fields
  *       404:
@@ -116,12 +139,35 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       settings
     );
 
+    // Get versions modified today for revert options
+    const versionsToday = await salesforceService.getFlowVersionsInTimeWindow(orgId, flowName, 24);
+    const versionNumbersToday = versionsToday.map(v => v.versionNumber);
+    const recommendedStableVersion = await salesforceService.findLastStableVersion(orgId, flowName, 24);
+
+    // Build revert prompt
+    let revertPrompt = '';
+    if (versionNumbersToday.length > 0) {
+      if (recommendedStableVersion) {
+        revertPrompt = `Would you like to activate Version ${recommendedStableVersion} (Last Stable), a specific version, or keep the current changes?`;
+      } else {
+        revertPrompt = `Would you like to activate a specific version or keep the current changes?`;
+      }
+    } else {
+      revertPrompt = 'No changes detected today. No revert action needed.';
+    }
+
     // Return response
     const response: AnalyzeFlowResponse = {
       success: true,
       flowName: diff.flowName,
       summary: diff.summary,
       changes: diff.changes,
+      revertOptions: {
+        summary: `${versionNumbersToday.length} change(s) detected today.`,
+        versionsToday: versionNumbersToday,
+        recommendedStableVersion,
+        revertPrompt,
+      },
     };
 
     res.json(response);

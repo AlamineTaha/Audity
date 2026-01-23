@@ -650,16 +650,84 @@ export class SalesforceService {
   }
 
   /**
+   * Get Flow versions modified within a specific timeframe
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @param hours Number of hours to look back (default: 24 for "today")
+   * @returns Array of version information
+   */
+  async getFlowVersionsInTimeWindow(
+    orgId: string,
+    flowApiName: string,
+    hours: number = 24
+  ): Promise<Array<{
+    versionNumber: number;
+    modifiedBy: string;
+    timestamp: string;
+    status: string;
+    versionId: string;
+  }>> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    // Step 1: Find the Container ID
+    const defQuery = `SELECT Id, DeveloperName FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
+    const defResult = await tooling.query<any>(defQuery);
+    
+    if (!defResult.records || defResult.records.length === 0) {
+      return [];
+    }
+    const definitionId = defResult.records[0].Id;
+
+    // Step 2: Calculate cutoff time
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - hours);
+    const cutoffTimeStr = cutoffTime.toISOString();
+
+    // Step 3: Query Flow versions modified within the time window
+    const flowQuery = `
+      SELECT Id, MasterLabel, VersionNumber, Status, LastModifiedDate, LastModifiedBy.Name
+      FROM Flow 
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        AND LastModifiedDate >= ${cutoffTimeStr}
+      ORDER BY VersionNumber DESC
+    `;
+
+    const result = await tooling.query<any>(flowQuery);
+    
+    if (!result.records || result.records.length === 0) {
+      return [];
+    }
+
+    return result.records.map((record: any) => ({
+      versionNumber: record.VersionNumber,
+      modifiedBy: record.LastModifiedBy?.Name || 'Unknown',
+      timestamp: record.LastModifiedDate,
+      status: record.Status,
+      versionId: record.Id,
+    }));
+  }
+
+  /**
    * Corrected getFlowMetadata
    * 1. Gets the Container ID (FlowDefinition)
    * 2. Gets the Version list (Flow)
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @param includeTimeWindow If true, also returns versions modified today
    */
-  async getFlowMetadata(orgId: string, flowApiName: string): Promise<FlowMetadata | null> {
+  async getFlowMetadata(
+    orgId: string,
+    flowApiName: string,
+    includeTimeWindow?: boolean
+  ): Promise<FlowMetadata | null> {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
   
     // Step 1: Find the Container ID using the API Name
-    const defQuery = `SELECT Id, DeveloperName FROM FlowDefinition WHERE DeveloperName = '${flowApiName}'`;
+    const defQuery = `SELECT Id, DeveloperName FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
     const defResult = await tooling.query<any>(defQuery);
     
     if (!defResult.records || defResult.records.length === 0) {
@@ -672,7 +740,7 @@ export class SalesforceService {
     const flowQuery = `
       SELECT Id, MasterLabel, VersionNumber, Status, DefinitionId
       FROM Flow 
-      WHERE DefinitionId = '${definitionId}'
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
       ORDER BY VersionNumber DESC
       LIMIT 1
     `;
@@ -685,14 +753,158 @@ export class SalesforceService {
   
     const latestVersion = result.records[0];
   
-    return {
+    const metadata: FlowMetadata = {
       Id: definitionId, // The Container ID
       ApiName: flowApiName,
       Label: latestVersion.MasterLabel,
       VersionNumber: latestVersion.VersionNumber,
       Status: latestVersion.Status,
       LatestVersionId: latestVersion.Id, // The ID of the actual Flow version record
-    } as FlowMetadata;
+    };
+
+    // If requested, add time window versions
+    if (includeTimeWindow) {
+      const versionsToday = await this.getFlowVersionsInTimeWindow(orgId, flowApiName, 24);
+      (metadata as any).versionsToday = versionsToday;
+    }
+
+    return metadata;
+  }
+
+  /**
+   * Check revert impact by comparing Active version with Target version
+   * Identifies potential issues like deleted fields/objects or active sessions
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @param targetVersionNumber Target version number to revert to
+   * @returns Impact assessment with warnings
+   */
+  async checkRevertImpact(
+    orgId: string,
+    flowApiName: string,
+    targetVersionNumber: number
+  ): Promise<{
+    warnings: string[];
+    activeSessions: number;
+    canRevert: boolean;
+  }> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    // Step 1: Get Flow Definition ID
+    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
+    const defResult = await tooling.query<any>(defQuery);
+    
+    if (!defResult.records || defResult.records.length === 0) {
+      throw new Error(`Flow not found: ${flowApiName}`);
+    }
+    const definitionId = defResult.records[0].Id;
+
+    // Step 2: Get Active version
+    const activeVersionQuery = `
+      SELECT Id, VersionNumber, Metadata
+      FROM Flow
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        AND Status = 'Active'
+      LIMIT 1
+    `;
+    const activeResult = await tooling.query<any>(activeVersionQuery);
+    
+    if (!activeResult.records || activeResult.records.length === 0) {
+      throw new Error(`No active version found for flow: ${flowApiName}`);
+    }
+    const activeVersion = activeResult.records[0];
+    const activeMetadata = activeVersion.Metadata || {};
+
+    // Step 3: Get Target version
+    const targetVersionQuery = `
+      SELECT Id, VersionNumber, Metadata
+      FROM Flow
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        AND VersionNumber = ${targetVersionNumber}
+      LIMIT 1
+    `;
+    const targetResult = await tooling.query<any>(targetVersionQuery);
+    
+    if (!targetResult.records || targetResult.records.length === 0) {
+      throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowApiName}`);
+    }
+    const targetMetadata = targetResult.records[0].Metadata || {};
+
+    // Step 4: Extract field and object references from metadata
+    const extractReferences = (metadata: any): { fields: Set<string>; objects: Set<string> } => {
+      const fields = new Set<string>();
+      const objects = new Set<string>();
+      
+      // Recursively search for field and object references
+      const searchMetadata = (obj: any) => {
+        if (!obj || typeof obj !== 'object') {
+          return;
+        }
+
+        for (const [key, value] of Object.entries(obj)) {
+          // Look for field references (format: ObjectName.FieldName or $Record.FieldName)
+          if (key === 'field' || key === 'fieldReference' || key === 'fieldPath') {
+            if (typeof value === 'string') {
+              const parts = value.split('.');
+              if (parts.length >= 2) {
+                objects.add(parts[0]);
+                fields.add(value);
+              }
+            }
+          }
+          
+          // Look for object references
+          if (key === 'object' || key === 'objectReference' || key === 'sobjectType') {
+            if (typeof value === 'string') {
+              objects.add(value);
+            }
+          }
+
+          // Recursively search nested objects
+          if (typeof value === 'object' && value !== null) {
+            searchMetadata(value);
+          }
+        }
+      };
+
+      searchMetadata(metadata);
+      return { fields, objects };
+    };
+
+    const activeRefs = extractReferences(activeMetadata);
+    const targetRefs = extractReferences(targetMetadata);
+
+    // Step 5: Find fields/objects in active version that don't exist in target version
+    const warnings: string[] = [];
+    
+    // Check for new fields in active version
+    const newFields = Array.from(activeRefs.fields).filter(field => !targetRefs.fields.has(field));
+    if (newFields.length > 0) {
+      warnings.push(
+        `Warning: Reverting to Version ${targetVersionNumber} may fail if it references fields that have since been deleted or modified. ` +
+        `Active version uses fields not present in target version: ${newFields.slice(0, 5).join(', ')}${newFields.length > 5 ? '...' : ''}`
+      );
+    }
+
+    // Check for new objects in active version
+    const newObjects = Array.from(activeRefs.objects).filter(obj => !targetRefs.objects.has(obj));
+    if (newObjects.length > 0) {
+      warnings.push(
+        `Warning: Active version references objects not present in target version: ${newObjects.slice(0, 5).join(', ')}${newObjects.length > 5 ? '...' : ''}`
+      );
+    }
+
+    // Step 6: Mock active sessions count (in real implementation, query FlowInterview)
+    // Note: FlowInterview query requires special permissions and may not be available
+    const activeSessions = 5; // Mock value as specified
+
+    return {
+      warnings,
+      activeSessions,
+      canRevert: warnings.length === 0, // Can revert if no warnings
+    };
   }
 
   /**
@@ -720,6 +932,190 @@ export class SalesforceService {
     // You do NOT need JSON.parse() here usually.
     console.log(result)
     return result.records[0].Metadata; 
+  }
+
+  /**
+   * Find the last stable version before a specific time window
+   * Used for batch revert operations
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @param hours Number of hours to look back (default: 24 for "today")
+   * @returns Version number of the last stable version before the time window, or null if not found
+   */
+  async findLastStableVersion(
+    orgId: string,
+    flowApiName: string,
+    hours: number = 24
+  ): Promise<number | null> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    // Step 1: Find the Container ID
+    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
+    const defResult = await tooling.query<any>(defQuery);
+    
+    if (!defResult.records || defResult.records.length === 0) {
+      return null;
+    }
+    const definitionId = defResult.records[0].Id;
+
+    // Step 2: Calculate cutoff time
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - hours);
+    const cutoffTimeStr = cutoffTime.toISOString();
+
+    // Step 3: Find the last version modified BEFORE the cutoff time
+    const stableVersionQuery = `
+      SELECT VersionNumber
+      FROM Flow
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        AND LastModifiedDate < ${cutoffTimeStr}
+      ORDER BY VersionNumber DESC
+      LIMIT 1
+    `;
+
+    const result = await tooling.query<any>(stableVersionQuery);
+    
+    if (!result.records || result.records.length === 0) {
+      return null;
+    }
+
+    return result.records[0].VersionNumber;
+  }
+
+  /**
+   * Activate a specific Flow version (Safe-Revert)
+   * This method ONLY changes status - it does NOT delete anything
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @param targetVersionNumber Target version number to activate
+   * @returns Success status and details
+   */
+  async activateSpecificVersion(
+    orgId: string,
+    flowApiName: string,
+    targetVersionNumber: number
+  ): Promise<{
+    success: boolean;
+    message: string;
+    previousActiveVersion: number;
+    newActiveVersion: number;
+  }> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    // Step 1: Get Flow Definition ID
+    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
+    const defResult = await tooling.query<any>(defQuery);
+    
+    if (!defResult.records || defResult.records.length === 0) {
+      throw new Error(`Flow not found: ${flowApiName}`);
+    }
+    const definitionId = defResult.records[0].Id;
+
+    // Step 2: Find the CURRENT Active version
+    const activeVersionQuery = `
+      SELECT Id, VersionNumber
+      FROM Flow
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        AND Status = 'Active'
+      LIMIT 1
+    `;
+    const activeResult = await tooling.query<any>(activeVersionQuery);
+    
+    if (!activeResult.records || activeResult.records.length === 0) {
+      throw new Error(`No active version found for flow: ${flowApiName}`);
+    }
+    const currentActiveId = activeResult.records[0].Id;
+    const currentActiveVersion = activeResult.records[0].VersionNumber;
+
+    // Step 3: Find the TARGET version
+    const targetVersionQuery = `
+      SELECT Id, VersionNumber
+      FROM Flow
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        AND VersionNumber = ${targetVersionNumber}
+      LIMIT 1
+    `;
+    const targetResult = await tooling.query<any>(targetVersionQuery);
+    
+    if (!targetResult.records || targetResult.records.length === 0) {
+      throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowApiName}`);
+    }
+    const targetVersionId = targetResult.records[0].Id;
+
+    // If target is already active, no action needed
+    if (currentActiveVersion === targetVersionNumber) {
+      return {
+        success: true,
+        message: `Version ${targetVersionNumber} is already active.`,
+        previousActiveVersion: currentActiveVersion,
+        newActiveVersion: targetVersionNumber,
+      };
+    }
+
+    // Step 4: Patch CURRENT Active version to 'Obsolete'
+    await tooling.sobject('Flow').update({
+      Id: currentActiveId,
+      Status: 'Obsolete',
+    });
+
+    // Step 5: Patch TARGET version to 'Active'
+    await tooling.sobject('Flow').update({
+      Id: targetVersionId,
+      Status: 'Active',
+    });
+
+    return {
+      success: true,
+      message: `Successfully activated Version ${targetVersionNumber}. Previous active version ${currentActiveVersion} set to Obsolete.`,
+      previousActiveVersion: currentActiveVersion,
+      newActiveVersion: targetVersionNumber,
+    };
+  }
+
+  /**
+   * Batch revert: Revert all changes made today by activating the last stable version
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @param hours Number of hours to look back (default: 24 for "today")
+   * @returns Success status and details
+   */
+  async batchRevertTodayChanges(
+    orgId: string,
+    flowApiName: string,
+    hours: number = 24
+  ): Promise<{
+    success: boolean;
+    message: string;
+    stableVersion: number | null;
+    previousActiveVersion: number;
+  }> {
+    const stableVersion = await this.findLastStableVersion(orgId, flowApiName, hours);
+    
+    if (!stableVersion) {
+      throw new Error(`No stable version found before the last ${hours} hours for flow: ${flowApiName}`);
+    }
+
+    // Get current active version before revert
+    const flowMetadata = await this.getFlowMetadata(orgId, flowApiName);
+    if (!flowMetadata) {
+      throw new Error(`Flow not found: ${flowApiName}`);
+    }
+    const previousActiveVersion = flowMetadata.VersionNumber;
+
+    // Activate the stable version
+    const result = await this.activateSpecificVersion(orgId, flowApiName, stableVersion);
+
+    return {
+      success: result.success,
+      message: `Batch revert completed: Activated Version ${stableVersion} (Last Stable). ${result.message}`,
+      stableVersion,
+      previousActiveVersion,
+    };
   }
 
   /**
