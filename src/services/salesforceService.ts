@@ -222,7 +222,7 @@ export class SalesforceService {
     const objectPermissionQuery = `
       SELECT Parent.Id, Parent.Label, Parent.IsOwnedByProfile, Parent.Profile.Name,
              PermissionsRead, PermissionsCreate, PermissionsEdit, PermissionsDelete,
-             PermissionsViewAll, PermissionsModifyAll
+             PermissionsViewAllRecords, PermissionsModifyAllRecords
       FROM ObjectPermissions
       WHERE ParentId IN (${permissionSetIdsStr})
         AND SobjectType = '${sanitizedObjectName}'
@@ -261,8 +261,8 @@ export class SalesforceService {
             { field: 'PermissionsCreate', name: 'Create' },
             { field: 'PermissionsEdit', name: 'Edit' },
             { field: 'PermissionsDelete', name: 'Delete' },
-            { field: 'PermissionsViewAll', name: 'ViewAll' },
-            { field: 'PermissionsModifyAll', name: 'ModifyAll' },
+            { field: 'PermissionsViewAllFields', name: 'ViewAll' },
+            { field: 'PermissionsModifyAllFields', name: 'ModifyAll' },
           ];
 
           for (const action of actions) {
