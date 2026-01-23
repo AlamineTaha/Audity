@@ -22,6 +22,19 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Error handling middleware for JSON parsing errors
+app.use((err: Error, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && 'body' in err) {
+    res.status(400).json({
+      error: 'Invalid JSON in request body',
+      details: err.message,
+      hint: 'Please check for missing commas, quotes, or brackets in your JSON payload.',
+    });
+    return;
+  }
+  next(err);
+});
+
 // Swagger/OpenAPI configuration
 const swaggerOptions: swaggerJsdoc.Options = {
   definition: {
@@ -199,7 +212,7 @@ const swaggerOptions: swaggerJsdoc.Options = {
       '/api/v1/analyze-permission': {
         post: {
           summary: 'Trace User Permissions',
-          description: "Analyzes a specific user's permissions. Useful for Agentforce to answer 'Why can User X do Y?'.",
+          description: 'Analyzes a specific user\'s System Permissions. Traces exactly which Profile or Permission Set grants a permission. Supports natural language queries (e.g., "create report", "export reports") or exact API names (e.g., "PermissionsCreateReport"). Note: Currently only supports System Permissions (not Object/Field permissions).',
           operationId: 'analyzePermission',
           tags: ['Security'],
           requestBody: {
@@ -208,10 +221,23 @@ const swaggerOptions: swaggerJsdoc.Options = {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['userId'],
+                  required: ['userId', 'orgId'],
                   properties: {
-                    userId: { type: 'string', description: 'Salesforce User ID or Username' },
-                    permissionName: { type: 'string', description: 'Optional: Specific permission api name to check' },
+                    userId: { 
+                      type: 'string', 
+                      description: 'Salesforce User ID (18-character) or Username (email)',
+                      example: '005J6000002RB2uIAG',
+                    },
+                    orgId: { 
+                      type: 'string', 
+                      description: 'Salesforce Organization ID',
+                      example: '00DJ6000001H7etMAC',
+                    },
+                    permissionName: { 
+                      type: 'string', 
+                      description: 'System Permission to check. Supports natural language (e.g., "create report", "export reports") or exact API name (e.g., "PermissionsCreateReport"). If not provided, returns basic user info.',
+                      example: 'create report',
+                    },
                   },
                 },
               },
@@ -219,19 +245,56 @@ const swaggerOptions: swaggerJsdoc.Options = {
           },
           responses: {
             '200': {
-              description: 'Analysis result',
+              description: 'Permission analysis result',
               content: {
                 'application/json': {
                   schema: {
                     type: 'object',
                     properties: {
-                      username: { type: 'string' },
-                      permissionSets: { type: 'integer' },
-                      riskAnalysis: { type: 'string' },
+                      username: { 
+                        type: 'string',
+                        description: 'User\'s full name',
+                        example: 'Alice Smith',
+                      },
+                      userId: { 
+                        type: 'string',
+                        description: 'Salesforce User ID',
+                        example: '005J6000002RB2uIAG',
+                      },
+                      checkingPermission: { 
+                        type: 'string',
+                        description: 'The resolved API name of the permission checked',
+                        example: 'PermissionsCreateReport',
+                      },
+                      hasAccess: { 
+                        type: 'boolean',
+                        description: 'Whether the user has the requested permission',
+                        example: true,
+                      },
+                      sources: { 
+                        type: 'array',
+                        description: 'List of Profiles/Permission Sets that grant this permission',
+                        items: { type: 'string' },
+                        example: ['Profile: System Administrator', 'Permission Set: Marketing Manager'],
+                      },
+                      explanation: { 
+                        type: 'string',
+                        description: 'Human-readable explanation of the permission analysis',
+                        example: 'User can do this because it is granted by: Profile: System Administrator, Permission Set: Marketing Manager',
+                      },
                     },
                   },
                 },
               },
+            },
+            '400': {
+              description: 'Bad request - missing required fields or invalid JSON',
+            },
+            '404': {
+              description: 'User not found',
+            },
+            '500': {
+              description: 'Internal server error',
             },
           },
         },
