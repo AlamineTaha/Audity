@@ -185,7 +185,15 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  *       or exact API names (e.g., "PermissionsCreateReport", "PermissionsExportReport").
  *       
  *       **Object Permissions:** Use format "Action Object" (e.g., "Edit Account", "Delete Lead", "Create Contact", "Read Opportunity").
- *       Supported actions: Read, Create, Edit, Delete, ViewAll, ModifyAll.
+ *       **Field Permissions:** Use format "Action Object Field" (e.g., "Edit Account Description", "Read Contact Email").
+ *       
+ *       **Action Keywords:** Use these exact strings for the action parameter:
+ *       - 'Read' - Check read access
+ *       - 'Create' - Check create access
+ *       - 'Edit' - Check edit access
+ *       - 'Delete' - Check delete access
+ *       - 'ViewAll' - Check view all records access (bypasses sharing)
+ *       - 'ModifyAll' - Check modify all records access (god mode)
  *     tags:
  *       - Security
  *     requestBody:
@@ -252,6 +260,19 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  *                   type: string
  *                   description: Human-readable explanation of the permission analysis
  *                   example: "User can do this because it is granted by: Profile: System Administrator, Permission Set: Marketing Manager"
+ *                 riskAnalysis:
+ *                   type: object
+ *                   description: Risk assessment for the permission
+ *                   properties:
+ *                     riskLevel:
+ *                       type: string
+ *                       enum: [LOW, MEDIUM, HIGH, CRITICAL]
+ *                       description: Risk level of the permission
+ *                       example: "HIGH"
+ *                     riskReason:
+ *                       type: string
+ *                       description: Explanation of why this risk level was assigned
+ *                       example: "User has 'View All Records' which allows them to see every record in the Account object, regardless of sharing rules."
  *       400:
  *         description: Bad request - missing required fields or invalid JSON
  *       404:
@@ -298,6 +319,7 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
           hasAccess: analysis.hasAccess,
           sources: analysis.sources,
           explanation: analysis.explanation,
+          riskAnalysis: analysis.riskAnalysis,
         });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Internal server error';

@@ -183,13 +183,92 @@ export class SalesforceService {
   }
 
   /**
+   * Evaluate risk level for permissions
+   * 
+   * @param type Type of permission: 'Object', 'Field', or 'System'
+   * @param permissions Permission data object
+   * @param objectApiName Object API name (for Object/Field types)
+   * @param fieldApiName Field API name (for Field type)
+   * @returns Risk assessment object
+   */
+  private evaluateRisk(
+    type: 'Object' | 'Field' | 'System',
+    permissions: any,
+    objectApiName?: string,
+    fieldApiName?: string
+  ): { riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; riskReason: string } {
+    if (type === 'Object') {
+      // Check for ModifyAllRecords (God Mode)
+      if (permissions.PermissionsModifyAllRecords === true) {
+        return {
+          riskLevel: 'CRITICAL',
+          riskReason: `User has 'Modify All Records' which allows them to edit and delete every record in the ${objectApiName} object, regardless of sharing rules. This is the highest level of access.`,
+        };
+      }
+
+      // Check for ViewAllRecords (Bypasses Sharing)
+      if (permissions.PermissionsViewAllRecords === true) {
+        return {
+          riskLevel: 'HIGH',
+          riskReason: `User has 'View All Records' which allows them to see every record in the ${objectApiName} object, regardless of sharing rules.`,
+        };
+      }
+
+      // Check for Delete on core objects (Data Loss Risk)
+      const coreObjects = ['Account', 'Contact', 'Opportunity', 'Case', 'Lead'];
+      if (permissions.PermissionsDelete === true && objectApiName && coreObjects.includes(objectApiName)) {
+        return {
+          riskLevel: 'MEDIUM',
+          riskReason: `User has 'Delete' permission on ${objectApiName}, a core business object. This poses a data loss risk if misused.`,
+        };
+      }
+
+      return {
+        riskLevel: 'LOW',
+        riskReason: 'Standard CRUD permissions with no elevated access.',
+      };
+    }
+
+    if (type === 'Field') {
+      // Check for PII-sensitive fields with Edit access
+      const piiKeywords = ['ssn', 'salary', 'revenue', 'phone', 'email', 'address', 'credit', 'bank'];
+      const fieldNameLower = (fieldApiName || '').toLowerCase();
+      const fieldLabelLower = (permissions.fieldLabel || '').toLowerCase();
+
+      if (permissions.PermissionsEdit === true) {
+        const isPIIField = piiKeywords.some(keyword => 
+          fieldNameLower.includes(keyword) || fieldLabelLower.includes(keyword)
+        );
+
+        if (isPIIField) {
+          return {
+            riskLevel: 'HIGH',
+            riskReason: `User has 'Edit' access to ${fieldApiName} field which contains Personally Identifiable Information (PII). This requires careful monitoring.`,
+          };
+        }
+      }
+
+      return {
+        riskLevel: 'LOW',
+        riskReason: 'Standard field-level permissions.',
+      };
+    }
+
+    // System Permission - default to LOW (can be enhanced later)
+    return {
+      riskLevel: 'LOW',
+      riskReason: 'System permission assessed.',
+    };
+  }
+
+  /**
    * Check Object-level permissions for a user
    * Returns ALL CRUD rights summary for the object
    * 
    * @param conn jsforce Connection instance
    * @param objectApiName Salesforce object API name (e.g., "Account", "Contact")
    * @param allPermissionSetIds Array of Permission Set IDs (including Profile-owned)
-   * @returns Object with CRUD rights summary and sources
+   * @returns Object with CRUD rights summary, sources, and risk assessment
    */
   private async checkObjectPermission(
     conn: any,
@@ -199,6 +278,7 @@ export class SalesforceService {
     crudRights: string[];
     sources: Record<string, string[]>; // Map of action -> sources
     allSources: string[]; // All unique sources
+    riskAssessment: { riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; riskReason: string };
   }> {
     // Resolve object name with fuzzy matching
     const resolvedObject = await this.resolveObjectName(conn, objectApiName);
@@ -213,6 +293,10 @@ export class SalesforceService {
         crudRights: [],
         sources: {},
         allSources: [],
+        riskAssessment: {
+          riskLevel: 'LOW',
+          riskReason: 'No permissions found.',
+        },
       };
     }
 
@@ -241,6 +325,11 @@ export class SalesforceService {
       };
       const allSourcesSet = new Set<string>();
 
+      let highestRisk: { riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; riskReason: string } = {
+        riskLevel: 'LOW',
+        riskReason: 'No permissions found.',
+      };
+
       if (result.records && result.records.length > 0) {
         for (const record of result.records) {
           const isOwnedByProfile = record.Parent?.IsOwnedByProfile === true;
@@ -261,8 +350,8 @@ export class SalesforceService {
             { field: 'PermissionsCreate', name: 'Create' },
             { field: 'PermissionsEdit', name: 'Edit' },
             { field: 'PermissionsDelete', name: 'Delete' },
-            { field: 'PermissionsViewAllFields', name: 'ViewAll' },
-            { field: 'PermissionsModifyAllFields', name: 'ModifyAll' },
+            { field: 'PermissionsViewAllRecords', name: 'ViewAll' },
+            { field: 'PermissionsModifyAllRecords', name: 'ModifyAll' },
           ];
 
           for (const action of actions) {
@@ -275,6 +364,15 @@ export class SalesforceService {
               }
             }
           }
+
+          // Evaluate risk for this record
+          const risk = this.evaluateRisk('Object', record, objectApiName);
+          
+          // Track highest risk level (CRITICAL > HIGH > MEDIUM > LOW)
+          const riskOrder = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+          if (riskOrder[risk.riskLevel] > riskOrder[highestRisk.riskLevel]) {
+            highestRisk = risk;
+          }
         }
       }
 
@@ -282,6 +380,7 @@ export class SalesforceService {
         crudRights: crudRights.sort(),
         sources,
         allSources: Array.from(allSourcesSet),
+        riskAssessment: highestRisk,
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -303,7 +402,7 @@ export class SalesforceService {
    * @param objectApiName Salesforce object API name (e.g., "Account")
    * @param fieldApiName Field API name (e.g., "Description")
    * @param allPermissionSetIds Array of Permission Set IDs (including Profile-owned)
-   * @returns Object with field permissions and sources
+   * @returns Object with field permissions, sources, and risk assessment
    */
   private async checkFieldPermission(
     conn: any,
@@ -318,6 +417,7 @@ export class SalesforceService {
       edit: string[];
     };
     resolvedField: { apiName: string; label: string };
+    riskAssessment: { riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; riskReason: string };
   }> {
     // Resolve object name with fuzzy matching
     const resolvedObject = await this.resolveObjectName(conn, objectApiName);
@@ -348,6 +448,10 @@ export class SalesforceService {
         canEdit: false,
         sources: { read: [], edit: [] },
         resolvedField,
+        riskAssessment: {
+          riskLevel: 'LOW',
+          riskReason: 'No permissions found.',
+        },
       };
     }
 
@@ -374,6 +478,11 @@ export class SalesforceService {
       let canRead = false;
       let canEdit = false;
 
+      let highestRisk: { riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; riskReason: string } = {
+        riskLevel: 'LOW',
+        riskReason: 'No permissions found.',
+      };
+
       if (result.records && result.records.length > 0) {
         for (const record of result.records) {
           const isOwnedByProfile = record.Parent?.IsOwnedByProfile === true;
@@ -399,6 +508,19 @@ export class SalesforceService {
               editSources.push(sourceLabel);
             }
           }
+
+          // Evaluate risk for this field permission
+          const risk = this.evaluateRisk('Field', {
+            PermissionsEdit: record.PermissionsEdit,
+            PermissionsRead: record.PermissionsRead,
+            fieldLabel: resolvedField.label,
+          }, resolvedObject.apiName, resolvedField.apiName);
+
+          // Track highest risk level
+          const riskOrder = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+          if (riskOrder[risk.riskLevel] > riskOrder[highestRisk.riskLevel]) {
+            highestRisk = risk;
+          }
         }
       }
 
@@ -410,6 +532,7 @@ export class SalesforceService {
           edit: editSources,
         },
         resolvedField,
+        riskAssessment: highestRisk,
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -651,6 +774,25 @@ export class SalesforceService {
    * @param permissionQuery Natural language permission query (e.g., "export reports", "Edit Account", "Delete Lead") or API name
    * @returns Detailed permission analysis with sources
    */
+  /**
+   * Sort sources to prioritize Profile as Primary Authority
+   */
+  private sortSourcesWithPrimaryAuthority(sources: string[]): string[] {
+    const profileSources: string[] = [];
+    const permissionSetSources: string[] = [];
+
+    for (const source of sources) {
+      if (source.startsWith('Profile:')) {
+        profileSources.push(source);
+      } else {
+        permissionSetSources.push(source);
+      }
+    }
+
+    // Profile sources first (Primary Authority), then Permission Sets
+    return [...profileSources, ...permissionSetSources];
+  }
+
   async analyzePermissions(
     orgId: string,
     userId: string,
@@ -663,6 +805,10 @@ export class SalesforceService {
     hasAccess: boolean;
     sources: string[];
     explanation: string;
+    riskAnalysis: {
+      riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+      riskReason: string;
+    };
   }> {
     const conn = await this.authService.getConnection(orgId);
 
@@ -750,6 +896,10 @@ export class SalesforceService {
         hasAccess: false,
         sources: [],
         explanation: `User ${user.Name} has no Permission Sets or Profile assigned.`,
+        riskAnalysis: {
+          riskLevel: 'LOW',
+          riskReason: 'No permissions found.',
+        },
       };
     }
 
@@ -771,17 +921,21 @@ export class SalesforceService {
         const hasAccess = action.toLowerCase() === 'read' ? fieldResult.canRead : 
                          action.toLowerCase() === 'edit' ? fieldResult.canEdit : false;
         
-        const sources = action.toLowerCase() === 'read' ? fieldResult.sources.read :
+        let sources = action.toLowerCase() === 'read' ? fieldResult.sources.read :
                        action.toLowerCase() === 'edit' ? fieldResult.sources.edit : [];
+        
+        // Sort sources to prioritize Profile as Primary Authority
+        sources = this.sortSourcesWithPrimaryAuthority(sources);
         
         const resolvedLabel = `${this.mapActionToFieldName(action)} ${fieldResult.resolvedField.label} on ${objectName}`;
         
         let explanation: string;
         if (hasAccess) {
+          const primarySource = sources[0];
           if (sources.length === 1) {
-            explanation = `User can ${action.toLowerCase()} ${fieldResult.resolvedField.label} on ${objectName} because it is granted by: ${sources[0]}`;
+            explanation = `User can ${action.toLowerCase()} ${fieldResult.resolvedField.label} on ${objectName} because it is granted by: ${primarySource}`;
           } else {
-            explanation = `User can ${action.toLowerCase()} ${fieldResult.resolvedField.label} on ${objectName} because it is granted by: ${sources.join(', ')}`;
+            explanation = `User can ${action.toLowerCase()} ${fieldResult.resolvedField.label} on ${objectName} because it is granted by: ${primarySource} (Primary Authority) and ${sources.slice(1).join(', ')}`;
           }
         } else {
           explanation = `User does NOT have permission to ${action.toLowerCase()} ${fieldResult.resolvedField.label} on ${objectName}. ` +
@@ -796,6 +950,7 @@ export class SalesforceService {
           hasAccess,
           sources,
           explanation,
+          riskAnalysis: fieldResult.riskAssessment,
         };
       } catch (error) {
         throw error;
@@ -814,16 +969,20 @@ export class SalesforceService {
 
         // Check if user has the specific action requested
         const hasAccess = objectResult.crudRights.includes(this.mapActionToFieldName(action));
-        const sources = objectResult.sources[this.mapActionToFieldName(action)] || [];
+        let sources = objectResult.sources[this.mapActionToFieldName(action)] || [];
+        
+        // Sort sources to prioritize Profile as Primary Authority
+        sources = this.sortSourcesWithPrimaryAuthority(sources);
         
         const resolvedLabel = `${this.mapActionToFieldName(action)} ${objectName}`;
         
         let explanation: string;
         if (hasAccess) {
+          const primarySource = sources[0];
           if (sources.length === 1) {
-            explanation = `User can ${action.toLowerCase()} ${objectName} because it is granted by: ${sources[0]}`;
+            explanation = `User can ${action.toLowerCase()} ${objectName} because it is granted by: ${primarySource}`;
           } else {
-            explanation = `User can ${action.toLowerCase()} ${objectName} because it is granted by: ${sources.join(', ')}`;
+            explanation = `User can ${action.toLowerCase()} ${objectName} because it is granted by: ${primarySource} (Primary Authority) and ${sources.slice(1).join(', ')}`;
           }
           
           // Add summary of ALL CRUD rights
@@ -848,6 +1007,7 @@ export class SalesforceService {
           hasAccess,
           sources,
           explanation,
+          riskAnalysis: objectResult.riskAssessment,
         };
       } catch (error) {
         throw error;
@@ -949,6 +1109,10 @@ export class SalesforceService {
         hasAccess: false,
         sources: [],
         explanation: `User ${user.Name} has no Permission Sets or Profile assigned.`,
+        riskAnalysis: {
+          riskLevel: 'LOW',
+          riskReason: 'No permissions found.',
+        },
       };
     }
 
@@ -1012,18 +1176,25 @@ export class SalesforceService {
         throw error;
       }
 
+      // Sort sources to prioritize Profile as Primary Authority
+      const sortedSources = this.sortSourcesWithPrimaryAuthority(sources);
+
       // Step 5: Build Explanation for System Permissions
       let explanation: string;
       if (hasAccess) {
-        if (sources.length === 1) {
-          explanation = `User can do this because it is granted by: ${sources[0]}`;
+        const primarySource = sortedSources[0];
+        if (sortedSources.length === 1) {
+          explanation = `User can do this because it is granted by: ${primarySource}`;
         } else {
-          explanation = `User can do this because it is granted by: ${sources.join(', ')}`;
+          explanation = `User can do this because it is granted by: ${primarySource} (Primary Authority) and ${sortedSources.slice(1).join(', ')}`;
         }
       } else {
         explanation = `User does NOT have access to "${permissionQuery}". ` +
           `Checked ${allPermissionSetIds.length} Permission Set(s) including Profile "${profileName}".`;
       }
+
+      // Evaluate risk for System Permission (default to LOW for now)
+      const riskAssessment = this.evaluateRisk('System', {}, resolvedPermission.apiName);
 
       return {
         username: user.Name,
@@ -1031,8 +1202,9 @@ export class SalesforceService {
         checkingPermission: resolvedPermission.apiName,
         resolvedLabel: resolvedPermission.label,
         hasAccess,
-        sources,
+        sources: sortedSources,
         explanation,
+        riskAnalysis: riskAssessment,
       };
     }
   }
