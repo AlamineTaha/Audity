@@ -1,11 +1,14 @@
 import { SalesforceAuthService } from './authService';
 import { FlowMetadata, SetupAuditTrail } from '../types';
+import { DependencyService } from './dependencyService';
 
 export class SalesforceService {
   private authService: SalesforceAuthService;
+  private dependencyService: DependencyService;
 
-  constructor(authService: SalesforceAuthService) {
+  constructor(authService: SalesforceAuthService, dependencyService?: DependencyService) {
     this.authService = authService;
+    this.dependencyService = dependencyService || new DependencyService();
   }
 
   /**
@@ -18,11 +21,17 @@ export class SalesforceService {
    * - Natural language: "create report" → "PermissionsCreateReport"
    * - Exact API name: "PermissionsExportReport" → "PermissionsExportReport"
    * 
+   * If multiple similar permissions are found (e.g., "Manage Users" and "Manage Internal Users"),
+   * returns an error object asking the admin to clarify.
+   * 
    * @param conn jsforce Connection instance
    * @param userQuery Natural language permission query (e.g., "create report", "export reports") or exact API name (e.g., "PermissionsCreateReport")
-   * @returns Object with apiName and label, or null if not found
+   * @returns Object with apiName and label, error object with ambiguous matches, or null if not found
    */
-  private async resolveSystemPermissionField(conn: any, userQuery: string): Promise<{ apiName: string; label: string } | null> {
+  private async resolveSystemPermissionField(
+    conn: any, 
+    userQuery: string
+  ): Promise<{ apiName: string; label: string } | { error: string; ambiguousMatches: Array<{ apiName: string; label: string }> } | null> {
     try {
       // Describe returns ALL fields, including 'PermissionsExportReport', etc.
       const description = await conn.describe('PermissionSet');
@@ -33,20 +42,56 @@ export class SalesforceService {
         return null;
       }
 
-      const match = description.fields.find((field: any) => {
+      // Find all matching fields
+      const matches: Array<{ apiName: string; label: string }> = [];
+      
+      for (const field of description.fields) {
         // We only care about fields that start with "Permissions" (System Permissions)
         if (!field.name.startsWith('Permissions')) {
-          return false;
+          continue;
         }
 
         const label = (field.label || '').toLowerCase();
         const name = field.name.toLowerCase();
 
         // Check for fuzzy match on Label or exact match on API Name
-        return label.includes(normalizedQuery) || name === normalizedQuery || name.includes(normalizedQuery);
-      });
+        if (label.includes(normalizedQuery) || name === normalizedQuery || name.includes(normalizedQuery)) {
+          matches.push({
+            apiName: field.name,
+            label: field.label || field.name,
+          });
+        }
+      }
 
-      return match ? { apiName: match.name, label: match.label || match.name } : null;
+      // If no matches found
+      if (matches.length === 0) {
+        return null;
+      }
+
+      // If exactly one match, return it
+      if (matches.length === 1) {
+        return matches[0];
+      }
+
+      // If multiple matches found, check if they're truly ambiguous
+      // An exact API name match takes precedence
+      const exactApiMatch = matches.find(m => m.apiName.toLowerCase() === normalizedQuery);
+      if (exactApiMatch) {
+        return exactApiMatch;
+      }
+
+      // Check if all matches have the same label (not ambiguous)
+      const firstLabel = matches[0].label.toLowerCase();
+      const allSameLabel = matches.every(m => m.label.toLowerCase() === firstLabel);
+      if (allSameLabel) {
+        return matches[0]; // Return first one if all have same label
+      }
+
+      // Multiple different matches found - return error with ambiguous matches
+      return {
+        error: `I found ${matches.length} similar permissions matching '${userQuery}'. Which one did you mean?`,
+        ambiguousMatches: matches,
+      };
 
     } catch (error) {
       console.error('Error describing PermissionSet:', error);
@@ -991,7 +1036,7 @@ export class SalesforceService {
    * @param orgId Salesforce Organization ID
    * @param flowApiName Flow API name
    * @param targetVersionNumber Target version number to activate
-   * @returns Success status and details
+   * @returns Success status and details with rollback context warnings
    */
   async activateSpecificVersion(
     orgId: string,
@@ -1002,6 +1047,7 @@ export class SalesforceService {
     message: string;
     previousActiveVersion: number;
     newActiveVersion: number;
+    warnings: string[];
   }> {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
@@ -1053,6 +1099,7 @@ export class SalesforceService {
         message: `Version ${targetVersionNumber} is already active.`,
         previousActiveVersion: currentActiveVersion,
         newActiveVersion: targetVersionNumber,
+        warnings: [],
       };
     }
 
@@ -1068,11 +1115,19 @@ export class SalesforceService {
       Status: 'Active',
     });
 
+    // Build warnings array
+    const warnings: string[] = [
+      'Active/Paused Flow Interviews will continue to run on the old version until they are completed or deleted manually in Salesforce.',
+      'New Flow interviews will use the newly activated version.',
+      'Monitor existing interviews in Setup > Flows > Flow Interviews to ensure they complete successfully.',
+    ];
+
     return {
       success: true,
       message: `Successfully activated Version ${targetVersionNumber}. Previous active version ${currentActiveVersion} set to Obsolete.`,
       previousActiveVersion: currentActiveVersion,
       newActiveVersion: targetVersionNumber,
+      warnings,
     };
   }
 
@@ -1082,7 +1137,7 @@ export class SalesforceService {
    * @param orgId Salesforce Organization ID
    * @param flowApiName Flow API name
    * @param hours Number of hours to look back (default: 24 for "today")
-   * @returns Success status and details
+   * @returns Success status and details with warnings
    */
   async batchRevertTodayChanges(
     orgId: string,
@@ -1093,6 +1148,7 @@ export class SalesforceService {
     message: string;
     stableVersion: number | null;
     previousActiveVersion: number;
+    warnings: string[];
   }> {
     const stableVersion = await this.findLastStableVersion(orgId, flowApiName, hours);
     
@@ -1115,6 +1171,249 @@ export class SalesforceService {
       message: `Batch revert completed: Activated Version ${stableVersion} (Last Stable). ${result.message}`,
       stableVersion,
       previousActiveVersion,
+      warnings: result.warnings,
+    };
+  }
+
+  /**
+   * Get Custom Buttons (WebLinks) that launch a specific Flow
+   * Safe metadata search - no code scanning required
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @returns Array of button information
+   */
+  async getFlowButtons(
+    orgId: string,
+    flowApiName: string
+  ): Promise<Array<{
+    name: string;
+    label: string;
+    linkType: string;
+    objectType?: string;
+  }>> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    // Query WebLink (Custom Button) metadata
+    // Look for buttons that reference the flow in their URL
+    const webLinkQuery = `
+      SELECT Name, MasterLabel, LinkType, EntityDefinition.QualifiedApiName, Url
+      FROM WebLink
+      WHERE (LinkType = 'url' OR LinkType = 'page')
+        AND (Url LIKE '%/flow/${flowApiName.replace(/'/g, "''")}%' OR Url LIKE '%flow=${flowApiName.replace(/'/g, "''")}%')
+    `;
+
+    try {
+      const result = await tooling.query<any>(webLinkQuery);
+      
+      if (!result.records || result.records.length === 0) {
+        return [];
+      }
+
+      return result.records.map((record: any) => ({
+        name: record.Name,
+        label: record.MasterLabel || record.Name,
+        linkType: record.LinkType,
+        objectType: record.SobjectType,
+      }));
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      
+      // If WebLink table doesn't exist or query fails, return empty array
+      if (errorMessage.includes('INVALID_TYPE') || errorMessage.includes('sObject type')) {
+        console.warn(`WebLink metadata not accessible for org ${orgId}. This may require additional permissions.`);
+        return [];
+      }
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Get Quick Actions (PlatformActions) that use a specific Flow
+   * Safe metadata search - no code scanning required
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @returns Array of quick action information
+   */
+  async getFlowQuickActions(
+    orgId: string,
+    flowApiName: string
+  ): Promise<Array<{
+    actionTarget: string;
+    label: string;
+    targetObject?: string;
+  }>> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    // Query PlatformAction metadata
+    // Look for Quick Actions that reference the flow
+    const platformActionQuery = `
+      SELECT ActionTarget, Label, TargetObject
+      FROM PlatformAction
+      WHERE ActionTarget LIKE '%${flowApiName.replace(/'/g, "''")}%'
+    `;
+
+    try {
+      const result = await tooling.query<any>(platformActionQuery);
+      
+      if (!result.records || result.records.length === 0) {
+        return [];
+      }
+
+      return result.records.map((record: any) => ({
+        actionTarget: record.ActionTarget,
+        label: record.Label || 'Unknown',
+        targetObject: record.TargetObject,
+      }));
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      
+      // If PlatformAction table doesn't exist or query fails, return empty array
+      if (errorMessage.includes('INVALID_TYPE') || errorMessage.includes('sObject type')) {
+        console.warn(`PlatformAction metadata not accessible for org ${orgId}. This may require additional permissions.`);
+        return [];
+      }
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Get subflow dependencies (flows called by this flow)
+   * Extracts subflow references from Flow metadata
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @returns Array of subflow names
+   */
+  async getSubflowDependencies(
+    orgId: string,
+    flowApiName: string
+  ): Promise<Array<{
+    flowApiName: string;
+    elementLabel?: string;
+  }>> {
+    try {
+      const flowMetadata = await this.getFlowMetadata(orgId, flowApiName);
+      if (!flowMetadata || !flowMetadata.LatestVersionId) {
+        return [];
+      }
+
+      const flowDefinition = await this.getFlowDefinition(orgId, flowMetadata.LatestVersionId);
+      
+      // Extract subflow references from metadata
+      const subflows: Array<{ flowApiName: string; elementLabel?: string }> = [];
+      
+      const extractSubflows = (obj: any) => {
+        if (!obj || typeof obj !== 'object') {
+          return;
+        }
+
+        for (const [key, value] of Object.entries(obj)) {
+          // Look for subflow references
+          if (key === 'flow' || key === 'flowReference' || key === 'flowApiName') {
+            if (typeof value === 'string' && value) {
+              subflows.push({
+                flowApiName: value,
+                elementLabel: obj.label || obj.name,
+              });
+            }
+          }
+
+          // Recursively search nested objects
+          if (typeof value === 'object' && value !== null) {
+            extractSubflows(value);
+          }
+        }
+      };
+
+      extractSubflows(flowDefinition);
+      
+      // Remove duplicates
+      const uniqueSubflows = Array.from(
+        new Map(subflows.map(sf => [sf.flowApiName, sf])).values()
+      );
+
+      return uniqueSubflows;
+    } catch (error) {
+      console.error(`Error extracting subflow dependencies for ${flowApiName}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Get comprehensive dependency report for a Flow
+   * Combines manual dependencies, UI dependencies (buttons/quick actions), and subflow dependencies
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowApiName Flow API name
+   * @returns Comprehensive dependency report with limitations
+   */
+  async getFlowDependencyReport(
+    orgId: string,
+    flowApiName: string
+  ): Promise<{
+    reportedDependencies: Array<{
+      type: string;
+      name: string;
+      description?: string;
+    }>;
+    uiDependencies: {
+      buttons: Array<{
+        name: string;
+        label: string;
+        linkType: string;
+        objectType?: string;
+      }>;
+      quickActions: Array<{
+        actionTarget: string;
+        label: string;
+        targetObject?: string;
+      }>;
+    };
+    subflowDependencies: Array<{
+      flowApiName: string;
+      elementLabel?: string;
+    }>;
+    securityNote: string;
+    limitations: string[];
+  }> {
+    // Get manual dependencies from DependencyService
+    const reportedDependencies = this.dependencyService.getManualDependencies(flowApiName);
+
+    // Get UI dependencies (buttons and quick actions)
+    const [buttons, quickActions] = await Promise.all([
+      this.getFlowButtons(orgId, flowApiName),
+      this.getFlowQuickActions(orgId, flowApiName),
+    ]);
+
+    // Get subflow dependencies
+    const subflowDependencies = await this.getSubflowDependencies(orgId, flowApiName);
+
+    // Build limitations array
+    const limitations: string[] = [];
+    
+    // Always include the general limitation
+    limitations.push('Analysis limited to Metadata (Subflows/Buttons). External callers (Apex/LWC) were not scanned.');
+    
+    // Add specific limitations if no dependencies found
+    if (subflowDependencies.length === 0 && buttons.length === 0 && quickActions.length === 0 && reportedDependencies.length === 0) {
+      limitations.push('No dependencies found via metadata search. This does NOT guarantee the Flow is safe to modify. External callers may exist in Apex classes or Lightning Web Components that were not scanned.');
+    }
+
+    return {
+      reportedDependencies,
+      uiDependencies: {
+        buttons,
+        quickActions,
+      },
+      subflowDependencies,
+      securityNote: 'Dependency analysis performed via safe metadata headers only. No proprietary codebase (Apex/LWC) was accessed.',
+      limitations,
     };
   }
 
@@ -1241,6 +1540,7 @@ export class SalesforceService {
     const profileName = profileResult.records?.[0]?.Name || 'Unknown Profile';
 
     // Step 3: Fetch All Permission Sources (needed for both paths)
+    // First, get direct Permission Set assignments
     const permissionSetAssignmentQuery = `
       SELECT PermissionSetId, PermissionSet.Name, PermissionSet.Label
       FROM PermissionSetAssignment
@@ -1251,6 +1551,49 @@ export class SalesforceService {
     const assignedPermissionSetIds: string[] = permissionSetAssignmentResult.records.map(
       (record: any) => record.PermissionSetId
     );
+
+    // Also get Permission Sets from Permission Set Groups
+    // Query PermissionSetGroupAssignment to find groups assigned to the user
+    const permissionSetGroupAssignmentQuery = `
+      SELECT PermissionSetGroupId
+      FROM PermissionSetGroupAssignment
+      WHERE AssigneeId = '${user.Id.replace(/'/g, "''")}'
+    `;
+
+    try {
+      const groupAssignmentResult = await conn.query<any>(permissionSetGroupAssignmentQuery);
+      
+      if (groupAssignmentResult.records && groupAssignmentResult.records.length > 0) {
+        const groupIds = groupAssignmentResult.records.map((record: any) => record.PermissionSetGroupId);
+        
+        // Query PermissionSetGroupComponent to get Permission Sets within each group
+        if (groupIds.length > 0) {
+          const groupIdsStr = groupIds.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+          const groupComponentQuery = `
+            SELECT PermissionSetId
+            FROM PermissionSetGroupComponent
+            WHERE PermissionSetGroupId IN (${groupIdsStr})
+          `;
+          
+          const componentResult = await conn.query<any>(groupComponentQuery);
+          
+          if (componentResult.records && componentResult.records.length > 0) {
+            const groupPermissionSetIds = componentResult.records.map((record: any) => record.PermissionSetId);
+            
+            // Add Permission Sets from groups to the assigned list
+            groupPermissionSetIds.forEach(id => {
+              if (!assignedPermissionSetIds.includes(id)) {
+                assignedPermissionSetIds.push(id);
+              }
+            });
+          }
+        }
+      }
+    } catch (error) {
+      // Permission Set Groups may not be available in all orgs or may require special permissions
+      // Log warning but don't fail the entire request
+      console.warn(`Could not query Permission Set Groups for user ${user.Id}:`, error);
+    }
 
     // Get Profile-owned Permission Set ID
     const profilePermissionSetQuery = `
@@ -1417,6 +1760,18 @@ export class SalesforceService {
           `Could not find a System Permission matching '${permissionQuery}'. ` +
           `Please check the spelling or use the exact API name (e.g., PermissionsExportReport). ` +
           `For Object Permissions, use format: "Action Object" (e.g., "Edit Account", "Delete Lead").`
+        );
+      }
+
+      // Check if ambiguous matches were returned
+      if ('error' in resolvedPermission && 'ambiguousMatches' in resolvedPermission) {
+        const ambiguousList = resolvedPermission.ambiguousMatches
+          .map(m => `"${m.label}" (${m.apiName})`)
+          .join(', ');
+        throw new Error(
+          `${resolvedPermission.error} ` +
+          `Found: ${ambiguousList}. ` +
+          `Please specify the exact permission name or use a more specific query.`
         );
       }
       

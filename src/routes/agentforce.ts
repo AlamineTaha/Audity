@@ -156,6 +156,25 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       revertPrompt = 'No changes detected today. No revert action needed.';
     }
 
+    // Get dependency report
+    let dependencies;
+    try {
+      dependencies = await salesforceService.getFlowDependencyReport(orgId, flowName);
+    } catch (error) {
+      console.error(`Error fetching dependency report for ${flowName}:`, error);
+      // Don't fail the entire request if dependency check fails
+      dependencies = {
+        reportedDependencies: [],
+        uiDependencies: { buttons: [], quickActions: [] },
+        subflowDependencies: [],
+        securityNote: 'Dependency analysis could not be completed. Error occurred during metadata query.',
+        limitations: [
+          'Analysis limited to Metadata (Subflows/Buttons). External callers (Apex/LWC) were not scanned.',
+          'Dependency analysis could not be completed due to an error. Please verify manually.',
+        ],
+      };
+    }
+
     // Return response
     const response: AnalyzeFlowResponse = {
       success: true,
@@ -168,6 +187,7 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
         recommendedStableVersion,
         revertPrompt,
       },
+      dependencies,
     };
 
     res.json(response);

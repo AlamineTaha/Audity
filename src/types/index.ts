@@ -126,3 +126,18 @@ export interface SlackNotification {
   timestamp: string;
 }
 
+/**
+ * Change notification payload for Slack
+ */
+export interface ChangeNotification {
+  type: 'Flow' | 'Permission' | 'Object' | string;
+  changeType: string;
+  user: string;
+  timestamp: string;
+  orgId: string;
+  summary: string;
+  changes: string[];
+  riskLevel: 'Low' | 'Medium' | 'High';
+  salesforceUrl: string;
+}
+
