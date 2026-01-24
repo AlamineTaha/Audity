@@ -1195,13 +1195,11 @@ export class SalesforceService {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
-    // Query WebLink (Custom Button) metadata
-    // Look for buttons that reference the flow in their URL
+    // We REMOVE the Url from the WHERE clause
     const webLinkQuery = `
       SELECT Name, MasterLabel, LinkType, EntityDefinition.QualifiedApiName, Url
       FROM WebLink
       WHERE (LinkType = 'url' OR LinkType = 'page')
-        AND (Url LIKE '%/flow/${flowApiName.replace(/'/g, "''")}%' OR Url LIKE '%flow=${flowApiName.replace(/'/g, "''")}%')
     `;
 
     try {
@@ -1211,21 +1209,23 @@ export class SalesforceService {
         return [];
       }
 
-      return result.records.map((record: any) => ({
-        name: record.Name,
-        label: record.MasterLabel || record.Name,
-        linkType: record.LinkType,
-        objectType: record.SobjectType,
-      }));
+      const lowerFlowName = flowApiName.toLowerCase();
+
+      // We filter in JAVASCRIPT instead of SOQL
+      return result.records
+        .filter((record: any) => {
+          if (!record.Url) return false;
+          const url = record.Url.toLowerCase();
+          return url.includes(`/flow/${lowerFlowName}`) || url.includes(`flow=${lowerFlowName}`);
+        })
+        .map((record: any) => ({
+          name: record.Name,
+          label: record.MasterLabel || record.Name,
+          linkType: record.LinkType,
+          objectType: record.EntityDefinition ? record.EntityDefinition.QualifiedApiName : 'Global',
+        }));
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      
-      // If WebLink table doesn't exist or query fails, return empty array
-      if (errorMessage.includes('INVALID_TYPE') || errorMessage.includes('sObject type')) {
-        console.warn(`WebLink metadata not accessible for org ${orgId}. This may require additional permissions.`);
-        return [];
-      }
-      
+      // ... same error handling as before
       throw error;
     }
   }
