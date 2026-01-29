@@ -1,46 +1,1058 @@
 {
-  "name": "audit-delta",
-  "version": "1.0.0",
-  "description": "Salesforce automation change monitoring service with AI-powered diff analysis",
-  "main": "dist/index.js",
-  "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "lint": "eslint src --ext .ts",
-    "test": "jest"
+  "swaggerDoc": {
+    "openapi": "3.0.0",
+    "info": {
+      "title": "AuditDelta API",
+      "version": "1.0.0",
+      "description": "Salesforce automation change monitoring service with AI-powered diff analysis. This API is designed for integration with Salesforce Einstein Agentforce.",
+      "contact": {
+        "name": "AuditDelta Support"
+      }
+    },
+    "servers": [
+      {
+        "url": "http://localhost:3000",
+        "description": "Development server"
+      }
+    ],
+    "tags": [
+      {
+        "name": "Agentforce",
+        "description": "Endpoints for Salesforce Einstein Agent integration"
+      },
+      {
+        "name": "Flows",
+        "description": "Flow version management and revert endpoints"
+      },
+      {
+        "name": "Auth",
+        "description": "Authentication endpoints"
+      },
+      {
+        "name": "Monitoring",
+        "description": "Proactive monitoring and change detection endpoints"
+      },
+      {
+        "name": "Security",
+        "description": "Security and permission analysis endpoints"
+      }
+    ],
+    "components": {
+      "schemas": {
+        "AnalyzeFlowRequest": {
+          "type": "object",
+          "required": [
+            "flowName",
+            "orgId"
+          ],
+          "properties": {
+            "flowName": {
+              "type": "string",
+              "description": "The API name of the Flow to analyze",
+              "example": "My_Flow"
+            },
+            "orgId": {
+              "type": "string",
+              "description": "The Salesforce Organization ID",
+              "example": "00D000000000000AAA"
+            }
+          }
+        },
+        "AnalyzeFlowResponse": {
+          "type": "object",
+          "properties": {
+            "success": {
+              "type": "boolean",
+              "example": true
+            },
+            "flowName": {
+              "type": "string",
+              "example": "My_Flow"
+            },
+            "summary": {
+              "type": "string",
+              "example": "The Flow was updated to include a new decision element..."
+            },
+            "changes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "example": [
+                "Added new decision element",
+                "Modified field update logic"
+              ]
+            },
+            "error": {
+              "type": "string",
+              "example": "Error message if success is false"
+            }
+          }
+        },
+        "AuthCallbackResponse": {
+          "type": "object",
+          "properties": {
+            "success": {
+              "type": "boolean",
+              "example": true
+            },
+            "orgId": {
+              "type": "string",
+              "description": "Salesforce Organization ID",
+              "example": "00D000000000000AAA"
+            },
+            "message": {
+              "type": "string",
+              "example": "Organization successfully authenticated"
+            }
+          }
+        },
+        "AuthErrorResponse": {
+          "type": "object",
+          "properties": {
+            "error": {
+              "type": "string",
+              "example": "Error message"
+            }
+          }
+        }
+      }
+    },
+    "paths": {
+      "/api/v1/trigger-check": {
+        "post": {
+          "summary": "Force Immediate Change Check",
+          "description": "Manually triggers the polling engine to check for Salesforce changes immediately, analyze them with AI, and send Slack alerts if issues are found.",
+          "operationId": "triggerCheck",
+          "tags": [
+            "Monitoring"
+          ],
+          "responses": {
+            "200": {
+              "description": "Check initiated",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "success": {
+                        "type": "boolean"
+                      },
+                      "message": {
+                        "type": "string",
+                        "example": "Manual check initiated. Notifications will be sent if changes are found."
+                      },
+                      "changesFound": {
+                        "type": "integer"
+                      },
+                      "errors": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/v1/recent-changes": {
+        "get": {
+          "summary": "Get Recent Org Activity",
+          "description": "Retrieves the Salesforce Audit Trail. Use this when the user asks 'What happened recently?' or 'Who changed what?'.",
+          "operationId": "getRecentActivity",
+          "tags": [
+            "Monitoring"
+          ],
+          "parameters": [
+            {
+              "in": "query",
+              "name": "hours",
+              "schema": {
+                "type": "integer",
+                "default": 24
+              },
+              "description": "Lookback window in hours"
+            },
+            {
+              "in": "query",
+              "name": "orgId",
+              "schema": {
+                "type": "string"
+              },
+              "description": "Salesforce Organization ID (required)"
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "List of recent changes",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "action": {
+                          "type": "string",
+                          "example": "ChangedFlow"
+                        },
+                        "user": {
+                          "type": "string",
+                          "example": "Alice Smith"
+                        },
+                        "section": {
+                          "type": "string",
+                          "example": "Flow Management"
+                        },
+                        "timestamp": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              "description": "Bad request - missing orgId"
+            },
+            "500": {
+              "description": "Internal server error"
+            }
+          }
+        }
+      },
+      "/api/v1/analyze-permission": {
+        "post": {
+          "summary": "Trace User Permissions",
+          "description": "Analyzes a specific user's permissions. Traces exactly which Profile or Permission Set grants a permission.\nUseful for Agentforce to answer 'Why can User X do Y?'.\n\n**System Permissions:** Supports natural language queries (e.g., \"create report\", \"export reports\", \"modify all data\") \nor exact API names (e.g., \"PermissionsCreateReport\", \"PermissionsExportReport\").\n\n**Object Permissions:** Use format \"Action Object\" (e.g., \"Edit Account\", \"Delete Lead\", \"Create Contact\", \"Read Opportunity\").\n**Field Permissions:** Use format \"Action Object Field\" (e.g., \"Edit Account Description\", \"Read Contact Email\").\n\n**Action Keywords:** Use these exact strings for the action parameter:\n- 'Read' - Check read access\n- 'Create' - Check create access\n- 'Edit' - Check edit access\n- 'Delete' - Check delete access\n- 'ViewAll' - Check view all records access (bypasses sharing)\n- 'ModifyAll' - Check modify all records access (god mode)\n",
+          "operationId": "analyzePermission",
+          "tags": [
+            "Security"
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "userId",
+                    "orgId"
+                  ],
+                  "properties": {
+                    "userId": {
+                      "type": "string",
+                      "description": "Salesforce User ID (18-character) or Username (email)",
+                      "example": "005J6000002RB2uIAG"
+                    },
+                    "orgId": {
+                      "type": "string",
+                      "description": "Salesforce Organization ID",
+                      "example": "00DJ6000001H7etMAC"
+                    },
+                    "permissionName": {
+                      "type": "string",
+                      "description": "Permission to check. Supports:\n- System Permissions: natural language (e.g., \"create report\", \"export reports\") or exact API name (e.g., \"PermissionsCreateReport\")\n- Object Permissions: format \"Action Object\" (e.g., \"Edit Account\", \"Delete Lead\", \"Create Contact\")\nIf not provided, returns basic user info without permission analysis.\n",
+                      "example": "Edit Account"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Permission analysis result",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "username": {
+                        "type": "string",
+                        "description": "User's full name",
+                        "example": "Alice Smith"
+                      },
+                      "userId": {
+                        "type": "string",
+                        "description": "Salesforce User ID",
+                        "example": "005J6000002RB2uIAG"
+                      },
+                      "checkingPermission": {
+                        "type": "string",
+                        "description": "The resolved API name of the permission checked",
+                        "example": "PermissionsCreateReport"
+                      },
+                      "hasAccess": {
+                        "type": "boolean",
+                        "description": "Whether the user has the requested permission",
+                        "example": true
+                      },
+                      "sources": {
+                        "type": "array",
+                        "description": "List of Profiles/Permission Sets that grant this permission",
+                        "items": {
+                          "type": "string"
+                        },
+                        "example": [
+                          "Profile: System Administrator",
+                          "Permission Set: Marketing Manager"
+                        ]
+                      },
+                      "explanation": {
+                        "type": "string",
+                        "description": "Human-readable explanation of the permission analysis",
+                        "example": "User can do this because it is granted by: Profile: System Administrator, Permission Set: Marketing Manager"
+                      },
+                      "resolvedLabel": {
+                        "type": "string",
+                        "description": "Human-readable label of the permission checked",
+                        "example": "Create Report"
+                      },
+                      "riskAnalysis": {
+                        "type": "object",
+                        "description": "Risk assessment for the permission",
+                        "properties": {
+                          "riskLevel": {
+                            "type": "string",
+                            "enum": [
+                              "LOW",
+                              "MEDIUM",
+                              "HIGH",
+                              "CRITICAL"
+                            ],
+                            "description": "Risk level of the permission",
+                            "example": "HIGH"
+                          },
+                          "riskReason": {
+                            "type": "string",
+                            "description": "Explanation of why this risk level was assigned",
+                            "example": "User has 'View All Records' which allows them to see every record in the Account object, regardless of sharing rules."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              "description": "Bad request - missing required fields or invalid JSON"
+            },
+            "404": {
+              "description": "User not found"
+            },
+            "500": {
+              "description": "Internal server error"
+            }
+          }
+        }
+      },
+      "/api/v1/analyze-flow": {
+        "post": {
+          "summary": "Analyze Flow changes",
+          "description": "Fetches current and previous Flow versions, uses AI to analyze differences, and returns a summary",
+          "tags": [
+            "Agentforce"
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "flowName",
+                    "orgId"
+                  ],
+                  "properties": {
+                    "flowName": {
+                      "type": "string",
+                      "description": "The API name of the Flow to analyze",
+                      "example": "My_Flow"
+                    },
+                    "orgId": {
+                      "type": "string",
+                      "description": "The Salesforce Organization ID",
+                      "example": "00D000000000000AAA"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Successful analysis",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "success": {
+                        "type": "boolean",
+                        "example": true
+                      },
+                      "flowName": {
+                        "type": "string",
+                        "example": "My_Flow"
+                      },
+                      "summary": {
+                        "type": "string",
+                        "example": "The Flow was updated to include a new decision element..."
+                      },
+                      "changes": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "example": [
+                          "Added new decision element",
+                          "Modified field update logic"
+                        ]
+                      },
+                      "revertOptions": {
+                        "type": "object",
+                        "description": "Safe-revert options for Flow version management",
+                        "properties": {
+                          "summary": {
+                            "type": "string",
+                            "description": "Summary of changes detected",
+                            "example": "5 change(s) detected today."
+                          },
+                          "versionsToday": {
+                            "type": "array",
+                            "description": "List of version numbers modified today",
+                            "items": {
+                              "type": "integer"
+                            },
+                            "example": [
+                              39,
+                              38,
+                              37,
+                              36,
+                              35
+                            ]
+                          },
+                          "recommendedStableVersion": {
+                            "type": "integer",
+                            "nullable": true,
+                            "description": "Recommended stable version number before today's changes",
+                            "example": 34
+                          },
+                          "revertPrompt": {
+                            "type": "string",
+                            "description": "Prompt message for revert action",
+                            "example": "Would you like to activate Version 34 (Last Stable), a specific version, or keep the current changes?"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              "description": "Bad request - missing required fields"
+            },
+            "404": {
+              "description": "Flow not found"
+            },
+            "500": {
+              "description": "Internal server error"
+            }
+          }
+        }
+      },
+      "/api/v1/health": {
+        "get": {
+          "summary": "Health check endpoint",
+          "description": "Returns the health status of the API",
+          "tags": [
+            "Agentforce"
+          ],
+          "responses": {
+            "200": {
+              "description": "Service is healthy",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "example": "ok"
+                      },
+                      "timestamp": {
+                        "type": "string",
+                        "example": "2024-01-01T00:00:00.000Z"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/v1/test-oauth-config": {
+        "get": {
+          "summary": "Test OAuth configuration",
+          "description": "Validates that OAuth environment variables are configured correctly.\nThis endpoint does not require an authenticated org.\n",
+          "tags": [
+            "Agentforce"
+          ],
+          "responses": {
+            "200": {
+              "description": "OAuth configuration test results",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "success": {
+                        "type": "boolean"
+                      },
+                      "config": {
+                        "type": "object",
+                        "description": "Masked configuration values"
+                      },
+                      "message": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/v1/test-connection": {
+        "post": {
+          "summary": "Test Salesforce org connection",
+          "description": "Tests the connection to a Salesforce org, validates OAuth tokens,\nand returns detailed error information for debugging.\n",
+          "tags": [
+            "Agentforce"
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "orgId"
+                  ],
+                  "properties": {
+                    "orgId": {
+                      "type": "string",
+                      "description": "The Salesforce Organization ID to test",
+                      "example": "00D000000000000AAA"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Connection test results",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "success": {
+                        "type": "boolean"
+                      },
+                      "orgId": {
+                        "type": "string"
+                      },
+                      "tests": {
+                        "type": "object",
+                        "properties": {
+                          "orgSettingsFound": {
+                            "type": "boolean"
+                          },
+                          "tokenRefresh": {
+                            "type": "boolean"
+                          },
+                          "apiQuery": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      "userInfo": {
+                        "type": "object"
+                      },
+                      "errors": {
+                        "type": "array",
+                        "items": {
+                          "type": "object"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              "description": "Bad request - missing orgId"
+            },
+            "404": {
+              "description": "Org not found"
+            },
+            "500": {
+              "description": "Internal server error"
+            }
+          }
+        }
+      },
+      "/api/v1/test-gemini": {
+        "post": {
+          "summary": "Test Gemini API call",
+          "description": "Tests the Gemini API call directly with different configurations.\nUseful for debugging API version and model name issues.\n",
+          "tags": [
+            "Agentforce"
+          ],
+          "requestBody": {
+            "required": false,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "prompt": {
+                      "type": "string",
+                      "description": "Test prompt to send to Gemini",
+                      "example": "Say hello"
+                    },
+                    "apiVersion": {
+                      "type": "string",
+                      "description": "API version to test (v1 or v1beta)",
+                      "example": "v1"
+                    },
+                    "model": {
+                      "type": "string",
+                      "description": "Model name to test",
+                      "example": "gemini-1.5-flash"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Gemini API test results",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "success": {
+                        "type": "boolean"
+                      },
+                      "url": {
+                        "type": "string"
+                      },
+                      "model": {
+                        "type": "string"
+                      },
+                      "apiVersion": {
+                        "type": "string"
+                      },
+                      "response": {
+                        "type": "string"
+                      },
+                      "error": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/v1/flows/check-revert-impact": {
+        "post": {
+          "summary": "Check revert impact before activating a Flow version",
+          "description": "Analyzes the impact of reverting to a specific Flow version by comparing\nthe active version with the target version. Identifies potential issues\nlike deleted fields/objects or active sessions.\n",
+          "tags": [
+            "Flows"
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "flowApiName",
+                    "orgId",
+                    "targetVersionNumber"
+                  ],
+                  "properties": {
+                    "flowApiName": {
+                      "type": "string",
+                      "description": "The API name of the Flow",
+                      "example": "My_Flow"
+                    },
+                    "orgId": {
+                      "type": "string",
+                      "description": "Salesforce Organization ID",
+                      "example": "00D000000000000AAA"
+                    },
+                    "targetVersionNumber": {
+                      "type": "integer",
+                      "description": "Target version number to check impact for",
+                      "example": 34
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Impact assessment result",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "warnings": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "List of warnings about potential issues",
+                        "example": [
+                          "Warning: Reverting to Version 34 may fail if it references fields that have since been deleted or modified."
+                        ]
+                      },
+                      "activeSessions": {
+                        "type": "integer",
+                        "description": "Number of active flow interviews (mock value)",
+                        "example": 5
+                      },
+                      "canRevert": {
+                        "type": "boolean",
+                        "description": "Whether it's safe to revert based on warnings",
+                        "example": true
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              "description": "Bad request - missing required fields"
+            },
+            "404": {
+              "description": "Flow or version not found"
+            },
+            "500": {
+              "description": "Internal server error"
+            }
+          }
+        }
+      },
+      "/api/v1/flows/activate-version": {
+        "post": {
+          "summary": "Activate a specific Flow version (Safe-Revert)",
+          "description": "Activates a specific Flow version by changing its status to 'Active'\nand setting the current active version to 'Obsolete'. This does NOT delete anything.\n\n**Important:** Active/Paused Flow Interviews will continue to run on the old version\nuntil they are completed or deleted manually in Salesforce.\n",
+          "tags": [
+            "Flows"
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "flowApiName",
+                    "orgId",
+                    "targetVersionNumber"
+                  ],
+                  "properties": {
+                    "flowApiName": {
+                      "type": "string",
+                      "description": "The API name of the Flow",
+                      "example": "My_Flow"
+                    },
+                    "orgId": {
+                      "type": "string",
+                      "description": "Salesforce Organization ID",
+                      "example": "00D000000000000AAA"
+                    },
+                    "targetVersionNumber": {
+                      "type": "integer",
+                      "description": "Target version number to activate",
+                      "example": 34
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Version activation successful",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "success": {
+                        "type": "boolean",
+                        "example": true
+                      },
+                      "message": {
+                        "type": "string",
+                        "example": "Successfully activated Version 34. Previous active version 39 set to Obsolete."
+                      },
+                      "previousActiveVersion": {
+                        "type": "integer",
+                        "example": 39
+                      },
+                      "newActiveVersion": {
+                        "type": "integer",
+                        "example": 34
+                      },
+                      "warnings": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "example": [
+                          "Active/Paused Flow Interviews will continue to run on the old version until they are completed or deleted manually in Salesforce."
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              "description": "Bad request - missing required fields"
+            },
+            "404": {
+              "description": "Flow or version not found"
+            },
+            "500": {
+              "description": "Internal server error"
+            }
+          }
+        }
+      },
+      "/api/v1/audit/complexity": {
+        "get": {
+          "summary": "Get Flow Complexity Heatmap",
+          "description": "Returns a heatmap of Flow complexity metrics across the organization. Useful for identifying overly complex Flows that may need refactoring.",
+          "operationId": "getComplexityHeatmap",
+          "tags": [
+            "Monitoring"
+          ],
+          "parameters": [
+            {
+              "in": "query",
+              "name": "orgId",
+              "required": true,
+              "schema": {
+                "type": "string"
+              },
+              "description": "Salesforce Organization ID"
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Complexity heatmap data",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "flows": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "flowName": { "type": "string" },
+                            "complexityScore": { "type": "number" },
+                            "elementCount": { "type": "integer" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/v1/audit/health-report": {
+        "get": {
+          "summary": "Get Apex Drift Health Report",
+          "description": "Returns a health report identifying Apex code that references Flows but may be out of sync. Helps detect drift between code and Flow metadata.",
+          "operationId": "getApexDriftReport",
+          "tags": [
+            "Monitoring"
+          ],
+          "parameters": [
+            {
+              "in": "query",
+              "name": "orgId",
+              "required": true,
+              "schema": {
+                "type": "string"
+              },
+              "description": "Salesforce Organization ID"
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Apex drift health report",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "properties": {
+                      "driftDetected": { "type": "boolean" },
+                      "affectedClasses": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/auth/authorize": {
+        "get": {
+          "summary": "Initiate OAuth 2.0 authorization flow",
+          "description": "Redirects to Salesforce OAuth authorization page. After user authorizes,\nSalesforce will redirect back to /auth/callback with an authorization code.\n\n**Billing Modes:**\n- PERSONAL: Uses Gemini API with API key (default)\n- ENTERPRISE: Uses Vertex AI with customer billing (requires gcpProjectId)\n",
+          "tags": [
+            "Auth"
+          ],
+          "parameters": [
+            {
+              "in": "query",
+              "name": "billingMode",
+              "schema": {
+                "type": "string",
+                "enum": [
+                  "PERSONAL",
+                  "ENTERPRISE"
+                ],
+                "default": "PERSONAL"
+              },
+              "description": "Billing mode for AI service",
+              "example": "PERSONAL"
+            },
+            {
+              "in": "query",
+              "name": "gcpProjectId",
+              "schema": {
+                "type": "string"
+              },
+              "description": "GCP Project ID (required for ENTERPRISE billing mode)",
+              "example": "my-gcp-project-id"
+            },
+            {
+              "in": "query",
+              "name": "state",
+              "schema": {
+                "type": "string"
+              },
+              "description": "Optional state parameter for OAuth flow"
+            }
+          ],
+          "responses": {
+            "302": {
+              "description": "Redirects to Salesforce authorization page"
+            },
+            "400": {
+              "description": "Bad request"
+            }
+          }
+        }
+      },
+      "/auth/callback": {
+        "get": {
+          "summary": "OAuth 2.0 callback handler",
+          "description": "Handles the OAuth callback from Salesforce. This endpoint is called by Salesforce\nafter user authorization. It exchanges the authorization code for access tokens\nand stores organization settings in Redis.\n\n**Note:** This endpoint is typically called by Salesforce, not directly by clients.\n",
+          "tags": [
+            "Auth"
+          ],
+          "parameters": [
+            {
+              "in": "query",
+              "name": "code",
+              "required": true,
+              "schema": {
+                "type": "string"
+              },
+              "description": "Authorization code from Salesforce",
+              "example": "aPrxrF8KvQ8XgL9jH5mN3pQ6rS7tU8vW9xY0zA1bC2dE3f"
+            },
+            {
+              "in": "query",
+              "name": "state",
+              "schema": {
+                "type": "string"
+              },
+              "description": "State parameter from authorization request (may contain billing mode info)"
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Organization successfully authenticated",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AuthCallbackResponse"
+                  }
+                }
+              }
+            },
+            "400": {
+              "description": "Bad request - missing authorization code or invalid parameters",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AuthErrorResponse"
+                  }
+                }
+              }
+            },
+            "500": {
+              "description": "Internal server error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AuthErrorResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   },
-  "keywords": [
-    "salesforce",
-    "automation",
-    "ai",
-    "monitoring"
-  ],
-  "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "express": "^4.18.2",
-    "jsforce": "^3.0.0",
-    "axios": "^1.6.0",
-    "redis": "^4.6.0",
-    "node-cron": "^3.0.3",
-    "dotenv": "^16.3.1",
-    "swagger-jsdoc": "^6.2.8",
-    "swagger-ui-express": "^5.0.0",
-    "cors": "^2.8.5"
-  },
-  "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^20.10.0",
-    "@types/node-cron": "^3.0.11",
-    "@types/swagger-jsdoc": "^6.0.1",
-    "@types/swagger-ui-express": "^4.1.6",
-    "@types/cors": "^2.8.17",
-    "@typescript-eslint/eslint-plugin": "^6.13.0",
-    "@typescript-eslint/parser": "^6.13.0",
-    "eslint": "^8.54.0",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.3.2"
-  }
+  "customOptions": {}
 }
-

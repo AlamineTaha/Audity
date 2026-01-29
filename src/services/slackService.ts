@@ -78,7 +78,7 @@ export class SlackService {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*AI Summary:*\n${notification.summary}`,
+          text: `*AI Summary:*\n${this.truncateSummary(notification.summary)}`,
         },
       },
       ...(notification.changes.length > 0
@@ -136,6 +136,20 @@ export class SlackService {
   }
 
   /**
+   * Truncate summary if it exceeds Slack's Block limit (3000 characters)
+   * Adds a link to read the full report if truncated
+   */
+  private truncateSummary(summary: string, maxLength: number = 3000): string {
+    if (summary.length <= maxLength) {
+      return summary;
+    }
+    
+    const truncated = summary.substring(0, maxLength - 100);
+    const dashboardUrl = process.env.AUDITDELTA_DASHBOARD_URL || 'https://auditdelta.example.com';
+    return `${truncated}...\n\n<${dashboardUrl}|Read full report in AuditDelta Dashboard.>`;
+  }
+
+  /**
    * Build Slack Block Kit blocks for Flow change notification (legacy)
    */
   private buildFlowChangeBlocks(diff: AuditDiff): unknown[] {
@@ -173,7 +187,7 @@ export class SlackService {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*Summary:*\n${diff.summary}`,
+          text: `*Summary:*\n${this.truncateSummary(diff.summary)}`,
         },
       },
       ...(diff.changes.length > 0

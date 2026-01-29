@@ -60,6 +60,10 @@ const swaggerOptions: swaggerJsdoc.Options = {
         description: 'Endpoints for Salesforce Einstein Agent integration',
       },
       {
+        name: 'Flows',
+        description: 'Flow version management and revert endpoints',
+      },
+      {
         name: 'Auth',
         description: 'Authentication endpoints',
       },

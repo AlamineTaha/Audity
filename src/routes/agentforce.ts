@@ -175,7 +175,64 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       };
     }
 
-    // Return response
+    // Get revert impact analysis (merged with analyze-flow)
+    let revertImpact;
+    if (recommendedStableVersion) {
+      try {
+        revertImpact = await salesforceService.checkRevertImpact(orgId, flowName, recommendedStableVersion);
+      } catch (error) {
+        console.error(`Error checking revert impact for ${flowName}:`, error);
+        // Don't fail the entire request if impact check fails
+        revertImpact = {
+          warnings: ['Could not analyze revert impact. Please verify manually before reverting.'],
+          activeSessions: 0,
+          canRevert: false,
+        };
+      }
+    } else {
+      revertImpact = {
+        warnings: [],
+        activeSessions: 0,
+        canRevert: true,
+      };
+    }
+
+    // Extract risk analysis from Flow metadata (PII/God Mode detection)
+    let riskAnalysis;
+    try {
+      const flowMetadata = await salesforceService.getFlowMetadata(orgId, flowName);
+      if (flowMetadata) {
+        // Check for PII fields and high-risk operations
+        const metadataStr = JSON.stringify(flowMetadata).toLowerCase();
+        const hasPII = /(ssn|social|credit|card|password|pin|salary|wage|compensation)/i.test(metadataStr);
+        const hasModifyAll = /modifyall|viewall/i.test(metadataStr);
+        
+        if (hasModifyAll) {
+          riskAnalysis = {
+            riskLevel: 'CRITICAL' as const,
+            riskReason: 'Flow contains ModifyAll or ViewAll operations which grant access to all records regardless of sharing rules.',
+          };
+        } else if (hasPII) {
+          riskAnalysis = {
+            riskLevel: 'HIGH' as const,
+            riskReason: 'Flow accesses PII (Personally Identifiable Information) fields. Ensure proper security controls are in place.',
+          };
+        } else {
+          riskAnalysis = {
+            riskLevel: 'LOW' as const,
+            riskReason: 'No high-risk operations detected in Flow metadata.',
+          };
+        }
+      }
+    } catch (error) {
+      console.error(`Error analyzing Flow risk:`, error);
+      riskAnalysis = {
+        riskLevel: 'MEDIUM' as const,
+        riskReason: 'Could not complete risk analysis. Please verify manually.',
+      };
+    }
+
+    // Return response with merged analysis
     const response: AnalyzeFlowResponse = {
       success: true,
       flowName: diff.flowName,
@@ -188,13 +245,15 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
         revertPrompt,
       },
       dependencies,
+      riskAnalysis,
+      revertImpact,
     };
 
-    res.json(response);
+    return res.json(response);
   } catch (error) {
     console.error('Error in analyze-flow endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: errorMessage,
     } as AnalyzeFlowResponse);
@@ -224,7 +283,7 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
  *                   type: string
  *                   example: "2024-01-01T00:00:00.000Z"
  */
-router.get('/health', (req: Request, res: Response) => {
+router.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -257,7 +316,7 @@ router.get('/health', (req: Request, res: Response) => {
  *                 message:
  *                   type: string
  */
-router.get('/test-oauth-config', (req: Request, res: Response) => {
+router.get('/test-oauth-config', (_req: Request, res: Response) => {
   const config = {
     SF_CLIENT_ID: process.env.SF_CLIENT_ID ? '***' + process.env.SF_CLIENT_ID.slice(-4) : 'NOT SET',
     SF_CLIENT_SECRET: process.env.SF_CLIENT_SECRET ? '***SET***' : 'NOT SET',
@@ -388,7 +447,7 @@ router.post('/test-connection', async (req: Request, res: Response) => {
 
     // Test 2: Test token refresh
     try {
-      const refreshedSettings = await authService.refreshSession(orgId);
+      await authService.refreshSession(orgId);
       testResults.tests.tokenRefresh = true;
       console.log(`[TEST] Token refresh successful for ${orgId}`);
     } catch (error) {
@@ -448,7 +507,7 @@ router.post('/test-connection', async (req: Request, res: Response) => {
                           testResults.tests.apiQuery;
 
     const statusCode = testResults.success ? 200 : 500;
-    res.status(statusCode).json(testResults);
+    return res.status(statusCode).json(testResults);
 
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -462,7 +521,7 @@ router.post('/test-connection', async (req: Request, res: Response) => {
       } : error,
     });
     console.error(`[TEST] General error:`, error);
-    res.status(500).json(testResults);
+    return res.status(500).json(testResults);
   }
 });
 
@@ -518,8 +577,6 @@ router.post('/test-connection', async (req: Request, res: Response) => {
  */
 router.post('/test-gemini', async (req: Request, res: Response) => {
   const { prompt = 'Say hello in one sentence', apiVersion = 'v1', model } = req.body;
-  
-  const aiService = new AIService();
   const testModel = model || process.env.GEMINI_MODEL || 'gemini-1.5-flash';
   const geminiApiKey = process.env.GEMINI_API_KEY || '';
 
@@ -613,11 +670,488 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
   }
 
   // If we get here, all configs failed
-  res.status(500).json({
+  return res.status(500).json({
     success: false,
     message: 'All Gemini API configurations failed',
     allResults: results,
   });
+});
+
+/**
+ * @swagger
+ * /api/v1/flows/check-revert-impact:
+ *   post:
+ *     summary: Check revert impact before activating a Flow version
+ *     description: |
+ *       Analyzes the impact of reverting to a specific Flow version by comparing
+ *       the active version with the target version. Identifies potential issues
+ *       like deleted fields/objects or active sessions.
+ *     tags:
+ *       - Flows
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - flowApiName
+ *               - orgId
+ *               - targetVersionNumber
+ *             properties:
+ *               flowApiName:
+ *                 type: string
+ *                 description: The API name of the Flow
+ *                 example: "My_Flow"
+ *               orgId:
+ *                 type: string
+ *                 description: Salesforce Organization ID
+ *                 example: "00D000000000000AAA"
+ *               targetVersionNumber:
+ *                 type: integer
+ *                 description: Target version number to check impact for
+ *                 example: 34
+ *     responses:
+ *       200:
+ *         description: Impact assessment result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 warnings:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                   description: List of warnings about potential issues
+ *                   example: ["Warning: Reverting to Version 34 may fail if it references fields that have since been deleted or modified."]
+ *                 activeSessions:
+ *                   type: integer
+ *                   description: Number of active flow interviews (mock value)
+ *                   example: 5
+ *                 canRevert:
+ *                   type: boolean
+ *                   description: Whether it's safe to revert based on warnings
+ *                   example: true
+ *       400:
+ *         description: Bad request - missing required fields
+ *       404:
+ *         description: Flow or version not found
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/flows/check-revert-impact', async (req: Request, res: Response) => {
+  try {
+    const { flowApiName, orgId, targetVersionNumber } = req.body;
+
+    if (!flowApiName || !orgId || targetVersionNumber === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: flowApiName, orgId, and targetVersionNumber are required',
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+
+    // Get org settings
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({
+        success: false,
+        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
+      });
+    }
+
+    const impact = await salesforceService.checkRevertImpact(orgId, flowApiName, targetVersionNumber);
+
+    return res.json({
+      success: true,
+      warnings: impact.warnings,
+      activeSessions: impact.activeSessions,
+      canRevert: impact.canRevert,
+      note: impact.activeSessions > 0 
+        ? `Note: Reverting will affect approximately ${impact.activeSessions} active flow interviews currently in progress.`
+        : undefined,
+    });
+  } catch (error) {
+    console.error('Error in check-revert-impact endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    
+    if (errorMessage.includes('not found')) {
+      return res.status(404).json({
+        success: false,
+        error: errorMessage,
+      });
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: errorMessage,
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/flows/activate-version:
+ *   post:
+ *     summary: Activate a specific Flow version (Safe-Revert)
+ *     description: |
+ *       Activates a specific Flow version by changing its status to 'Active'
+ *       and setting the current active version to 'Obsolete'. This does NOT delete anything.
+ *       
+ *       **Important:** Active/Paused Flow Interviews will continue to run on the old version
+ *       until they are completed or deleted manually in Salesforce.
+ *     tags:
+ *       - Flows
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - flowApiName
+ *               - orgId
+ *               - targetVersionNumber
+ *             properties:
+ *               flowApiName:
+ *                 type: string
+ *                 description: The API name of the Flow
+ *                 example: "My_Flow"
+ *               orgId:
+ *                 type: string
+ *                 description: Salesforce Organization ID
+ *                 example: "00D000000000000AAA"
+ *               targetVersionNumber:
+ *                 type: integer
+ *                 description: Target version number to activate
+ *                 example: 34
+ *     responses:
+ *       200:
+ *         description: Version activation successful
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Successfully activated Version 34. Previous active version 39 set to Obsolete."
+ *                 previousActiveVersion:
+ *                   type: integer
+ *                   example: 39
+ *                 newActiveVersion:
+ *                   type: integer
+ *                   example: 34
+ *                 warnings:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *                   example: ["Active/Paused Flow Interviews will continue to run on the old version until they are completed or deleted manually in Salesforce."]
+ *       400:
+ *         description: Bad request - missing required fields
+ *       404:
+ *         description: Flow or version not found
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/flows/activate-version', async (req: Request, res: Response) => {
+  try {
+    const { flowApiName, orgId, targetVersionNumber } = req.body;
+
+    if (!flowApiName || !orgId || targetVersionNumber === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: flowApiName, orgId, and targetVersionNumber are required',
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+
+    // Get org settings
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({
+        success: false,
+        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
+      });
+    }
+
+    const result = await salesforceService.activateSpecificVersion(orgId, flowApiName, targetVersionNumber);
+
+    return res.json({
+      success: result.success,
+      message: result.message,
+      previousActiveVersion: result.previousActiveVersion,
+      newActiveVersion: result.newActiveVersion,
+      warnings: result.warnings,
+    });
+  } catch (error) {
+    console.error('Error in activate-version endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    
+    if (errorMessage.includes('not found')) {
+      return res.status(404).json({
+        success: false,
+        error: errorMessage,
+      });
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: errorMessage,
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/flows/revert-today:
+ *   post:
+ *     summary: Batch revert all changes made today
+ *     description: |
+ *       Reverts all changes made today by activating the last stable version
+ *       (the last version modified before the specified time window).
+ *       
+ *       **Important:** Active/Paused Flow Interviews will continue to run on the old version
+ *       until they are completed or deleted manually in Salesforce.
+ *     tags:
+ *       - Flows
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - flowApiName
+ *               - orgId
+ *             properties:
+ *               flowApiName:
+ *                 type: string
+ *                 description: The API name of the Flow
+ *                 example: "My_Flow"
+ *               orgId:
+ *                 type: string
+ *                 description: Salesforce Organization ID
+ *                 example: "00D000000000000AAA"
+ *               hours:
+ *                 type: integer
+ *                 description: Number of hours to look back (default: 24 for "today")
+ *                 example: 24
+ *     responses:
+ *       200:
+ *         description: Batch revert successful
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Batch revert completed: Activated Version 34 (Last Stable). Successfully activated Version 34..."
+ *                 stableVersion:
+ *                   type: integer
+ *                   example: 34
+ *                 previousActiveVersion:
+ *                   type: integer
+ *                   example: 39
+ *                 warnings:
+ *                   type: array
+ *                   items:
+ *                     type: string
+ *       400:
+ *         description: Bad request - missing required fields
+ *       404:
+ *         description: Flow or stable version not found
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/flows/revert-today', async (req: Request, res: Response) => {
+  try {
+    const { flowApiName, orgId, hours = 24 } = req.body;
+
+    if (!flowApiName || !orgId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: flowApiName and orgId are required',
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+
+    // Get org settings
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({
+        success: false,
+        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
+      });
+    }
+
+    const result = await salesforceService.batchRevertTodayChanges(orgId, flowApiName, hours);
+
+    return res.json({
+      success: result.success,
+      message: result.message,
+      stableVersion: result.stableVersion,
+      previousActiveVersion: result.previousActiveVersion,
+      warnings: result.warnings,
+    });
+  } catch (error) {
+    console.error('Error in revert-today endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    
+    if (errorMessage.includes('not found')) {
+      return res.status(404).json({
+        success: false,
+        error: errorMessage,
+      });
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: errorMessage,
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/flows/versions:
+ *   get:
+ *     summary: Get Flow version history within a time window
+ *     description: |
+ *       Retrieves a list of all Flow versions modified within a specific timeframe.
+ *       Useful for understanding recent changes and identifying which version to revert to.
+ *     tags:
+ *       - Flows
+ *     parameters:
+ *       - in: query
+ *         name: flowApiName
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: The API name of the Flow
+ *         example: "My_Flow"
+ *       - in: query
+ *         name: orgId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Salesforce Organization ID
+ *         example: "00D000000000000AAA"
+ *       - in: query
+ *         name: hours
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           default: 24
+ *         description: Number of hours to look back (default: 24 for "today")
+ *         example: 24
+ *     responses:
+ *       200:
+ *         description: List of versions modified within the time window
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 flowApiName:
+ *                   type: string
+ *                   example: "My_Flow"
+ *                 versions:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       versionNumber:
+ *                         type: integer
+ *                         example: 39
+ *                       modifiedBy:
+ *                         type: string
+ *                         example: "John Doe"
+ *                       timestamp:
+ *                         type: string
+ *                         example: "2024-01-15T10:30:00.000Z"
+ *                       status:
+ *                         type: string
+ *                         example: "Active"
+ *                       versionId:
+ *                         type: string
+ *                         example: "301..."
+ *       400:
+ *         description: Bad request - missing required query parameters
+ *       404:
+ *         description: Flow not found
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/flows/versions', async (req: Request, res: Response) => {
+  try {
+    const { flowApiName, orgId, hours } = req.query;
+
+    if (!flowApiName || !orgId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required query parameters: flowApiName and orgId are required',
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+
+    // Get org settings
+    const settings = await authService.getOrgSettings(orgId as string);
+    if (!settings) {
+      return res.status(404).json({
+        success: false,
+        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
+      });
+    }
+
+    const hoursNum = hours ? parseInt(hours as string, 10) : 24;
+    const versions = await salesforceService.getFlowVersionsInTimeWindow(
+      orgId as string,
+      flowApiName as string,
+      hoursNum
+    );
+
+    return res.json({
+      success: true,
+      flowApiName,
+      versions,
+      timeWindow: `${hoursNum} hours`,
+    });
+  } catch (error) {
+    console.error('Error in versions endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    
+    if (errorMessage.includes('not found')) {
+      return res.status(404).json({
+        success: false,
+        error: errorMessage,
+      });
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: errorMessage,
+    });
+  }
 });
 
 export default router;

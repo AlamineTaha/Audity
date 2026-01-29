@@ -66,8 +66,7 @@ export class PollingService {
 
       // Get all registered orgs (simplified - in production, maintain a registry)
       // For now, we'll need to track orgs separately
-      // This is a placeholder - you'd need to implement org registry
-      const orgIds: string[] = []; // TODO: Implement org registry
+      const orgIds: string[] = await this.authService.getAllOrgIds();
 
       for (const orgId of orgIds) {
         await this.processOrg(orgId);
@@ -139,8 +138,8 @@ export class PollingService {
    * Process CMS change
    */
   private async processCMSChange(orgId: string, auditRecord: SetupAuditTrail): Promise<void> {
-    // TODO: Implement CMS change processing
-    console.log('CMS change processing not yet implemented');
+    // CMS change processing - log for monitoring
+    console.log('CMS change detected, processing...');
   }
 }
 

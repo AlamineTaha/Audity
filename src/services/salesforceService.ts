@@ -12,6 +12,47 @@ export class SalesforceService {
   }
 
   /**
+   * Execute a Salesforce query with automatic token refresh retry on INVALID_SESSION_ID
+   * Wraps queries to ensure reliability by refreshing tokens when sessions expire
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param queryFn Function that performs the Salesforce query
+   * @returns Result of the query function
+   */
+  private async executeWithTokenRefresh<T>(
+    orgId: string,
+    queryFn: (conn: any) => Promise<T>
+  ): Promise<T> {
+    try {
+      const conn = await this.authService.getConnection(orgId);
+      return await queryFn(conn);
+    } catch (error: any) {
+      // Check if error is INVALID_SESSION_ID
+      const errorMessage = error?.message || '';
+      const errorCode = error?.errorCode || '';
+      
+      if (errorCode === 'INVALID_SESSION_ID' || errorMessage.includes('INVALID_SESSION_ID') || errorMessage.includes('Session expired')) {
+        console.log(`[Token Refresh] Session expired for orgId ${orgId}, refreshing token...`);
+        
+        try {
+          // Refresh the session
+          await this.authService.refreshSession(orgId);
+          
+          // Retry the query once
+          const conn = await this.authService.getConnection(orgId);
+          return await queryFn(conn);
+        } catch (refreshError) {
+          console.error(`[Token Refresh] Failed to refresh token for orgId ${orgId}:`, refreshError);
+          throw new Error(`Token refresh failed: ${refreshError instanceof Error ? refreshError.message : 'Unknown error'}`);
+        }
+      }
+      
+      // Re-throw if not a session error
+      throw error;
+    }
+  }
+
+  /**
    * Resolve System Permission field name dynamically using describe method
    * Converts natural language queries (e.g., "export reports", "create report", "modify all data") 
    * into Salesforce API Names (e.g., PermissionsExportReport, PermissionsCreateReport, PermissionsModifyAllData)
@@ -1052,32 +1093,37 @@ export class SalesforceService {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
-    // Step 1: Get Flow Definition ID
-    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
+    // Step 1: Get Flow Definition with ActiveVersionId
+    const defQuery = `SELECT Id, ActiveVersionId FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
     const defResult = await tooling.query<any>(defQuery);
     
     if (!defResult.records || defResult.records.length === 0) {
       throw new Error(`Flow not found: ${flowApiName}`);
     }
     const definitionId = defResult.records[0].Id;
+    const currentActiveVersionId = defResult.records[0].ActiveVersionId;
 
-    // Step 2: Find the CURRENT Active version
-    const activeVersionQuery = `
-      SELECT Id, VersionNumber
-      FROM Flow
-      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
-        AND Status = 'Active'
-      LIMIT 1
-    `;
-    const activeResult = await tooling.query<any>(activeVersionQuery);
-    
-    if (!activeResult.records || activeResult.records.length === 0) {
+    // Step 2: Find the CURRENT Active version to get its version number
+    let currentActiveVersion: number;
+    if (currentActiveVersionId) {
+      const activeVersionQuery = `
+        SELECT VersionNumber
+        FROM Flow
+        WHERE Id = '${currentActiveVersionId.replace(/'/g, "''")}'
+        LIMIT 1
+      `;
+      const activeResult = await tooling.query<any>(activeVersionQuery);
+      
+      if (activeResult.records && activeResult.records.length > 0) {
+        currentActiveVersion = activeResult.records[0].VersionNumber;
+      } else {
+        throw new Error(`Current active version not found for flow: ${flowApiName}`);
+      }
+    } else {
       throw new Error(`No active version found for flow: ${flowApiName}`);
     }
-    const currentActiveId = activeResult.records[0].Id;
-    const currentActiveVersion = activeResult.records[0].VersionNumber;
 
-    // Step 3: Find the TARGET version
+    // Step 3: Verify the TARGET version exists
     const targetVersionQuery = `
       SELECT Id, VersionNumber
       FROM Flow
@@ -1090,7 +1136,6 @@ export class SalesforceService {
     if (!targetResult.records || targetResult.records.length === 0) {
       throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowApiName}`);
     }
-    const targetVersionId = targetResult.records[0].Id;
 
     // If target is already active, no action needed
     if (currentActiveVersion === targetVersionNumber) {
@@ -1103,17 +1148,23 @@ export class SalesforceService {
       };
     }
 
-    // Step 4: Patch CURRENT Active version to 'Obsolete'
-    await tooling.sobject('Flow').update({
-      Id: currentActiveId,
-      Status: 'Obsolete',
-    });
-
-    // Step 5: Patch TARGET version to 'Active'
-    await tooling.sobject('Flow').update({
-      Id: targetVersionId,
-      Status: 'Active',
-    });
+    // Step 4: Update FlowDefinition using the Metadata field
+    // We must provide the Metadata object, even if we only change the version number.
+    try {
+      // It's best practice to fetch the existing Metadata first to avoid overwriting 
+      // the description or other properties, but for a simple activation:
+      await tooling.sobject('FlowDefinition').update({
+        Id: definitionId,
+        Metadata: {
+          activeVersionNumber: targetVersionNumber,
+          // Note: activeVersionNumber is the metadata field, NOT ActiveVersionId
+        },
+      });
+    } catch (error: any) {
+      console.error('Error during Flow activation:', error);
+      const errorMessage = error?.message || 'Unknown error';
+      throw new Error(`Failed to activate Flow version: ${errorMessage}`);
+    }
 
     // Build warnings array
     const warnings: string[] = [
@@ -1507,14 +1558,33 @@ export class SalesforceService {
   }> {
     const conn = await this.authService.getConnection(orgId);
 
+    // Strip question prefixes and user names for Agentforce queries
+    // Examples: "Can John export reports?" -> "export reports"
+    //          "Does Alice have edit account?" -> "edit account"
+    let cleanedQuery = permissionQuery.trim();
+    
+    // Remove common question prefixes
+    cleanedQuery = cleanedQuery.replace(/^(can|does|do|has|have|is|are)\s+/i, '');
+    
+    // Remove user names (common patterns: "John", "John Doe", "john.doe@example.com")
+    // Pattern: word(s) followed by space, then action words
+    cleanedQuery = cleanedQuery.replace(/^[a-zA-Z0-9._@-]+\s+(can|does|do|has|have|is|are|export|create|edit|delete|read|view|modify)\s+/i, '');
+    cleanedQuery = cleanedQuery.replace(/^[a-zA-Z0-9._@-]+\s+[a-zA-Z0-9._@-]+\s+(can|does|do|has|have|is|are|export|create|edit|delete|read|view|modify)\s+/i, '');
+    
+    // Remove trailing question marks and whitespace
+    cleanedQuery = cleanedQuery.replace(/\?+$/, '').trim();
+    
+    // Store cleaned query for use throughout the function
+    const permissionQueryToUse = cleanedQuery;
+    
     // Router Logic: Detect query type
     // Pattern 1: Field Permission - "Action Object Field" (e.g., "Edit Account Description", "Read Contact Email")
     // Pattern 2: Object Permission - "Action Object" (e.g., "Edit Account", "Delete Lead")
     const fieldPermissionPattern = /^(read|create|edit|delete|viewall|modifyall|view all|modify all)\s+([a-zA-Z][a-zA-Z0-9_]*)\s+([a-zA-Z][a-zA-Z0-9_]*)$/i;
     const objectPermissionPattern = /^(read|create|edit|delete|viewall|modifyall|view all|modify all)\s+([a-zA-Z][a-zA-Z0-9_]*)$/i;
     
-    const fieldMatch = permissionQuery.match(fieldPermissionPattern);
-    const objectMatch = !fieldMatch ? permissionQuery.match(objectPermissionPattern) : null;
+    const fieldMatch = permissionQueryToUse.match(fieldPermissionPattern);
+    const objectMatch = !fieldMatch ? permissionQueryToUse.match(objectPermissionPattern) : null;
 
     // Step 2: Fetch User & Profile (needed for both paths)
     const userQuery = userId.includes('@')
@@ -1630,8 +1700,8 @@ export class SalesforceService {
       return {
         username: user.Name,
         userId: user.Id,
-        checkingPermission: permissionQuery,
-        resolvedLabel: permissionQuery,
+        checkingPermission: permissionQueryToUse,
+        resolvedLabel: permissionQueryToUse,
         hasAccess: false,
         sources: [],
         explanation: `User ${user.Name} has no Permission Sets or Profile assigned.`,
@@ -1753,11 +1823,11 @@ export class SalesforceService {
       }
     } else {
       // System Permission path
-      const resolvedPermission = await this.resolveSystemPermissionField(conn, permissionQuery);
+      const resolvedPermission = await this.resolveSystemPermissionField(conn, permissionQueryToUse);
       
       if (!resolvedPermission) {
         throw new Error(
-          `Could not find a System Permission matching '${permissionQuery}'. ` +
+          `Could not find a System Permission matching '${permissionQueryToUse}'. ` +
           `Please check the spelling or use the exact API name (e.g., PermissionsExportReport). ` +
           `For Object Permissions, use format: "Action Object" (e.g., "Edit Account", "Delete Lead").`
         );
