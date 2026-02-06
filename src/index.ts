@@ -12,7 +12,6 @@ import app from './app';
 import { SalesforceAuthService } from './services/authService';
 import { SalesforceService } from './services/salesforceService';
 import { AIService } from './services/aiService';
-import { SlackService } from './services/slackService';
 import { PollingService } from './services/pollingService';
 
 const PORT = process.env.PORT || 3000;
@@ -25,13 +24,11 @@ async function startServer() {
 
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
-    const slackService = new SlackService();
 
-    // Initialize polling service
+    // Initialize polling service (uses Salesforce native integration, no webhook needed)
     const pollingService = new PollingService(
       salesforceService,
       aiService,
-      slackService,
       authService
     );
 

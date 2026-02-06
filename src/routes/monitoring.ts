@@ -7,7 +7,6 @@ import { Router, Request, Response } from 'express';
 import { MonitorService } from '../services/monitorService';
 import { SalesforceService } from '../services/salesforceService';
 import { AIService } from '../services/aiService';
-import { SlackService } from '../services/slackService';
 import { SalesforceAuthService } from '../services/authService';
 
 const router = Router();
@@ -20,11 +19,9 @@ function getMonitorService(): MonitorService {
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
-    const slackService = new SlackService();
     monitorService = new MonitorService(
       salesforceService,
       aiService,
-      slackService,
       authService
     );
   }
@@ -36,9 +33,16 @@ function getMonitorService(): MonitorService {
  * /api/v1/trigger-check:
  *   post:
  *     summary: Force Immediate Change Check
- *     description: Manually triggers the polling engine to check for Salesforce changes immediately, analyze them with AI, and send Slack alerts if issues are found.
+ *     description: Manually triggers the polling engine to check for Salesforce changes immediately, analyze them with AI, and send Slack alerts if issues are found. Use the `hours` query parameter to check for changes in the past X hours (e.g., `?hours=12`).
  *     tags:
  *       - Monitoring
+ *     parameters:
+ *       - in: query
+ *         name: hours
+ *         schema:
+ *           type: integer
+ *         description: Optional. Look back X hours instead of default time window (10 minutes). Use this to check for changes that happened earlier.
+ *         example: 12
  *     responses:
  *       200:
  *         description: Check initiated
@@ -51,31 +55,53 @@ function getMonitorService(): MonitorService {
  *                   type: boolean
  *                 message:
  *                   type: string
- *                   example: "Manual check initiated. Notifications will be sent if changes are found."
+ *                   example: "Manual check completed (12 hour(s)). Found 5 change(s)."
  *                 changesFound:
  *                   type: integer
  *                 errors:
  *                   type: array
  *                   items:
  *                     type: string
+ *                 timeWindow:
+ *                   type: string
+ *                   description: The time window used for the check
+ *                   example: "12 hours"
+ *       400:
+ *         description: Bad request - invalid hours parameter
  */
-router.post('/trigger-check', async (_req: Request, res: Response) => {
+router.post('/trigger-check', async (req: Request, res: Response) => {
   try {
-    const service = getMonitorService();
-    const result = await service.runChangeCheck();
+    const { hours } = req.query;
+    const hoursNum = hours ? parseInt(hours as string, 10) : undefined;
+    
+    // Validate hours parameter if provided
+    if (hoursNum !== undefined && (isNaN(hoursNum) || hoursNum < 1)) {
+      return res.status(400).json({
+        success: false,
+        message: 'hours must be a positive integer',
+        changesFound: 0,
+        errors: ['Invalid hours parameter'],
+      });
+    }
 
-    res.json({
+    const service = getMonitorService();
+    const result = await service.runChangeCheck(hoursNum);
+
+    const timeWindow = hoursNum ? `${hoursNum} hour(s)` : 'default time window';
+    return res.json({
       success: result.success,
       message: result.success
-        ? `Manual check completed. Found ${result.changesFound} change(s).`
+        ? `Manual check completed (${timeWindow}). Found ${result.changesFound} change(s).`
         : 'Manual check completed with errors.',
       changesFound: result.changesFound,
       errors: result.errors,
+      timeWindow: hoursNum ? `${hoursNum} hours` : '10 minutes',
+      changes: result.changes || [], // Include change details in response
     });
   } catch (error) {
     console.error('Error in trigger-check endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: errorMessage,
       changesFound: 0,
@@ -89,9 +115,19 @@ router.post('/trigger-check', async (_req: Request, res: Response) => {
  * /api/v1/recent-changes:
  *   get:
  *     summary: Get Recent Org Activity
- *     description: Retrieves a raw list of metadata changes (Flows, Permissions, Objects) from the Audit Trail.
+ *     description: |
+ *       Retrieves a list of metadata changes from the Audit Trail with AI-powered explanations for Validation Rules and Formula Fields.
+ *       
+ *       **AI Explanations:** For Validation Rules and Formula Fields, the response includes human-readable explanations
+ *       that describe what the change means in business terms. This helps non-technical users understand the impact.
+ *       
+ *       **Supported Change Types:**
+ *       - Validation Rules: `changedValidationFormula`, `changedValidationMessage`, `createdValidationRule`, `changedValidationRule`, `deletedValidationRule`
+ *       - Formula Fields: `createdCFFormula`, `changedCFFormula`, `deletedCFFormula`
+ *       - Other changes: All other audit trail entries are included without AI explanations
  *     tags:
  *       - Monitoring
+ *     operationId: getRecentChanges
  *     parameters:
  *       - in: query
  *         name: hours
@@ -99,14 +135,17 @@ router.post('/trigger-check', async (_req: Request, res: Response) => {
  *           type: integer
  *           default: 24
  *         description: Lookback window in hours
+ *         example: 24
  *       - in: query
  *         name: orgId
+ *         required: true
  *         schema:
  *           type: string
- *         description: Salesforce Organization ID (required)
+ *         description: Salesforce Organization ID
+ *         example: "00DJ6000001H7etMAC"
  *     responses:
  *       200:
- *         description: List of recent changes
+ *         description: List of recent changes with AI explanations for Validation Rules and Formula Fields
  *         content:
  *           application/json:
  *             schema:
@@ -116,19 +155,100 @@ router.post('/trigger-check', async (_req: Request, res: Response) => {
  *                 properties:
  *                   action:
  *                     type: string
- *                     example: "ChangedFlow"
+ *                     description: Salesforce action code
+ *                     example: "changedValidationFormula"
  *                   user:
  *                     type: string
+ *                     description: User who made the change
  *                     example: "Alice Smith"
  *                   section:
  *                     type: string
- *                     example: "Flow Management"
+ *                     description: Section where the change occurred
+ *                     example: "Customize Accounts"
  *                   timestamp:
  *                     type: string
+ *                     format: date-time
+ *                     description: When the change occurred
+ *                     example: "2026-01-15T10:30:00.000Z"
+ *                   display:
+ *                     type: string
+ *                     description: Human-readable description of the change
+ *                     example: "Changed validation rule In_dustry_validation_rule"
+ *                   id:
+ *                     type: string
+ *                     description: Audit trail record ID
+ *                     example: "0Ya..."
+ *                   explanation:
+ *                     type: string
+ *                     description: AI-generated explanation in business terms (only for Validation Rules and Formula Fields)
+ *                     example: "This validation rule blocks users from saving Account records where the Industry field is not set to 'Technology'."
+ *                   metadataName:
+ *                     type: string
+ *                     description: API name of the metadata item (only for Validation Rules and Formula Fields)
+ *                     example: "In_dustry_validation_rule" or "Account.Formula_Test__c"
+ *                   metadataType:
+ *                     type: string
+ *                     enum: [ValidationRule, FormulaField]
+ *                     description: Type of metadata (only for Validation Rules and Formula Fields)
+ *                     example: "ValidationRule"
+ *             examples:
+ *               withExplanations:
+ *                 summary: Changes with AI explanations
+ *                 value:
+ *                   - action: "changedValidationFormula"
+ *                     user: "John Doe"
+ *                     section: "Customize Accounts"
+ *                     timestamp: "2026-01-15T10:30:00.000Z"
+ *                     display: "Changed validation rule In_dustry_validation_rule"
+ *                     id: "0Ya..."
+ *                     explanation: "This validation rule blocks users from saving Account records where the Industry field is not set to 'Technology'."
+ *                     metadataName: "In_dustry_validation_rule"
+ *                     metadataType: "ValidationRule"
+ *                   - action: "changedCFFormula"
+ *                     user: "Jane Smith"
+ *                     section: "Customize Accounts"
+ *                     timestamp: "2026-01-15T11:00:00.000Z"
+ *                     display: "Changed custom formula field: Formula_Test__c"
+ *                     id: "0Yb..."
+ *                     explanation: "This formula field automatically calculates a 10% commission based on the Account's Annual Revenue."
+ *                     metadataName: "Account.Formula_Test__c"
+ *                     metadataType: "FormulaField"
+ *                   - action: "accountlayout"
+ *                     user: "Bob Johnson"
+ *                     section: "Customize Accounts"
+ *                     timestamp: "2026-01-15T12:00:00.000Z"
+ *                     display: "Changed page layout Account Layout"
+ *                     id: "0Yc..."
  *       400:
- *         description: Bad request - missing orgId
+ *         description: Bad request - missing orgId or invalid hours parameter
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                   example: "orgId query parameter is required"
+ *       404:
+ *         description: Organization not found or not configured
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                   example: "Organization 00DJ6000001H7etMAC not found or not configured"
  *       500:
  *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                   example: "Internal server error"
  */
 router.get('/recent-changes', async (req: Request, res: Response) => {
   try {
@@ -149,18 +269,167 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
 
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
+    const aiService = new AIService();
+
+    // Get org settings for billing mode
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({
+        error: `Organization ${orgId} not found or not configured`,
+      });
+    }
 
     const auditRecords = await salesforceService.queryAuditTrailByHours(orgId, hoursNum);
 
-    // Transform to the expected format
-    const changes = auditRecords.map((record) => ({
-      action: record.Action,
-      user: record.CreatedBy.Name,
-      section: record.Section,
-      timestamp: record.CreatedDate,
-      display: record.Display,
-      id: record.Id,
-    }));
+    // Helper function to check if action is validation-related
+    const isValidationAction = (action: string): boolean => {
+      return [
+        'changedValidationFormula',
+        'changedValidationMessage',
+        'createdValidationRule',
+        'changedValidationRule',
+        'deletedValidationRule'
+      ].includes(action);
+    };
+
+    // Helper function to check if action is formula field-related
+    const isFormulaFieldAction = (action: string): boolean => {
+      return [
+        'createdCFFormula',
+        'changedCFFormula',
+        'deletedCFFormula'
+      ].includes(action);
+    };
+
+    // Helper function to extract validation rule name from Display field
+    const extractValidationRuleName = (display: string): string | null => {
+      const patterns = [
+        /(?:ValidationRule|Validation Rule):\s*(.+?)(?:\s|$)/i,
+        /validation rule\s+(.+?)(?:\s|$)/i,
+        /validation\s+["']([^"']+)["']/i,  // Handles: "Changed error message for Accounts validation "RuleName""
+        /rule\s+["']?([^"'\s]+)["']?/i,
+        /"([^"]+)"(?:\s+validation|$)/i
+      ];
+
+      for (const pattern of patterns) {
+        const match = display.match(pattern);
+        if (match && match[1]) {
+          return match[1].trim();
+        }
+      }
+      return null;
+    };
+
+    // Helper function to extract object name from Section field
+    const extractObjectNameFromSection = (section: string): string | null => {
+      if (!section) return null;
+      const match = section.match(/Customize\s+([A-Za-z0-9_]+)/i);
+      if (match && match[1]) {
+        let objectName = match[1];
+        // Remove plural 's' if present
+        if (objectName.endsWith('s') && objectName.length > 1) {
+          objectName = objectName.slice(0, -1);
+        }
+        return objectName;
+      }
+      return null;
+    };
+
+    // Helper function to extract field name from Display field
+    const extractFieldName = (display: string): string | null => {
+      const patterns = [
+        /(?:field|formula field):\s*(.+?)(?:\s*\(|$)/i,
+        /\.([A-Za-z0-9_]+__c)/,
+        /^([A-Za-z0-9_\s]+?)(?:\s*\(|$)/,
+        /"([^"]+)"(?:\s+field|$)/i
+      ];
+
+      for (const pattern of patterns) {
+        const match = display.match(pattern);
+        if (match && match[1]) {
+          return match[1].trim();
+        }
+      }
+      return null;
+    };
+
+    // Process changes with AI explanations for validation rules and formula fields
+    const changes = await Promise.all(
+      auditRecords.map(async (record) => {
+        const change: any = {
+          action: record.Action,
+          user: record.CreatedBy.Name,
+          section: record.Section,
+          timestamp: record.CreatedDate,
+          display: record.Display,
+          id: record.Id,
+        };
+
+        try {
+          // Add AI explanation for Validation Rules
+          if (isValidationAction(record.Action)) {
+            const ruleName = extractValidationRuleName(record.Display || '');
+            if (ruleName) {
+              try {
+                const validationMetadata = await salesforceService.getValidationRuleMetadata(orgId, ruleName);
+                if (validationMetadata) {
+                  const metadata = {
+                    errorConditionFormula: validationMetadata.errorConditionFormula,
+                    id: validationMetadata.id,
+                  };
+                  change.explanation = await aiService.interpretMetadataChange(
+                    metadata,
+                    'ValidationRule',
+                    ruleName,
+                    settings
+                  );
+                  change.metadataName = ruleName;
+                  change.metadataType = 'ValidationRule';
+                }
+              } catch (error) {
+                console.warn(`[Recent Changes] Could not fetch explanation for validation rule ${ruleName}:`, error);
+                // Continue without explanation
+              }
+            }
+          }
+          // Add AI explanation for Formula Fields
+          else if (isFormulaFieldAction(record.Action)) {
+            const fieldName = extractFieldName(record.Display || '');
+            const objectName = extractObjectNameFromSection(record.Section || '') || 
+                             (record.Display?.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/)?.[1]) ||
+                             'Unknown';
+
+            if (fieldName && objectName !== 'Unknown') {
+              try {
+                const formulaMetadata = await salesforceService.getFormulaFieldMetadata(
+                  orgId,
+                  fieldName,
+                  objectName
+                );
+                if (formulaMetadata) {
+                  change.explanation = await aiService.interpretMetadataChange(
+                    formulaMetadata,
+                    'FormulaField',
+                    `${objectName}.${fieldName}`,
+                    settings
+                  );
+                  change.metadataName = `${objectName}.${fieldName}`;
+                  change.metadataType = 'FormulaField';
+                }
+              } catch (error) {
+                console.warn(`[Recent Changes] Could not fetch explanation for formula field ${objectName}.${fieldName}:`, error);
+                // Continue without explanation
+              }
+            }
+          }
+        } catch (error) {
+          // If explanation fails, still return the change without explanation
+          console.warn(`[Recent Changes] Error generating explanation for ${record.Action}:`, error);
+        }
+
+        return change;
+      })
+    );
 
     return res.json(changes);
   } catch (error) {
@@ -393,6 +662,326 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
     console.error('Error in analyze-permission endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
     return res.status(500).json({
+      error: errorMessage,
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/explain-metadata:
+ *   post:
+ *     summary: Explain Validation Rule or Formula Field
+ *     description: |
+ *       Fetches metadata for a Validation Rule or Formula Field by API name and provides an AI-powered explanation in business terms.
+ *       
+ *       **Use Cases:**
+ *       - Understand what a validation rule does without reading the formula
+ *       - Get a business-friendly explanation of a formula field calculation
+ *       - Help non-technical users understand Salesforce metadata
+ *       
+ *       **For Validation Rules:** Only requires `orgId`, `name`, and `type`.
+ *       **For Formula Fields:** Also requires `objectName` parameter.
+ *     tags:
+ *       - Monitoring
+ *     operationId: explainMetadata
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - orgId
+ *               - name
+ *               - type
+ *             properties:
+ *               orgId:
+ *                 type: string
+ *                 description: Salesforce Organization ID
+ *                 example: "00DJ6000001H7etMAC"
+ *               name:
+ *                 type: string
+ *                 description: API name of the Validation Rule or Formula Field (e.g., "In_dustry_validation_rule" or "Formula_Test__c")
+ *                 example: "In_dustry_validation_rule"
+ *               type:
+ *                 type: string
+ *                 enum: [ValidationRule, FormulaField]
+ *                 description: Type of metadata to explain
+ *                 example: "ValidationRule"
+ *               objectName:
+ *                 type: string
+ *                 description: Required for FormulaField - Object API Name (e.g., "Account", "Contact", "CustomObject__c")
+ *                 example: "Account"
+ *           examples:
+ *             validationRule:
+ *               summary: Explain a Validation Rule
+ *               value:
+ *                 orgId: "00DJ6000001H7etMAC"
+ *                 name: "In_dustry_validation_rule"
+ *                 type: "ValidationRule"
+ *             formulaField:
+ *               summary: Explain a Formula Field
+ *               value:
+ *                 orgId: "00DJ6000001H7etMAC"
+ *                 name: "Formula_Test__c"
+ *                 type: "FormulaField"
+ *                 objectName: "Account"
+ *     responses:
+ *       200:
+ *         description: Explanation generated successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 name:
+ *                   type: string
+ *                   description: The API name of the metadata item
+ *                   example: "In_dustry_validation_rule"
+ *                 type:
+ *                   type: string
+ *                   enum: [ValidationRule, FormulaField]
+ *                   example: "ValidationRule"
+ *                 objectName:
+ *                   type: string
+ *                   description: Object name (only present for FormulaField)
+ *                   example: "Account"
+ *                 explanation:
+ *                   type: string
+ *                   description: AI-generated explanation in business terms
+ *                   example: "This validation rule blocks users from saving Account records where the Industry field is not set to 'Technology'. It ensures data quality by preventing invalid industry values."
+ *                 metadata:
+ *                   type: object
+ *                   description: Raw metadata from Salesforce
+ *                   properties:
+ *                     errorConditionFormula:
+ *                       type: string
+ *                       description: Validation rule formula (for ValidationRule)
+ *                       example: "Industry != 'Technology'"
+ *                     formula:
+ *                       type: string
+ *                       description: Formula field calculation (for FormulaField)
+ *                       example: "Account.AnnualRevenue * 0.1"
+ *                     label:
+ *                       type: string
+ *                       description: Human-readable label
+ *                       example: "10% Commission"
+ *                     type:
+ *                       type: string
+ *                       description: Field type (for FormulaField)
+ *                       example: "Currency"
+ *                     id:
+ *                       type: string
+ *                       description: Salesforce metadata ID
+ *                       example: "03d..."
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *                   description: When the explanation was generated
+ *                   example: "2026-01-15T10:30:00.000Z"
+ *             examples:
+ *               validationRule:
+ *                 summary: Validation Rule explanation
+ *                 value:
+ *                   success: true
+ *                   name: "In_dustry_validation_rule"
+ *                   type: "ValidationRule"
+ *                   explanation: "This validation rule blocks users from saving Account records where the Industry field is not set to 'Technology'. It ensures data quality by preventing invalid industry values."
+ *                   metadata:
+ *                     errorConditionFormula: "Industry != 'Technology'"
+ *                     id: "03d..."
+ *                   timestamp: "2026-01-15T10:30:00.000Z"
+ *               formulaField:
+ *                 summary: Formula Field explanation
+ *                 value:
+ *                   success: true
+ *                   name: "Formula_Test__c"
+ *                   type: "FormulaField"
+ *                   objectName: "Account"
+ *                   explanation: "This formula field automatically calculates a 10% commission based on the Account's Annual Revenue. It multiplies the Annual Revenue by 0.1 to determine the commission amount."
+ *                   metadata:
+ *                     formula: "Account.AnnualRevenue * 0.1"
+ *                     label: "Commission"
+ *                     type: "Currency"
+ *                   timestamp: "2026-01-15T10:30:00.000Z"
+ *       400:
+ *         description: Bad request - missing required parameters or invalid type
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Missing required parameters: orgId, name, and type are required"
+ *             examples:
+ *               missingParams:
+ *                 summary: Missing required parameters
+ *                 value:
+ *                   success: false
+ *                   error: "Missing required parameters: orgId, name, and type are required"
+ *               invalidType:
+ *                 summary: Invalid type value
+ *                 value:
+ *                   success: false
+ *                   error: "type must be either \"ValidationRule\" or \"FormulaField\""
+ *               missingObjectName:
+ *                 summary: Missing objectName for FormulaField
+ *                 value:
+ *                   success: false
+ *                   error: "objectName is required when type is \"FormulaField\""
+ *       404:
+ *         description: Metadata not found or organization not configured
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Validation Rule \"In_dustry_validation_rule\" not found"
+ *             examples:
+ *               notFound:
+ *                 summary: Metadata not found
+ *                 value:
+ *                   success: false
+ *                   error: "Validation Rule \"In_dustry_validation_rule\" not found"
+ *               orgNotFound:
+ *                 summary: Organization not configured
+ *                 value:
+ *                   success: false
+ *                   error: "Organization 00DJ6000001H7etMAC not found or not configured"
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
+ *                   type: string
+ *                   example: "Internal server error"
+ */
+router.post('/explain-metadata', async (req: Request, res: Response) => {
+  try {
+    const { orgId, name, type, objectName } = req.body;
+
+    // Validate required parameters
+    if (!orgId || !name || !type) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required parameters: orgId, name, and type are required',
+      });
+    }
+
+    // Validate type
+    if (type !== 'ValidationRule' && type !== 'FormulaField') {
+      return res.status(400).json({
+        success: false,
+        error: 'type must be either "ValidationRule" or "FormulaField"',
+      });
+    }
+
+    // Validate objectName for FormulaField
+    if (type === 'FormulaField' && !objectName) {
+      return res.status(400).json({
+        success: false,
+        error: 'objectName is required when type is "FormulaField"',
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+    const aiService = new AIService();
+
+    // Get org settings for billing mode
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({
+        success: false,
+        error: `Organization ${orgId} not found or not configured`,
+      });
+    }
+
+    let metadata: any = null;
+    let explanation: string;
+
+    if (type === 'ValidationRule') {
+      // Fetch Validation Rule metadata
+      const validationMetadata = await salesforceService.getValidationRuleMetadata(orgId, name);
+      
+      if (!validationMetadata) {
+        return res.status(404).json({
+          success: false,
+          error: `Validation Rule "${name}" not found`,
+        });
+      }
+
+      metadata = {
+        errorConditionFormula: validationMetadata.errorConditionFormula,
+        id: validationMetadata.id,
+      };
+
+      // Generate AI explanation
+      explanation = await aiService.interpretMetadataChange(
+        metadata,
+        'ValidationRule',
+        name,
+        settings
+      );
+    } else {
+      // Fetch Formula Field metadata
+      const formulaMetadata = await salesforceService.getFormulaFieldMetadata(
+        orgId,
+        name,
+        objectName
+      );
+
+      if (!formulaMetadata) {
+        return res.status(404).json({
+          success: false,
+          error: `Formula Field "${name}" not found on object "${objectName}"`,
+        });
+      }
+
+      metadata = formulaMetadata;
+
+      // Generate AI explanation
+      explanation = await aiService.interpretMetadataChange(
+        formulaMetadata,
+        'FormulaField',
+        `${objectName}.${name}`,
+        settings
+      );
+    }
+
+    return res.json({
+      success: true,
+      name,
+      type,
+      objectName: type === 'FormulaField' ? objectName : undefined,
+      explanation,
+      metadata,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Error in explain-metadata endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    return res.status(500).json({
+      success: false,
       error: errorMessage,
     });
   }
