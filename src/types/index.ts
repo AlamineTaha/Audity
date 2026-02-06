@@ -80,6 +80,7 @@ export interface AuditDiff {
   newVersion: number;
   summary: string;
   changes: string[];
+  securityFindings?: string[]; // Security and performance findings from AI analysis
   timestamp: string;
   orgId: string;
 }

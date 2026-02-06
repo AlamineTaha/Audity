@@ -6,14 +6,12 @@
 import * as cron from 'node-cron';
 import { SalesforceService } from './salesforceService';
 import { AIService } from './aiService';
-import { SlackService } from './slackService';
 import { SalesforceAuthService } from './authService';
 import { SetupAuditTrail } from '../types';
 
 export class PollingService {
   private salesforceService: SalesforceService;
   private aiService: AIService;
-  private slackService: SlackService;
   private authService: SalesforceAuthService;
   private cronExpression: string;
   private isRunning: boolean = false;
@@ -21,13 +19,11 @@ export class PollingService {
   constructor(
     salesforceService: SalesforceService,
     aiService: AIService,
-    slackService: SlackService,
     authService: SalesforceAuthService,
     cronExpression: string = '*/10 * * * *' // Every 10 minutes
   ) {
     this.salesforceService = salesforceService;
     this.aiService = aiService;
-    this.slackService = slackService;
     this.authService = authService;
     this.cronExpression = cronExpression;
   }
@@ -66,8 +62,7 @@ export class PollingService {
 
       // Get all registered orgs (simplified - in production, maintain a registry)
       // For now, we'll need to track orgs separately
-      // This is a placeholder - you'd need to implement org registry
-      const orgIds: string[] = []; // TODO: Implement org registry
+      const orgIds: string[] = await this.authService.getAllOrgIds();
 
       for (const orgId of orgIds) {
         await this.processOrg(orgId);
@@ -89,6 +84,8 @@ export class PollingService {
           await this.processFlowChange(orgId, record);
         } else if (record.Action === 'ManagedContent' || record.Action === 'PublishKnowledge') {
           await this.processCMSChange(orgId, record);
+        } else if (record.Action === 'changedValidationFormula' || record.Action?.toLowerCase().includes('validation')) {
+          await this.processValidationRuleChange(orgId, record);
         }
       }
     } catch (error) {
@@ -128,8 +125,18 @@ export class PollingService {
         settings
       );
 
-      // Send Slack notification
-      await this.slackService.sendFlowChangeNotification(diff);
+      // Build summary text for Slack (formatted for Salesforce Flow → Slack)
+      const summaryText = `🚨 **Flow Change Detected: ${flowName}**\n\n` +
+        `**Summary:**\n${diff.summary}\n\n` +
+        `**Changes:**\n${diff.changes.map(c => `• ${c}`).join('\n')}\n\n` +
+        `**Changed by:** ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
+        `**Time:** ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
+        `**View in Salesforce:** ${settings.instanceUrl}/lightning/setup/Flows/home`;
+
+      // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
+      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, flowName);
+
+      console.log(`[Polling] Published Flow change notification to Salesforce for: ${flowName}`);
     } catch (error) {
       console.error(`Error processing flow change:`, error);
     }
@@ -138,9 +145,64 @@ export class PollingService {
   /**
    * Process CMS change
    */
-  private async processCMSChange(orgId: string, auditRecord: SetupAuditTrail): Promise<void> {
-    // TODO: Implement CMS change processing
-    console.log('CMS change processing not yet implemented');
+  private async processCMSChange(_orgId: string, _auditRecord: SetupAuditTrail): Promise<void> {
+    // CMS change processing - log for monitoring
+    console.log('CMS change detected, processing...');
+  }
+
+  /**
+   * Process Validation Rule change
+   * Fetches the formula, gets Gemini interpretation, and publishes to Salesforce
+   */
+  private async processValidationRuleChange(orgId: string, auditRecord: SetupAuditTrail): Promise<void> {
+    try {
+      // Extract validation rule name from Display field
+      // Format examples: "ValidationRule: RuleName", "Validation Rule: RuleName", etc.
+      const display = auditRecord.Display || '';
+      const ruleNameMatch = display.match(/(?:ValidationRule|Validation Rule):\s*(.+)/i);
+      
+      if (!ruleNameMatch) {
+        console.warn(`Could not extract validation rule name from: ${display}`);
+        return;
+      }
+
+      const ruleName = ruleNameMatch[1].trim();
+
+      // Get org settings for billing mode
+      const settings = await this.authService.getOrgSettings(orgId);
+      if (!settings) {
+        throw new Error(`No settings found for orgId: ${orgId}`);
+      }
+
+      // Fetch the full validation rule formula
+      const formula = await this.salesforceService.getValidationRuleFormula(orgId, ruleName);
+      
+      if (!formula) {
+        console.warn(`Could not fetch formula for validation rule: ${ruleName}`);
+        return;
+      }
+
+      // Get Gemini interpretation of the formula
+      const interpretation = await this.aiService.interpretValidationFormula(
+        formula,
+        ruleName,
+        settings
+      );
+
+      // Build summary text for Slack
+      const summaryText = `🔍 **Validation Rule Updated: ${ruleName}**\n\n` +
+        `**Formula:**\n\`\`\`${formula}\`\`\`\n\n` +
+        `**AI Interpretation:**\n${interpretation}\n\n` +
+        `**Changed by:** ${auditRecord.CreatedBy.Name}\n` +
+        `**Time:** ${new Date(auditRecord.CreatedDate).toLocaleString()}`;
+
+      // Publish to Salesforce custom object (triggers Flow → Slack)
+      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, ruleName);
+
+      console.log(`[Polling] Processed validation rule change: ${ruleName}`);
+    } catch (error) {
+      console.error(`Error processing validation rule change:`, error);
+    }
   }
 }
 

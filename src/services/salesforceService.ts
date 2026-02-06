@@ -12,6 +12,47 @@ export class SalesforceService {
   }
 
   /**
+   * Execute a Salesforce query with automatic token refresh retry on INVALID_SESSION_ID
+   * Wraps queries to ensure reliability by refreshing tokens when sessions expire
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param queryFn Function that performs the Salesforce query
+   * @returns Result of the query function
+   */
+  private async executeWithTokenRefresh<T>(
+    orgId: string,
+    queryFn: (conn: any) => Promise<T>
+  ): Promise<T> {
+    try {
+      const conn = await this.authService.getConnection(orgId);
+      return await queryFn(conn);
+    } catch (error: any) {
+      // Check if error is INVALID_SESSION_ID
+      const errorMessage = error?.message || '';
+      const errorCode = error?.errorCode || '';
+      
+      if (errorCode === 'INVALID_SESSION_ID' || errorMessage.includes('INVALID_SESSION_ID') || errorMessage.includes('Session expired')) {
+        console.log(`[Token Refresh] Session expired for orgId ${orgId}, refreshing token...`);
+        
+        try {
+          // Refresh the session
+          await this.authService.refreshSession(orgId);
+          
+          // Retry the query once
+          const conn = await this.authService.getConnection(orgId);
+          return await queryFn(conn);
+        } catch (refreshError) {
+          console.error(`[Token Refresh] Failed to refresh token for orgId ${orgId}:`, refreshError);
+          throw new Error(`Token refresh failed: ${refreshError instanceof Error ? refreshError.message : 'Unknown error'}`);
+        }
+      }
+      
+      // Re-throw if not a session error
+      throw error;
+    }
+  }
+
+  /**
    * Resolve System Permission field name dynamically using describe method
    * Converts natural language queries (e.g., "export reports", "create report", "modify all data") 
    * into Salesforce API Names (e.g., PermissionsExportReport, PermissionsCreateReport, PermissionsModifyAllData)
@@ -606,6 +647,7 @@ export class SalesforceService {
 
     // Query SetupAuditTrail for changes in the specified time window
     // Filter for relevant actions: ChangedFlow, flowChanged, ManagedContent, PublishKnowledge, etc.
+    // Note: Action LIKE '%layout%' and '%Formula%' won't work in SOQL - they need to be exact matches or use proper LIKE syntax
     const soql = `
       SELECT Id, Action, Display, CreatedDate, CreatedBy.Id, CreatedBy.Name, Section
       FROM SetupAuditTrail
@@ -614,11 +656,10 @@ export class SalesforceService {
           Action LIKE '%Flow%' 
           OR Action LIKE '%Permission%'
           OR Action LIKE '%Object%'
+          OR Action LIKE '%Validation%'
+          OR Action LIKE '%Formula%'
           OR Action = 'ManagedContent'
           OR Action = 'PublishKnowledge'
-          OR Action = '%layout%'
-          OR Action = '%Formula%'
-
         )
       ORDER BY CreatedDate DESC
       LIMIT 100
@@ -1052,32 +1093,37 @@ export class SalesforceService {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
-    // Step 1: Get Flow Definition ID
-    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
+    // Step 1: Get Flow Definition with ActiveVersionId
+    const defQuery = `SELECT Id, ActiveVersionId FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
     const defResult = await tooling.query<any>(defQuery);
     
     if (!defResult.records || defResult.records.length === 0) {
       throw new Error(`Flow not found: ${flowApiName}`);
     }
     const definitionId = defResult.records[0].Id;
+    const currentActiveVersionId = defResult.records[0].ActiveVersionId;
 
-    // Step 2: Find the CURRENT Active version
-    const activeVersionQuery = `
-      SELECT Id, VersionNumber
-      FROM Flow
-      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
-        AND Status = 'Active'
-      LIMIT 1
-    `;
-    const activeResult = await tooling.query<any>(activeVersionQuery);
-    
-    if (!activeResult.records || activeResult.records.length === 0) {
+    // Step 2: Find the CURRENT Active version to get its version number
+    let currentActiveVersion: number;
+    if (currentActiveVersionId) {
+      const activeVersionQuery = `
+        SELECT VersionNumber
+        FROM Flow
+        WHERE Id = '${currentActiveVersionId.replace(/'/g, "''")}'
+        LIMIT 1
+      `;
+      const activeResult = await tooling.query<any>(activeVersionQuery);
+      
+      if (activeResult.records && activeResult.records.length > 0) {
+        currentActiveVersion = activeResult.records[0].VersionNumber;
+      } else {
+        throw new Error(`Current active version not found for flow: ${flowApiName}`);
+      }
+    } else {
       throw new Error(`No active version found for flow: ${flowApiName}`);
     }
-    const currentActiveId = activeResult.records[0].Id;
-    const currentActiveVersion = activeResult.records[0].VersionNumber;
 
-    // Step 3: Find the TARGET version
+    // Step 3: Verify the TARGET version exists
     const targetVersionQuery = `
       SELECT Id, VersionNumber
       FROM Flow
@@ -1090,7 +1136,6 @@ export class SalesforceService {
     if (!targetResult.records || targetResult.records.length === 0) {
       throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowApiName}`);
     }
-    const targetVersionId = targetResult.records[0].Id;
 
     // If target is already active, no action needed
     if (currentActiveVersion === targetVersionNumber) {
@@ -1103,17 +1148,23 @@ export class SalesforceService {
       };
     }
 
-    // Step 4: Patch CURRENT Active version to 'Obsolete'
-    await tooling.sobject('Flow').update({
-      Id: currentActiveId,
-      Status: 'Obsolete',
-    });
-
-    // Step 5: Patch TARGET version to 'Active'
-    await tooling.sobject('Flow').update({
-      Id: targetVersionId,
-      Status: 'Active',
-    });
+    // Step 4: Update FlowDefinition using the Metadata field
+    // We must provide the Metadata object, even if we only change the version number.
+    try {
+      // It's best practice to fetch the existing Metadata first to avoid overwriting 
+      // the description or other properties, but for a simple activation:
+      await tooling.sobject('FlowDefinition').update({
+        Id: definitionId,
+        Metadata: {
+          activeVersionNumber: targetVersionNumber,
+          // Note: activeVersionNumber is the metadata field, NOT ActiveVersionId
+        },
+      });
+    } catch (error: any) {
+      console.error('Error during Flow activation:', error);
+      const errorMessage = error?.message || 'Unknown error';
+      throw new Error(`Failed to activate Flow version: ${errorMessage}`);
+    }
 
     // Build warnings array
     const warnings: string[] = [
@@ -1279,6 +1330,91 @@ export class SalesforceService {
       }
       
       throw error;
+    }
+  }
+
+  /**
+   * Find parent flows that use a specific flow as a subflow
+   * Performs reverse lookup by searching all Flow definitions for references to this flow
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param subflowApiName The subflow API name to find parents for
+   * @returns Array of parent flow API names that use this subflow
+   */
+  async findParentFlows(
+    orgId: string,
+    subflowApiName: string
+  ): Promise<Array<{
+    flowApiName: string;
+    label?: string;
+  }>> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      // Query all Flow definitions
+      const flowQuery = `
+        SELECT Id, ApiName, Label, LatestVersionId
+        FROM FlowDefinition
+        WHERE Status = 'Active'
+        LIMIT 200
+      `;
+
+      const result = await tooling.query<any>(flowQuery);
+      
+      if (!result.records || result.records.length === 0) {
+        return [];
+      }
+
+      const parentFlows: Array<{ flowApiName: string; label?: string }> = [];
+
+      // Check each flow for references to the subflow
+      for (const flowDef of result.records) {
+        if (!flowDef.LatestVersionId) continue;
+
+        try {
+          const flowDefinition = await this.getFlowDefinition(orgId, flowDef.LatestVersionId);
+          
+          // Search for subflow references
+          const hasSubflowReference = (obj: any): boolean => {
+            if (!obj || typeof obj !== 'object') {
+              return false;
+            }
+
+            for (const [key, value] of Object.entries(obj)) {
+              // Check if this is a subflow reference
+              if ((key === 'flow' || key === 'flowReference' || key === 'flowApiName') && 
+                  typeof value === 'string' && value === subflowApiName) {
+                return true;
+              }
+
+              // Recursively search nested objects
+              if (typeof value === 'object' && value !== null) {
+                if (hasSubflowReference(value)) {
+                  return true;
+                }
+              }
+            }
+
+            return false;
+          };
+
+          if (hasSubflowReference(flowDefinition)) {
+            parentFlows.push({
+              flowApiName: flowDef.ApiName,
+              label: flowDef.Label,
+            });
+          }
+        } catch (error) {
+          // Skip flows that can't be accessed
+          console.warn(`[Salesforce] Could not check flow ${flowDef.ApiName} for subflow references:`, error);
+        }
+      }
+
+      return parentFlows;
+    } catch (error) {
+      console.error(`Error finding parent flows for subflow ${subflowApiName}:`, error);
+      return [];
     }
   }
 
@@ -1507,14 +1643,33 @@ export class SalesforceService {
   }> {
     const conn = await this.authService.getConnection(orgId);
 
+    // Strip question prefixes and user names for Agentforce queries
+    // Examples: "Can John export reports?" -> "export reports"
+    //          "Does Alice have edit account?" -> "edit account"
+    let cleanedQuery = permissionQuery.trim();
+    
+    // Remove common question prefixes
+    cleanedQuery = cleanedQuery.replace(/^(can|does|do|has|have|is|are)\s+/i, '');
+    
+    // Remove user names (common patterns: "John", "John Doe", "john.doe@example.com")
+    // Pattern: word(s) followed by space, then action words
+    cleanedQuery = cleanedQuery.replace(/^[a-zA-Z0-9._@-]+\s+(can|does|do|has|have|is|are|export|create|edit|delete|read|view|modify)\s+/i, '');
+    cleanedQuery = cleanedQuery.replace(/^[a-zA-Z0-9._@-]+\s+[a-zA-Z0-9._@-]+\s+(can|does|do|has|have|is|are|export|create|edit|delete|read|view|modify)\s+/i, '');
+    
+    // Remove trailing question marks and whitespace
+    cleanedQuery = cleanedQuery.replace(/\?+$/, '').trim();
+    
+    // Store cleaned query for use throughout the function
+    const permissionQueryToUse = cleanedQuery;
+    
     // Router Logic: Detect query type
     // Pattern 1: Field Permission - "Action Object Field" (e.g., "Edit Account Description", "Read Contact Email")
     // Pattern 2: Object Permission - "Action Object" (e.g., "Edit Account", "Delete Lead")
     const fieldPermissionPattern = /^(read|create|edit|delete|viewall|modifyall|view all|modify all)\s+([a-zA-Z][a-zA-Z0-9_]*)\s+([a-zA-Z][a-zA-Z0-9_]*)$/i;
     const objectPermissionPattern = /^(read|create|edit|delete|viewall|modifyall|view all|modify all)\s+([a-zA-Z][a-zA-Z0-9_]*)$/i;
     
-    const fieldMatch = permissionQuery.match(fieldPermissionPattern);
-    const objectMatch = !fieldMatch ? permissionQuery.match(objectPermissionPattern) : null;
+    const fieldMatch = permissionQueryToUse.match(fieldPermissionPattern);
+    const objectMatch = !fieldMatch ? permissionQueryToUse.match(objectPermissionPattern) : null;
 
     // Step 2: Fetch User & Profile (needed for both paths)
     const userQuery = userId.includes('@')
@@ -1630,8 +1785,8 @@ export class SalesforceService {
       return {
         username: user.Name,
         userId: user.Id,
-        checkingPermission: permissionQuery,
-        resolvedLabel: permissionQuery,
+        checkingPermission: permissionQueryToUse,
+        resolvedLabel: permissionQueryToUse,
         hasAccess: false,
         sources: [],
         explanation: `User ${user.Name} has no Permission Sets or Profile assigned.`,
@@ -1753,11 +1908,11 @@ export class SalesforceService {
       }
     } else {
       // System Permission path
-      const resolvedPermission = await this.resolveSystemPermissionField(conn, permissionQuery);
+      const resolvedPermission = await this.resolveSystemPermissionField(conn, permissionQueryToUse);
       
       if (!resolvedPermission) {
         throw new Error(
-          `Could not find a System Permission matching '${permissionQuery}'. ` +
+          `Could not find a System Permission matching '${permissionQueryToUse}'. ` +
           `Please check the spelling or use the exact API name (e.g., PermissionsExportReport). ` +
           `For Object Permissions, use format: "Action Object" (e.g., "Edit Account", "Delete Lead").`
         );
@@ -1957,6 +2112,375 @@ export class SalesforceService {
         explanation,
         riskAnalysis: riskAssessment,
       };
+    }
+  }
+
+  /**
+   * Publish audit event to Salesforce custom object for Org-to-Slack bridge
+   * Creates a record in AuditDelta_Event__c which triggers a Flow to send message to Slack
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param summaryText AI-generated summary text to send to Slack
+   * @param ruleName Name of the validation rule or other entity that triggered the event
+   * @returns Created record ID
+   */
+  async publishAuditToSalesforce(
+    orgId: string,
+    summaryText: string,
+    ruleName: string
+  ): Promise<string> {
+    const conn = await this.authService.getConnection(orgId);
+
+    try {
+      const record = {
+        Name: `Validation Update: ${ruleName}`,
+        Message__c: summaryText,
+      };
+
+      const result = await conn.sobject('AuditDelta_Event__c').create(record);
+
+      if (!result.success) {
+        throw new Error(`Failed to create AuditDelta_Event__c record: ${result.errors?.join(', ') || 'Unknown error'}`);
+      }
+
+      console.log(`[AuditDelta] Published audit event to Salesforce: ${result.id} for rule: ${ruleName}`);
+      return result.id;
+    } catch (error: any) {
+      const errorMessage = error?.message || 'Unknown error';
+      
+      // Check if custom object doesn't exist
+      if (errorMessage.includes('sObject type') || errorMessage.includes('INVALID_TYPE')) {
+        throw new Error(
+          `Custom object 'AuditDelta_Event__c' not found. ` +
+          `Please ensure the custom object exists with fields: Name (Text), Message__c (Long Text Area).`
+        );
+      }
+      
+      // Check if field doesn't exist
+      if (errorMessage.includes('No such column') || errorMessage.includes('INVALID_FIELD')) {
+        throw new Error(
+          `Required fields not found on AuditDelta_Event__c. ` +
+          `Please ensure the object has fields: Name (Text), Message__c (Long Text Area).`
+        );
+      }
+      
+      throw new Error(`Failed to publish audit to Salesforce: ${errorMessage}`);
+    }
+  }
+
+  /**
+   * Get Validation Rule metadata from Salesforce using Tooling API
+   * Returns the full metadata object including errorConditionFormula
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param validationRuleName API name of the validation rule (e.g., "Prevent_Invalid_Email")
+   * @returns Validation rule metadata object with errorConditionFormula, or null if not found
+   */
+  async getValidationRuleMetadata(
+    orgId: string,
+    validationRuleName: string
+  ): Promise<{ id: string; errorConditionFormula: string } | null> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      // Use ValidationName field for exact match (more reliable than FullName)
+      // LIMIT 1 is required when querying Metadata field in Tooling API
+      const soql = `
+        SELECT Id, FullName, Metadata
+        FROM ValidationRule
+        WHERE ValidationName = '${validationRuleName.replace(/'/g, "''")}'
+        LIMIT 1
+      `;
+
+      const result = await tooling.query<any>(soql);
+
+      if (!result.records || result.records.length === 0) {
+        // Fallback: try FullName if ValidationName didn't work
+        const fallbackSoql = `
+          SELECT Id, FullName, Metadata
+          FROM ValidationRule
+          WHERE FullName = '${validationRuleName.replace(/'/g, "''")}'
+          LIMIT 1
+        `;
+        const fallbackResult = await tooling.query<any>(fallbackSoql);
+        
+        if (!fallbackResult.records || fallbackResult.records.length === 0) {
+          return null;
+        }
+        
+        const metadata = fallbackResult.records[0].Metadata || {};
+        return {
+          id: fallbackResult.records[0].Id,
+          errorConditionFormula: metadata.errorConditionFormula || metadata.ValidationFormula || ''
+        };
+      }
+
+      const metadata = result.records[0].Metadata || {};
+      return {
+        id: result.records[0].Id,
+        errorConditionFormula: metadata.errorConditionFormula || metadata.ValidationFormula || ''
+      };
+    } catch (error) {
+      console.error(`Error fetching validation rule metadata for ${validationRuleName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Store Validation Rule formula snapshot in Redis for future comparison
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param validationRuleName API name of the validation rule
+   * @param formula Current formula to store
+   */
+  private async storeValidationRuleSnapshot(
+    orgId: string,
+    validationRuleName: string,
+    formula: string
+  ): Promise<void> {
+    try {
+      const redisKey = `validation_rule:${orgId}:${validationRuleName}`;
+      // Store with 30-day expiration (validation rules don't change frequently)
+      await this.authService['redisClient'].setEx(redisKey, 30 * 24 * 60 * 60, formula);
+      console.log(`[SalesforceService] Stored validation rule snapshot for ${validationRuleName}`);
+    } catch (error) {
+      // Non-critical: log but don't fail if Redis is unavailable
+      console.warn(`[SalesforceService] Failed to store validation rule snapshot: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Get stored Validation Rule formula snapshot from Redis
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param validationRuleName API name of the validation rule
+   * @returns Previous formula if found in Redis, null otherwise
+   */
+  private async getValidationRuleSnapshot(
+    orgId: string,
+    validationRuleName: string
+  ): Promise<string | null> {
+    try {
+      const redisKey = `validation_rule:${orgId}:${validationRuleName}`;
+      const storedFormula = await this.authService['redisClient'].get(redisKey);
+      return storedFormula || null;
+    } catch (error) {
+      // Non-critical: log but don't fail if Redis is unavailable
+      console.warn(`[SalesforceService] Failed to retrieve validation rule snapshot: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get Validation Rule formula from Salesforce (legacy method, kept for backward compatibility)
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param validationRuleName API name of the validation rule
+   * @returns Validation rule formula text
+   */
+  async getValidationRuleFormula(
+    orgId: string,
+    validationRuleName: string
+  ): Promise<string | null> {
+    const metadata = await this.getValidationRuleMetadata(orgId, validationRuleName);
+    return metadata?.errorConditionFormula || null;
+  }
+
+  /**
+   * Get Validation Rule versions for diff comparison
+   * Similar to getFlowVersions, but for Validation Rules
+   * Retrieves previous version from Redis snapshot storage
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param validationRuleName API name of the validation rule
+   * @param currentChangeTime Timestamp of the current change (unused, kept for API consistency)
+   * @returns Object with current and previous formulas
+   */
+  async getValidationRuleVersions(
+    orgId: string,
+    validationRuleName: string,
+    _currentChangeTime: string // Kept for API consistency, but we use Redis snapshots instead
+  ): Promise<{ current: string; previous: string | null }> {
+    // Get current version
+    const currentMetadata = await this.getValidationRuleMetadata(orgId, validationRuleName);
+    const currentFormula = currentMetadata?.errorConditionFormula || '';
+
+    // Get previous version from Redis snapshot storage
+    const previousFormula = await this.getValidationRuleSnapshot(orgId, validationRuleName);
+
+    // Store current version for next comparison (async, don't wait)
+    if (currentFormula) {
+      this.storeValidationRuleSnapshot(orgId, validationRuleName, currentFormula).catch(err => {
+        console.warn(`[SalesforceService] Failed to store validation rule snapshot: ${err}`);
+      });
+    }
+
+    return {
+      current: currentFormula,
+      previous: previousFormula,
+    };
+  }
+
+  /**
+   * Get Flow Metadata for a specific version using Tooling API
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param flowName Flow API name
+   * @param versionNumber Optional: specific version number. If not provided, gets latest version
+   * @returns Flow Metadata object or null if not found
+   */
+  async getFlowMetadataByVersion(
+    orgId: string,
+    flowName: string,
+    versionNumber?: number
+  ): Promise<unknown | null> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      // First, get the FlowDefinition ID
+      const defQuery = `
+        SELECT Id, DeveloperName
+        FROM FlowDefinition
+        WHERE DeveloperName = '${flowName.replace(/'/g, "''")}'
+        LIMIT 1
+      `;
+      
+      const defResult = await tooling.query<any>(defQuery);
+      if (!defResult.records || defResult.records.length === 0) {
+        return null;
+      }
+      
+      const definitionId = defResult.records[0].Id;
+      
+      // Build version query
+      let versionQuery = `
+        SELECT Id, Metadata, VersionNumber
+        FROM Flow
+        WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+      `;
+      
+      if (versionNumber !== undefined) {
+        versionQuery += ` AND VersionNumber = ${versionNumber}`;
+      } else {
+        versionQuery += ` ORDER BY VersionNumber DESC`;
+      }
+      
+      versionQuery += ` LIMIT 1`;
+      
+      const versionResult = await tooling.query<any>(versionQuery);
+      if (!versionResult.records || versionResult.records.length === 0) {
+        return null;
+      }
+      
+      return versionResult.records[0].Metadata || null;
+    } catch (error) {
+      console.error(`Error fetching Flow metadata for ${flowName} version ${versionNumber}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get Custom Field Metadata including formula using Tooling API
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param fieldName Custom Field API name (e.g., "CustomField__c")
+   * @param objectName Object API name (e.g., "Account")
+   * @returns Custom Field metadata with formula, or null if not found
+   */
+  /**
+   * Convert a field label to DeveloperName format
+   * Replaces spaces with underscores, removes __c if present, and handles special characters
+   * Examples: "Formula Test" -> "Formula_Test__c", "CustomField__c" -> "CustomField__c"
+   */
+  private labelToDeveloperName(label: string): string {
+    if (!label) return label;
+    
+    // If it already looks like a DeveloperName (starts with capital, contains only alphanumeric/underscore)
+    // and ends with __c, use as-is
+    if (/^[A-Z][A-Za-z0-9_]*__c$/.test(label)) {
+      return label;
+    }
+    
+    // Remove __c suffix if present (we'll add it back if needed)
+    let devName = label.replace(/__c$/i, '');
+    
+    // Replace spaces and special characters with underscores
+    devName = devName.replace(/[^A-Za-z0-9_]/g, '_');
+    
+    // Remove multiple consecutive underscores
+    devName = devName.replace(/_+/g, '_');
+    
+    // Remove leading/trailing underscores
+    devName = devName.replace(/^_+|_+$/g, '');
+    
+    // Capitalize first letter (Salesforce DeveloperName convention)
+    if (devName.length > 0) {
+      devName = devName.charAt(0).toUpperCase() + devName.slice(1);
+    }
+    
+    // If it doesn't end with __c, add it (assuming it's a custom field)
+    if (!devName.endsWith('__c')) {
+      devName = devName + '__c';
+    }
+    
+    return devName;
+  }
+
+  /**
+   * Get Formula Field metadata from Salesforce using Tooling API
+   * Specifically for formula fields (not validation rules)
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param fieldName Field DeveloperName or Label (will be converted to DeveloperName)
+   * @param objectName Object API Name (e.g., "Account")
+   * @returns Formula field metadata with formula, label, and type, or null if not found
+   */
+  async getFormulaFieldMetadata(
+    orgId: string,
+    fieldName: string,
+    objectName: string
+  ): Promise<{ formula?: string; label?: string; type?: string } | null> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      // Convert fieldName to DeveloperName format if it's a label
+      // If fieldName already contains __c or is in API format, use as-is
+      // Otherwise, convert label to DeveloperName
+      const developerName = fieldName.includes('__c') || /^[A-Z][A-Za-z0-9_]+$/.test(fieldName)
+        ? fieldName
+        : this.labelToDeveloperName(fieldName);
+
+      // Sanitize inputs for SOQL
+      const sanitizedDevName = developerName.replace(/'/g, "''");
+      const sanitizedObjectName = objectName.replace(/'/g, "''");
+
+      // Use DeveloperName and TableEnumOrId instead of FullName (FullName is not filterable)
+      const soql = `
+        SELECT Id, FullName, Metadata
+        FROM CustomField
+        WHERE DeveloperName = '${sanitizedDevName}'
+          AND TableEnumOrId = '${sanitizedObjectName}'
+        LIMIT 1
+      `;
+
+      const result = await tooling.query<any>(soql);
+
+      if (!result.records || result.records.length === 0) {
+        return null;
+      }
+
+      const metadata = result.records[0].Metadata || {};
+      return {
+        formula: metadata.formula || undefined,
+        label: metadata.label || undefined,
+        type: metadata.type || undefined,
+      };
+    } catch (error) {
+      console.error(`Error fetching Custom Field metadata for ${fieldName}:`, error);
+      throw error;
     }
   }
 

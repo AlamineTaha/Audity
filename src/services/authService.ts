@@ -31,7 +31,12 @@ export class SalesforceAuthService {
     });
 
     this.redisClient.on('error', (err) => {
-      console.error('Redis Client Error:', err);
+      if (err.message.includes('NOAUTH') || err.message.includes('Authentication required')) {
+        console.error('Redis Authentication Error: Check REDIS_PASSWORD in .env file');
+        console.error('If Redis requires authentication, set REDIS_PASSWORD in your .env file');
+      } else {
+        console.error('Redis Client Error:', err);
+      }
     });
   }
 
@@ -41,6 +46,19 @@ export class SalesforceAuthService {
   async connect(): Promise<void> {
     if (!this.redisClient.isOpen) {
       await this.redisClient.connect();
+      
+      // Authenticate if password is set
+      // Note: Redis v4+ client should handle auth automatically via password option,
+      // but we'll ensure it's authenticated explicitly for compatibility
+      if (process.env.REDIS_PASSWORD) {
+        try {
+          await this.redisClient.sendCommand(['AUTH', process.env.REDIS_PASSWORD]);
+        } catch (error) {
+          // If AUTH fails, it might be because auth was already done or not required
+          // Log but don't fail - the connection might still work
+          console.warn('Redis AUTH command failed (this may be normal if auth is handled automatically):', error);
+        }
+      }
     }
   }
 
