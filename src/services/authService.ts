@@ -292,6 +292,79 @@ export class SalesforceAuthService {
     return data ? JSON.parse(data) : null;
   }
 
+  /** Deduplication: SetupAuditTrail.Id is the source of truth; keys expire after 10 min */
+  private static readonly AUDIT_PROCESSED_TTL_SEC = 600; // 10 minutes
+
+  /**
+   * Check if this SetupAuditTrail record was already processed
+   * Uses record.Id (SetupAuditTrail Id) - same Id = same change = duplicate
+   */
+  async isAuditRecordProcessed(orgId: string, recordId: string): Promise<boolean> {
+    if (!recordId || recordId.trim() === '') return false;
+    await this.connect();
+    const key = `audit_processed:${orgId}:${recordId}`;
+    const exists = await this.redisClient.exists(key);
+    return exists === 1;
+  }
+
+  /**
+   * Mark a SetupAuditTrail record as processed by its Id
+   * recordId = SetupAuditTrail.Id (unique per audit trail entry)
+   */
+  async markAuditRecordProcessed(orgId: string, recordId: string): Promise<void> {
+    if (!recordId || recordId.trim() === '') return;
+    await this.connect();
+    const key = `audit_processed:${orgId}:${recordId}`;
+    await this.redisClient.setEx(key, SalesforceAuthService.AUDIT_PROCESSED_TTL_SEC, '1');
+  }
+
+  /** Validation rule deduplication: one Slack message per rule per 5 min (SF creates multiple SetupAuditTrail per change) */
+  private static readonly VALIDATION_PROCESSED_TTL_SEC = 300; // 5 minutes
+
+  async isValidationRuleRecentlyProcessed(orgId: string, ruleName: string): Promise<boolean> {
+    if (!ruleName || ruleName.trim() === '') return false;
+    await this.connect();
+    const key = `validation_processed:${orgId}:${ruleName}`;
+    const exists = await this.redisClient.exists(key);
+    return exists === 1;
+  }
+
+  async markValidationRuleProcessed(orgId: string, ruleName: string): Promise<void> {
+    if (!ruleName || ruleName.trim() === '') return;
+    await this.connect();
+    const key = `validation_processed:${orgId}:${ruleName}`;
+    await this.redisClient.setEx(key, SalesforceAuthService.VALIDATION_PROCESSED_TTL_SEC, '1');
+  }
+
+  /** Flow thread ledger: 36h TTL (129600 seconds) */
+  private static readonly FLOW_THREAD_TTL_SEC = 129600;
+
+  async getFlowThreadTs(orgId: string, flowDeveloperName: string): Promise<string | null> {
+    await this.connect();
+    const key = `flow_thread:${orgId}:${flowDeveloperName}`;
+    return await this.redisClient.get(key);
+  }
+
+  async setFlowThreadTs(orgId: string, flowDeveloperName: string, threadTs: string): Promise<void> {
+    await this.connect();
+    const key = `flow_thread:${orgId}:${flowDeveloperName}`;
+    await this.redisClient.setEx(key, SalesforceAuthService.FLOW_THREAD_TTL_SEC, threadTs);
+  }
+
+  /**
+   * Delete all audit_processed keys (run every 24h)
+   */
+  async cleanupAuditProcessedKeys(): Promise<number> {
+    await this.connect();
+    const keys = await this.redisClient.keys('audit_processed:*');
+    if (keys.length === 0) return 0;
+    for (const key of keys) {
+      await this.redisClient.del(key);
+    }
+    console.log(`[Auth] Cleaned up ${keys.length} audit_processed key(s)`);
+    return keys.length;
+  }
+
   /**
    * Get all registered organization IDs from Redis
    */

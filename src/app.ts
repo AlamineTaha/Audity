@@ -179,20 +179,29 @@ const swaggerOptions: swaggerJsdoc.Options = {
       '/api/v1/recent-changes': {
         get: {
           summary: 'Get Recent Org Activity',
-          description: 'Retrieves a raw list of metadata changes (Flows, Permissions, Objects) from the Audit Trail.',
+          description: 'Retrieves a list of metadata changes from the Audit Trail with AI-powered explanations for Validation Rules and Formula Fields.',
           operationId: 'getRecentChanges',
           tags: ['Monitoring'],
           parameters: [
             {
               in: 'query',
+              name: 'orgId',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Salesforce Organization ID (required)',
+              example: '00DJ6000001H7etMAC',
+            },
+            {
+              in: 'query',
               name: 'hours',
+              required: false,
               schema: { type: 'integer', default: 24 },
-              description: 'Lookback window in hours',
+              description: 'Lookback window in hours (optional, defaults to 24)',
             },
           ],
           responses: {
             '200': {
-              description: 'List of recent changes',
+              description: 'List of recent changes with AI explanations for Validation Rules and Formula Fields',
               content: {
                 'application/json': {
                   schema: {
@@ -200,11 +209,55 @@ const swaggerOptions: swaggerJsdoc.Options = {
                     items: {
                       type: 'object',
                       properties: {
-                        action: { type: 'string', example: 'ChangedFlow' },
+                        action: { type: 'string', example: 'changedValidationFormula' },
                         user: { type: 'string', example: 'Alice Smith' },
-                        section: { type: 'string', example: 'Flow Management' },
-                        timestamp: { type: 'string' },
+                        section: { type: 'string', example: 'Customize Accounts' },
+                        timestamp: { type: 'string', format: 'date-time', example: '2026-01-15T10:30:00.000Z' },
+                        display: { type: 'string', example: 'Changed validation rule In_dustry_validation_rule' },
+                        id: { type: 'string', example: '0Ya...' },
+                        explanation: { type: 'string', description: 'AI-generated explanation (only for Validation Rules and Formula Fields)', example: 'This validation rule blocks users from saving Account records where the Industry field is not set to Technology.' },
+                        metadataName: { type: 'string', example: 'In_dustry_validation_rule' },
+                        metadataType: { type: 'string', enum: ['ValidationRule', 'FormulaField'] },
                       },
+                    },
+                  },
+                },
+              },
+            },
+            '400': {
+              description: 'Bad request - missing orgId or invalid hours parameter',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      error: { type: 'string', example: 'orgId query parameter is required' },
+                    },
+                  },
+                },
+              },
+            },
+            '404': {
+              description: 'Organization not found or not configured',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      error: { type: 'string', example: 'Organization 00DJ6000001H7etMAC not found or not configured' },
+                    },
+                  },
+                },
+              },
+            },
+            '500': {
+              description: 'Internal server error',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      error: { type: 'string', example: 'Internal server error' },
                     },
                   },
                 },
