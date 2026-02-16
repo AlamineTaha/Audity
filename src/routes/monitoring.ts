@@ -102,6 +102,29 @@ router.post('/slack-thread-callback', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Clear audit_processed Redis cache (for re-testing)
+ * POST /api/v1/clear-audit-cache
+ */
+router.post('/clear-audit-cache', async (_req: Request, res: Response) => {
+  try {
+    const authService = new SalesforceAuthService();
+    await authService.connect();
+    const count = await authService.cleanupAuditProcessedKeys();
+    return res.json({
+      success: true,
+      message: `Cleared ${count} audit_processed key(s). You can re-test now.`,
+      keysCleared: count,
+    });
+  } catch (error) {
+    console.error('[clear-audit-cache] Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
 router.post('/trigger-check', async (req: Request, res: Response) => {
   try {
     const { hours, debug } = req.query;
