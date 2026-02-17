@@ -632,6 +632,103 @@ export class SalesforceService {
   }
 
   /**
+   * Query Setup Audit Trail for recent changes (last N seconds)
+   * Used for time-based gate to avoid processing old records
+   * @param orgId Salesforce Organization ID
+   * @param seconds Number of seconds to look back (default: 60)
+   * @returns Array of SetupAuditTrail records
+   */
+  async queryAuditTrailBySeconds(orgId: string, seconds: number = 60): Promise<SetupAuditTrail[]> {
+    const conn = await this.authService.getConnection(orgId);
+    
+    const cutoffTime = new Date();
+    cutoffTime.setSeconds(cutoffTime.getSeconds() - seconds);
+    const cutoffTimeStr = cutoffTime.toISOString();
+
+    const soql = `
+      SELECT Id, Action, Display, CreatedDate, CreatedBy.Id, CreatedBy.Name, Section
+      FROM SetupAuditTrail
+      WHERE CreatedDate >= ${cutoffTimeStr}
+      ORDER BY CreatedDate DESC
+      LIMIT 200
+    `;
+
+    try {
+      const result = await conn.query<any>(soql);
+      
+      return result.records.map((record: any) => ({
+        Id: record.Id,
+        Action: record.Action,
+        Display: record.Display,
+        CreatedDate: record.CreatedDate,
+        CreatedBy: {
+          Id: record.CreatedBy?.Id || '',
+          Name: record.CreatedBy?.Name || 'Unknown',
+        },
+        Section: record.Section || '',
+        DelegateUser: record.DelegateUser ? {
+          Id: record.DelegateUser.Id,
+          Name: record.DelegateUser.Name,
+        } : undefined,
+      })) as SetupAuditTrail[];
+    } catch (error) {
+      console.error('Error querying audit trail:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Query Setup Audit Trail for exactly N seconds (filtered by relevant actions)
+   * Used for snapshot aggregation with a precise 300-second window
+   */
+  async queryAuditTrailBySecondsFiltered(orgId: string, seconds: number = 300): Promise<SetupAuditTrail[]> {
+    const conn = await this.authService.getConnection(orgId);
+    const cutoffTime = new Date();
+    cutoffTime.setSeconds(cutoffTime.getSeconds() - seconds);
+    const cutoffTimeStr = cutoffTime.toISOString();
+
+    const soql = `
+      SELECT Id, Action, Display, CreatedDate, CreatedBy.Id, CreatedBy.Name, Section
+      FROM SetupAuditTrail
+      WHERE CreatedDate >= ${cutoffTimeStr}
+        AND (
+          Action LIKE '%Flow%'
+          OR Action LIKE '%Permission%'
+          OR Action LIKE '%PermSet%'
+          OR Action LIKE '%Object%'
+          OR Action LIKE '%Validation%'
+          OR Action LIKE '%Formula%'
+          OR Action = 'ManagedContent'
+          OR Action = 'PublishKnowledge'
+        )
+      ORDER BY CreatedDate ASC
+      LIMIT 200
+    `;
+
+    try {
+      const result = await conn.query<any>(soql);
+      return result.records.map((record: any) => ({
+        Id: record.Id,
+        Action: record.Action,
+        Display: record.Display,
+        CreatedDate: record.CreatedDate,
+        CreatedBy: {
+          Id: record.CreatedBy?.Id || '',
+          Name: record.CreatedBy?.Name || 'Unknown',
+        },
+        Section: record.Section || '',
+        DelegateUser: record.DelegateUser ? {
+          Id: record.DelegateUser.Id,
+          Name: record.DelegateUser.Name,
+        } : undefined,
+      })) as SetupAuditTrail[];
+    } catch (error) {
+      console.error('Error querying audit trail:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Query Setup Audit Trail for recent changes
    * @param orgId Salesforce Organization ID
    * @param minutes Number of minutes to look back (default: 10)
@@ -655,6 +752,7 @@ export class SalesforceService {
         AND (
           Action LIKE '%Flow%' 
           OR Action LIKE '%Permission%'
+          OR Action LIKE '%PermSet%'
           OR Action LIKE '%Object%'
           OR Action LIKE '%Validation%'
           OR Action LIKE '%Formula%'
@@ -1352,10 +1450,11 @@ export class SalesforceService {
     const tooling = conn.tooling;
 
     try {
-      // Query all Flow definitions
+      // Query Flow (versions) with Status = 'Active' instead of FlowDefinition
+      // FlowDefinition doesn't have Status, but Flow (versions) does
       const flowQuery = `
-        SELECT Id, ApiName, Label, LatestVersionId
-        FROM FlowDefinition
+        SELECT Id, MasterLabel, DefinitionId, VersionNumber
+        FROM Flow
         WHERE Status = 'Active'
         LIMIT 200
       `;
@@ -1366,14 +1465,31 @@ export class SalesforceService {
         return [];
       }
 
+      // Get unique DefinitionIds (one per flow definition)
+      const definitionIds = [...new Set(result.records.map((r: any) => r.DefinitionId))];
+
+      // Query FlowDefinition to get DeveloperName for each definition
+      const defQuery = `
+        SELECT Id, DeveloperName, MasterLabel
+        FROM FlowDefinition
+        WHERE Id IN ('${definitionIds.join("','")}')
+      `;
+
+      const defResult = await tooling.query<any>(defQuery);
+      const defMap = new Map<string, { DeveloperName: string; MasterLabel?: string }>();
+      defResult.records.forEach((def: any) => {
+        defMap.set(def.Id, def);
+      });
+
       const parentFlows: Array<{ flowApiName: string; label?: string }> = [];
 
-      // Check each flow for references to the subflow
-      for (const flowDef of result.records) {
-        if (!flowDef.LatestVersionId) continue;
+      // Check each active flow for references to the subflow
+      for (const flowRecord of result.records) {
+        const flowDef = defMap.get(flowRecord.DefinitionId);
+        if (!flowDef) continue;
 
         try {
-          const flowDefinition = await this.getFlowDefinition(orgId, flowDef.LatestVersionId);
+          const flowDefinition = await this.getFlowDefinition(orgId, flowRecord.Id);
           
           // Search for subflow references
           const hasSubflowReference = (obj: any): boolean => {
@@ -1401,13 +1517,13 @@ export class SalesforceService {
 
           if (hasSubflowReference(flowDefinition)) {
             parentFlows.push({
-              flowApiName: flowDef.ApiName,
-              label: flowDef.Label,
+              flowApiName: flowDef.DeveloperName || flowRecord.DefinitionId,
+              label: flowDef.MasterLabel || flowRecord.MasterLabel,
             });
           }
         } catch (error) {
           // Skip flows that can't be accessed
-          console.warn(`[Salesforce] Could not check flow ${flowDef.ApiName} for subflow references:`, error);
+          console.warn(`[Salesforce] Could not check flow ${flowDef.DeveloperName || flowRecord.DefinitionId} for subflow references:`, error);
         }
       }
 
@@ -2124,18 +2240,42 @@ export class SalesforceService {
    * @param ruleName Name of the validation rule or other entity that triggered the event
    * @returns Created record ID
    */
+  /**
+   * Publish audit event to Salesforce custom object
+   * This triggers a Salesforce Flow that sends the message to Slack
+   * 
+   * @param orgId Salesforce Organization ID
+   * @param summaryText Message content to send
+   * @param ruleName Name/identifier of the metadata item
+   * @param category Category for channel routing ('Security', 'Automation', 'Schema')
+   * @param threadTs Optional Slack thread timestamp for threaded replies
+   * @returns Record ID of the created AuditDelta_Event__c record
+   */
   async publishAuditToSalesforce(
     orgId: string,
     summaryText: string,
-    ruleName: string
+    ruleName: string,
+    category: 'Security' | 'Automation' | 'Schema' = 'Schema',
+    threadTs?: string
   ): Promise<string> {
     const conn = await this.authService.getConnection(orgId);
 
     try {
-      const record = {
-        Name: `Validation Update: ${ruleName}`,
+      const fullName = `${category} Update: ${ruleName}`;
+      const record: Record<string, unknown> = {
+        Name: fullName.length > 80 ? fullName.substring(0, 77) + '...' : fullName,
         Message__c: summaryText,
       };
+
+      // Optional fields - only set if your AuditDelta_Event__c has them
+      // Category__c: used by Flow for Slack_Channel_Mapping__mdt lookup
+      if (category) {
+        record.Category__c = category;
+      }
+      // Thread_Timestamp__c: for threaded replies (Flow passes to Slack thread_ts)
+      if (threadTs) {
+        record.Thread_Timestamp__c = threadTs;
+      }
 
       const result = await conn.sobject('AuditDelta_Event__c').create(record);
 
@@ -2143,7 +2283,7 @@ export class SalesforceService {
         throw new Error(`Failed to create AuditDelta_Event__c record: ${result.errors?.join(', ') || 'Unknown error'}`);
       }
 
-      console.log(`[AuditDelta] Published audit event to Salesforce: ${result.id} for rule: ${ruleName}`);
+      console.log(`[AuditDelta] Published audit event to Salesforce: ${result.id} for ${category}:${ruleName}${threadTs ? ' (threaded)' : ''}`);
       return result.id;
     } catch (error: any) {
       const errorMessage = error?.message || 'Unknown error';
@@ -2152,15 +2292,24 @@ export class SalesforceService {
       if (errorMessage.includes('sObject type') || errorMessage.includes('INVALID_TYPE')) {
         throw new Error(
           `Custom object 'AuditDelta_Event__c' not found. ` +
-          `Please ensure the custom object exists with fields: Name (Text), Message__c (Long Text Area).`
+          `Please ensure the custom object exists with fields: Name (Text), Message__c (Long Text Area), Category__c (Text, optional), Channel__c (Text, optional), Thread_Timestamp__c (Text, optional).`
         );
       }
       
       // Check if field doesn't exist
       if (errorMessage.includes('No such column') || errorMessage.includes('INVALID_FIELD')) {
+        // Log the actual error for debugging
+        console.error(`[SalesforceService] Field error details:`, error);
+        
+        // Try to extract which field is missing
+        const fieldMatch = errorMessage.match(/No such column '([^']+)'/);
+        const missingField = fieldMatch ? fieldMatch[1] : 'unknown';
+        
         throw new Error(
-          `Required fields not found on AuditDelta_Event__c. ` +
-          `Please ensure the object has fields: Name (Text), Message__c (Long Text Area).`
+          `Required field '${missingField}' not found on AuditDelta_Event__c. ` +
+          `Please ensure the object has fields: Name (Text), Message__c (Long Text Area), ` +
+          `Category__c (Text, optional), Channel__c (Text, optional), Thread_Timestamp__c (Text, optional). ` +
+          `Actual error: ${errorMessage}`
         );
       }
       
@@ -2323,12 +2472,76 @@ export class SalesforceService {
   }
 
   /**
+   * Get Flow Delta (N vs N-1) for AI comparison
+   * Uses Tooling API: fetches current (V-n) and previous (V-n-1) Metadata JSON blobs
+   */
+  async getFlowDelta(orgId: string, flowName: string): Promise<{
+    current: unknown;
+    previous: unknown | null;
+    currentVersion: number;
+    previousVersion: number;
+  } | null> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowName.replace(/'/g, "''")}' LIMIT 1`;
+      const defResult = await tooling.query<any>(defQuery);
+      if (!defResult.records?.length) return null;
+
+      const definitionId = defResult.records[0].Id;
+      const flowQuery = `
+        SELECT Id, VersionNumber, Metadata, Status
+        FROM Flow
+        WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        ORDER BY VersionNumber DESC
+        LIMIT 2
+      `;
+      const flowResult = await tooling.query<any>(flowQuery);
+      if (!flowResult.records?.length) return null;
+
+      const current = flowResult.records[0];
+      const previous = flowResult.records[1] || null;
+      const currentMetadata = current.Metadata ?? current;
+      const previousMetadata = previous?.Metadata ?? previous ?? null;
+
+      return {
+        current: currentMetadata,
+        previous: previousMetadata,
+        currentVersion: current.VersionNumber ?? 0,
+        previousVersion: previous?.VersionNumber ?? 0,
+      };
+    } catch (error) {
+      console.error(`Error fetching flow delta for ${flowName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get Max VersionNumber for a Flow (latest version)
+   */
+  async getFlowMaxVersion(orgId: string, flowName: string): Promise<number> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowName.replace(/'/g, "''")}' LIMIT 1`;
+    const defResult = await tooling.query<any>(defQuery);
+    if (!defResult.records?.length) return 0;
+
+    const definitionId = defResult.records[0].Id;
+    const flowQuery = `
+      SELECT VersionNumber
+      FROM Flow
+      WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+      ORDER BY VersionNumber DESC
+      LIMIT 1
+    `;
+    const flowResult = await tooling.query<any>(flowQuery);
+    return flowResult.records?.[0]?.VersionNumber ?? 0;
+  }
+
+  /**
    * Get Flow Metadata for a specific version using Tooling API
-   * 
-   * @param orgId Salesforce Organization ID
-   * @param flowName Flow API name
-   * @param versionNumber Optional: specific version number. If not provided, gets latest version
-   * @returns Flow Metadata object or null if not found
    */
   async getFlowMetadataByVersion(
     orgId: string,

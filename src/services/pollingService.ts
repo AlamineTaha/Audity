@@ -134,7 +134,12 @@ export class PollingService {
         `**View in Salesforce:** ${settings.instanceUrl}/lightning/setup/Flows/home`;
 
       // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, flowName);
+      await this.salesforceService.publishAuditToSalesforce(
+        orgId,
+        summaryText,
+        flowName,
+        'Automation' // FlowDefinition → Automation category
+      );
 
       console.log(`[Polling] Published Flow change notification to Salesforce for: ${flowName}`);
     } catch (error) {
@@ -197,9 +202,14 @@ export class PollingService {
         `**Time:** ${new Date(auditRecord.CreatedDate).toLocaleString()}`;
 
       // Publish to Salesforce custom object (triggers Flow → Slack)
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, ruleName);
+      const recordId = await this.salesforceService.publishAuditToSalesforce(
+        orgId,
+        summaryText,
+        ruleName,
+        'Schema' // ValidationRule → Schema category
+      );
 
-      console.log(`[Polling] Processed validation rule change: ${ruleName}`);
+      console.log(`[Polling] Created AuditDelta_Event__c ${recordId} for validation rule: ${ruleName}`);
     } catch (error) {
       console.error(`Error processing validation rule change:`, error);
     }

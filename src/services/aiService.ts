@@ -5,6 +5,7 @@
 
 import axios, { AxiosInstance } from 'axios';
 import { OrgSettings, AuditDiff } from '../types';
+import { logLLMCall } from '../utils/llmPromptLogger';
 
 export class AIService {
   private geminiApiKey: string;
@@ -53,7 +54,7 @@ Please provide a clear, concise explanation of what this validation rule does:
 Keep your response under 200 words and use plain language that a non-technical admin can understand.`;
 
     try {
-      return await this.callLLM(prompt, settings);
+      return await this.callLLM(prompt, settings, 'interpretValidationFormula');
     } catch (error) {
       console.error('Error interpreting validation formula:', error);
       throw new Error(`Failed to interpret validation formula: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -118,7 +119,7 @@ Keep your response under 300 words and use plain language that a non-technical a
 Focus on the differences and their business impact.`;
 
     try {
-      return await this.callLLM(prompt, settings);
+      return await this.callLLM(prompt, settings, 'compareValidationRuleFormulas');
     } catch (error) {
       console.error('Error comparing validation rule formulas:', error);
       throw new Error(`Failed to compare validation rule formulas: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -221,7 +222,7 @@ Please explain what this change means in business terms. Use clear, non-technica
     }
 
     try {
-      return await this.callLLM(prompt, settings);
+      return await this.callLLM(prompt, settings, `interpretMetadataChange:${type}`);
     } catch (error) {
       console.error(`Error interpreting ${type} metadata change:`, error);
       throw new Error(`Failed to interpret ${type} metadata: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -322,7 +323,7 @@ Use clear, non-technical language. Keep it under 150 words.`;
     const sanitizedNew = this.sanitizeJson(newJson);
 
     const prompt = this.buildPrompt(sanitizedOld, sanitizedNew, flowName, parentFlows);
-    const summary = await this.callLLM(prompt, settings);
+    const summary = await this.callLLM(prompt, settings, 'generateSummary');
 
     // Parse the summary to extract structured information
     const changes = this.extractChanges(summary);
@@ -374,6 +375,69 @@ Use clear, non-technical language. Keep it under 150 words.`;
     }
 
     return findings.length > 0 ? findings : [];
+  }
+
+  /**
+   * Generate an aggregate summary for a development session
+   * Alias for analyzeDevelopmentSession - used when active_session expires
+   */
+  async generateAggregateSummary(
+    changes: Array<{ version?: number; summary: string; timestamp: string; action: string }>,
+    metadataName: string,
+    metadataType: string,
+    settings: OrgSettings
+  ): Promise<string> {
+    return this.analyzeDevelopmentSession(changes, metadataName, metadataType, settings);
+  }
+
+  /**
+   * Analyze a development session with multiple changes
+   * Summarizes all changes in a session to identify patterns, fixes, and final state
+   * 
+   * @param changes Array of change objects with version numbers and summaries
+   * @param metadataName Name of the metadata item (e.g., Flow name, Validation Rule name)
+   * @param metadataType Type of metadata (e.g., 'FlowDefinition', 'ValidationRule')
+   * @param settings Org settings for billing mode
+   * @returns Session summary with insights about the development pattern
+   */
+  async analyzeDevelopmentSession(
+    changes: Array<{
+      version?: number;
+      summary: string;
+      timestamp: string;
+      action: string;
+    }>,
+    metadataName: string,
+    metadataType: string,
+    settings: OrgSettings
+  ): Promise<string> {
+    const changesText = changes.map((change, index) => {
+      return `Change ${index + 1} (Version ${change.version || 'N/A'}, ${change.timestamp}):
+Action: ${change.action}
+Summary: ${change.summary}
+---`;
+    }).join('\n\n');
+
+    const prompt = `You are a Salesforce Development Session Analyzer. Analyze this development session for ${metadataType} "${metadataName}".
+
+The developer made ${changes.length} change(s) in a short time period:
+
+${changesText}
+
+Please provide a comprehensive session summary:
+1. *Starting State:* What was the initial state or goal?
+2. *Development Pattern:* Did the developer iterate to fix issues? Were there any bugs introduced and then fixed?
+3. *Final State:* What is the final, active state after all changes?
+4. *Insights:* Any patterns or concerns (e.g., multiple rapid changes suggesting troubleshooting, or a clean progression)?
+
+Format your response in clear sections. Use Slack markdown formatting (*bold* for emphasis). Keep it concise but informative (under 300 words).`;
+
+    try {
+      return await this.callLLM(prompt, settings);
+    } catch (error) {
+      console.error(`Error analyzing development session:`, error);
+      return `Session Summary: ${changes.length} change(s) were made to ${metadataName}. Review the individual changes for details.`;
+    }
   }
 
   /**
@@ -431,13 +495,24 @@ IMPACTS: [Any business impacts or concerns${parentFlows && parentFlows.length > 
 
   /**
    * Call the LLM (Gemini or Vertex AI) based on billing mode
+   * Logs prompt and response to llm_prompts_log.jsonl for debugging duplicate messages
    */
-  private async callLLM(prompt: string, settings: OrgSettings): Promise<string> {
-    if (settings.billingMode === 'ENTERPRISE') {
-      return this.callVertexAI(prompt, settings);
-    } else {
-      return this.callGeminiAPI(prompt);
-    }
+  private async callLLM(prompt: string, settings: OrgSettings, method: string = 'unknown'): Promise<string> {
+    const response = settings.billingMode === 'ENTERPRISE'
+      ? await this.callVertexAI(prompt, settings)
+      : await this.callGeminiAPI(prompt);
+
+    logLLMCall({
+      timestamp: new Date().toISOString(),
+      method,
+      context: `${method} | orgId=${settings.orgId}`,
+      prompt,
+      response,
+      promptLength: prompt.length,
+      responseLength: response.length,
+    });
+
+    return response;
   }
 
   /**

@@ -13,6 +13,7 @@ import { SalesforceAuthService } from './services/authService';
 import { SalesforceService } from './services/salesforceService';
 import { AIService } from './services/aiService';
 import { PollingService } from './services/pollingService';
+import { ensureWaitingRoomStarted } from './routes/monitoring';
 
 const PORT = process.env.PORT || 3000;
 
@@ -34,6 +35,19 @@ async function startServer() {
 
     // Start polling service
     pollingService.start();
+
+    // Waiting Room Listener: Background process monitors Redis TTL
+    // When a session expires (5 min), automatically triggers processAggregation
+    await ensureWaitingRoomStarted();
+
+    // Cleanup audit_processed keys every 24h
+    setInterval(async () => {
+      try {
+        await authService.cleanupAuditProcessedKeys();
+      } catch (err) {
+        console.error('[Startup] audit_processed cleanup failed:', err);
+      }
+    }, 24 * 60 * 60 * 1000);
 
     // Start Express server
     app.listen(PORT, () => {

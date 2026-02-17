@@ -158,6 +158,29 @@ const swaggerOptions: swaggerJsdoc.Options = {
           description: 'Manually triggers the polling engine to check for Salesforce changes immediately, analyze them with AI, and send Slack alerts if issues are found.',
           operationId: 'triggerCheck',
           tags: ['Monitoring'],
+          parameters: [
+            {
+              in: 'query',
+              name: 'hours',
+              required: false,
+              schema: { type: 'integer' },
+              description: 'Look back X hours instead of default time window (300 seconds).',
+            },
+            {
+              in: 'query',
+              name: 'debug',
+              required: false,
+              schema: { type: 'boolean', default: false },
+              description: 'If true, skip isAuditRecordProcessed check to re-test the same change without clearing Redis cache.',
+            },
+            {
+              in: 'query',
+              name: 'forceImmediate',
+              required: false,
+              schema: { type: 'boolean', default: false },
+              description: 'Bypass aggregation for on-demand triggers.',
+            },
+          ],
           responses: {
             '200': {
               description: 'Check initiated',
@@ -167,7 +190,12 @@ const swaggerOptions: swaggerJsdoc.Options = {
                     type: 'object',
                     properties: {
                       success: { type: 'boolean' },
-                      message: { type: 'string', example: 'Manual check initiated. Notifications will be sent if changes are found.' },
+                      message: { type: 'string', example: 'Manual check completed (300 seconds). Found 5 change(s).' },
+                      changesFound: { type: 'integer' },
+                      errors: { type: 'array', items: { type: 'string' } },
+                      timeWindow: { type: 'string', example: '300 seconds' },
+                      debug: { type: 'boolean', description: 'Whether debug mode was used (cache bypass)' },
+                      changes: { type: 'array', items: { type: 'object' } },
                     },
                   },
                 },
@@ -176,23 +204,65 @@ const swaggerOptions: swaggerJsdoc.Options = {
           },
         },
       },
+      '/api/v1/slack-invite': {
+        post: {
+          summary: 'Safe Slack Channel Invite',
+          description: 'Invites users to a Slack channel safely. Checks membership first to avoid already_in_channel errors. Flow calls this before posting to Slack. Body: { channelId: string, userIds: string | string[] } (comma-separated or array of Slack User IDs).',
+          operationId: 'slackInvite',
+          tags: ['Monitoring'],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['channelId'],
+                  properties: {
+                    channelId: { type: 'string', description: 'Slack channel ID (e.g. C01234567)' },
+                    userIds: {
+                      oneOf: [
+                        { type: 'string', description: 'Comma-separated Slack User IDs' },
+                        { type: 'array', items: { type: 'string' }, description: 'Array of Slack User IDs' },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': { description: 'Invitation successful or skipped (all already in channel)' },
+            '400': { description: 'channelId is required' },
+            '500': { description: 'Invitation failed (non-already_in_channel error)' },
+          },
+        },
+      },
       '/api/v1/recent-changes': {
         get: {
           summary: 'Get Recent Org Activity',
-          description: 'Retrieves a raw list of metadata changes (Flows, Permissions, Objects) from the Audit Trail.',
+          description: 'Retrieves a list of metadata changes from the Audit Trail with AI-powered explanations for Validation Rules and Formula Fields.',
           operationId: 'getRecentChanges',
           tags: ['Monitoring'],
           parameters: [
             {
               in: 'query',
+              name: 'orgId',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Salesforce Organization ID (required)',
+              example: '00DJ6000001H7etMAC',
+            },
+            {
+              in: 'query',
               name: 'hours',
+              required: false,
               schema: { type: 'integer', default: 24 },
-              description: 'Lookback window in hours',
+              description: 'Lookback window in hours (optional, defaults to 24)',
             },
           ],
           responses: {
             '200': {
-              description: 'List of recent changes',
+              description: 'List of recent changes with AI explanations for Validation Rules and Formula Fields',
               content: {
                 'application/json': {
                   schema: {
@@ -200,11 +270,55 @@ const swaggerOptions: swaggerJsdoc.Options = {
                     items: {
                       type: 'object',
                       properties: {
-                        action: { type: 'string', example: 'ChangedFlow' },
+                        action: { type: 'string', example: 'changedValidationFormula' },
                         user: { type: 'string', example: 'Alice Smith' },
-                        section: { type: 'string', example: 'Flow Management' },
-                        timestamp: { type: 'string' },
+                        section: { type: 'string', example: 'Customize Accounts' },
+                        timestamp: { type: 'string', format: 'date-time', example: '2026-01-15T10:30:00.000Z' },
+                        display: { type: 'string', example: 'Changed validation rule In_dustry_validation_rule' },
+                        id: { type: 'string', example: '0Ya...' },
+                        explanation: { type: 'string', description: 'AI-generated explanation (only for Validation Rules and Formula Fields)', example: 'This validation rule blocks users from saving Account records where the Industry field is not set to Technology.' },
+                        metadataName: { type: 'string', example: 'In_dustry_validation_rule' },
+                        metadataType: { type: 'string', enum: ['ValidationRule', 'FormulaField'] },
                       },
+                    },
+                  },
+                },
+              },
+            },
+            '400': {
+              description: 'Bad request - missing orgId or invalid hours parameter',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      error: { type: 'string', example: 'orgId query parameter is required' },
+                    },
+                  },
+                },
+              },
+            },
+            '404': {
+              description: 'Organization not found or not configured',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      error: { type: 'string', example: 'Organization 00DJ6000001H7etMAC not found or not configured' },
+                    },
+                  },
+                },
+              },
+            },
+            '500': {
+              description: 'Internal server error',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      error: { type: 'string', example: 'Internal server error' },
                     },
                   },
                 },

@@ -11,7 +11,6 @@ import { SalesforceAuthService } from '../services/authService';
 
 const router = Router();
 
-// Initialize services (these will be reused across requests)
 let monitorService: MonitorService | null = null;
 
 function getMonitorService(): MonitorService {
@@ -22,10 +21,18 @@ function getMonitorService(): MonitorService {
     monitorService = new MonitorService(
       salesforceService,
       aiService,
-      authService
+      authService,
+      10 // checkIntervalMinutes — no Waiting Room; uses Threaded Ledger for Flows
     );
   }
   return monitorService;
+}
+
+/**
+ * No-op: Waiting Room removed; Flows use Threaded Ledger (flow_thread Redis keys)
+ */
+export async function ensureWaitingRoomStarted(): Promise<void> {
+  getMonitorService();
 }
 
 /**
@@ -41,8 +48,20 @@ function getMonitorService(): MonitorService {
  *         name: hours
  *         schema:
  *           type: integer
- *         description: Optional. Look back X hours instead of default time window (10 minutes). Use this to check for changes that happened earlier.
+ *         description: Optional. Look back X hours instead of default time window (300 seconds).
  *         example: 12
+ *       - in: query
+ *         name: debug
+ *         schema:
+ *           type: boolean
+ *           default: false
+ *         description: If true, skip isAuditRecordProcessed check to re-test the same change without clearing Redis cache.
+ *       - in: query
+ *         name: forceImmediate
+ *         schema:
+ *           type: boolean
+ *           default: false
+ *         description: Bypass aggregation for on-demand triggers.
  *     responses:
  *       200:
  *         description: Check initiated
@@ -69,9 +88,88 @@ function getMonitorService(): MonitorService {
  *       400:
  *         description: Bad request - invalid hours parameter
  */
+/**
+ * Safe Slack invite - Flow calls before posting to avoid already_in_channel errors
+ * Body: { channelId: string, userIds: string | string[] } (comma-separated or array)
+ */
+router.post('/slack-invite', async (req: Request, res: Response) => {
+  try {
+    const { channelId, userIds } = req.body;
+    if (!channelId) {
+      return res.status(400).json({ success: false, error: 'channelId is required' });
+    }
+    let ids: string[];
+    if (Array.isArray(userIds)) {
+      ids = userIds;
+    } else if (typeof userIds === 'string') {
+      ids = userIds.split(',').map((s) => s.trim()).filter(Boolean);
+    } else {
+      ids = [];
+    }
+    const slackService = new (await import('../services/slackService')).SlackService();
+    await slackService.inviteUsersSafely(channelId, ids);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[slack-invite] Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * Callback for Salesforce Flow to store Slack thread_ts after posting
+ * Flow calls this after sending to Slack; we store for threaded replies (36h TTL)
+ */
+router.post('/slack-thread-callback', async (req: Request, res: Response) => {
+  try {
+    const { orgId, flowDeveloperName, threadTs } = req.body;
+    if (!orgId || !flowDeveloperName || !threadTs) {
+      return res.status(400).json({
+        success: false,
+        error: 'orgId, flowDeveloperName, and threadTs are required',
+      });
+    }
+    const authService = new SalesforceAuthService();
+    await authService.setFlowThreadTs(orgId, flowDeveloperName, threadTs);
+    console.log(`[Slack] Stored thread_ts for ${orgId}:${flowDeveloperName}`);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[Slack] Thread callback error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * Clear audit_processed Redis cache (for re-testing)
+ * POST /api/v1/clear-audit-cache
+ */
+router.post('/clear-audit-cache', async (_req: Request, res: Response) => {
+  try {
+    const authService = new SalesforceAuthService();
+    await authService.connect();
+    const count = await authService.cleanupAuditProcessedKeys();
+    return res.json({
+      success: true,
+      message: `Cleared ${count} audit_processed key(s). You can re-test now.`,
+      keysCleared: count,
+    });
+  } catch (error) {
+    console.error('[clear-audit-cache] Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
 router.post('/trigger-check', async (req: Request, res: Response) => {
   try {
-    const { hours } = req.query;
+    const { hours, debug } = req.query;
     const hoursNum = hours ? parseInt(hours as string, 10) : undefined;
     
     // Validate hours parameter if provided
@@ -85,9 +183,11 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
     }
 
     const service = getMonitorService();
-    const result = await service.runChangeCheck(hoursNum);
+    const forceImmediate = req.query.forceImmediate === 'true' || req.query.immediate === 'true';
+    const debugMode = debug === 'true';
+    const result = await service.runChangeCheck(hoursNum, forceImmediate, debugMode);
 
-    const timeWindow = hoursNum ? `${hoursNum} hour(s)` : 'default time window';
+    const timeWindow = hoursNum ? `${hoursNum} hour(s)` : '300 seconds';
     return res.json({
       success: result.success,
       message: result.success
@@ -95,8 +195,9 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
         : 'Manual check completed with errors.',
       changesFound: result.changesFound,
       errors: result.errors,
-      timeWindow: hoursNum ? `${hoursNum} hours` : '10 minutes',
-      changes: result.changes || [], // Include change details in response
+      timeWindow: hoursNum ? `${hoursNum} hours` : '300 seconds',
+      debug: debugMode,
+      changes: result.changes || [],
     });
   } catch (error) {
     console.error('Error in trigger-check endpoint:', error);
@@ -130,19 +231,20 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
  *     operationId: getRecentChanges
  *     parameters:
  *       - in: query
+ *         name: orgId
+ *         required: true
+ *         description: Salesforce Organization ID (required)
+ *         schema:
+ *           type: string
+ *         example: "00DJ6000001H7etMAC"
+ *       - in: query
  *         name: hours
+ *         required: false
+ *         description: Lookback window in hours (optional, defaults to 24)
  *         schema:
  *           type: integer
  *           default: 24
- *         description: Lookback window in hours
  *         example: 24
- *       - in: query
- *         name: orgId
- *         required: true
- *         schema:
- *           type: string
- *         description: Salesforce Organization ID
- *         example: "00DJ6000001H7etMAC"
  *     responses:
  *       200:
  *         description: List of recent changes with AI explanations for Validation Rules and Formula Fields
@@ -251,10 +353,15 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
  *                   example: "Internal server error"
  */
 router.get('/recent-changes', async (req: Request, res: Response) => {
+  console.log(`[Recent Changes] Endpoint called - Query params:`, req.query);
+  
   try {
     const { orgId, hours } = req.query;
 
+    console.log(`[Recent Changes] Processing request - orgId: ${orgId}, hours: ${hours}`);
+
     if (!orgId || typeof orgId !== 'string') {
+      console.warn(`[Recent Changes] Missing or invalid orgId parameter`);
       return res.status(400).json({
         error: 'orgId query parameter is required',
       });
@@ -262,24 +369,30 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
 
     const hoursNum = hours ? parseInt(hours as string, 10) : 24;
     if (isNaN(hoursNum) || hoursNum < 1) {
+      console.warn(`[Recent Changes] Invalid hours parameter: ${hours}`);
       return res.status(400).json({
         error: 'hours must be a positive integer',
       });
     }
 
+    console.log(`[Recent Changes] Initializing services for orgId: ${orgId}, hours: ${hoursNum}`);
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
 
     // Get org settings for billing mode
+    console.log(`[Recent Changes] Fetching org settings for: ${orgId}`);
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
+      console.error(`[Recent Changes] Organization ${orgId} not found or not configured`);
       return res.status(404).json({
         error: `Organization ${orgId} not found or not configured`,
       });
     }
 
+    console.log(`[Recent Changes] Querying audit trail for orgId: ${orgId}, last ${hoursNum} hours`);
     const auditRecords = await salesforceService.queryAuditTrailByHours(orgId, hoursNum);
+    console.log(`[Recent Changes] Found ${auditRecords.length} audit record(s)`);
 
     // Helper function to check if action is validation-related
     const isValidationAction = (action: string): boolean => {
@@ -354,8 +467,12 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
     };
 
     // Process changes with AI explanations for validation rules and formula fields
+    console.log(`[Recent Changes] Processing ${auditRecords.length} record(s) with AI explanations`);
     const changes = await Promise.all(
-      auditRecords.map(async (record) => {
+      auditRecords.map(async (record, index) => {
+        if (index === 0 || index % 10 === 0) {
+          console.log(`[Recent Changes] Processing record ${index + 1}/${auditRecords.length}: ${record.Action} - ${record.Display?.substring(0, 50)}...`);
+        }
         const change: any = {
           action: record.Action,
           user: record.CreatedBy.Name,
@@ -431,10 +548,19 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
       })
     );
 
-    return res.json(changes);
+    console.log(`[Recent Changes] Successfully processed ${changes.length} change(s). Returning response.`);
+    
+    // Note: This endpoint is READ-ONLY and does NOT create AuditDelta_Event__c records.
+    // To trigger notifications, use POST /api/v1/trigger-check instead.
+    return res.json({
+      count: changes.length,
+      changes,
+      note: 'This endpoint is read-only. To trigger Slack notifications, use POST /api/v1/trigger-check'
+    });
   } catch (error) {
-    console.error('Error in recent-changes endpoint:', error);
+    console.error('[Recent Changes] Error in recent-changes endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    console.error('[Recent Changes] Error details:', error instanceof Error ? error.stack : error);
     return res.status(500).json({
       error: errorMessage,
     });
