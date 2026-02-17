@@ -694,6 +694,7 @@ export class SalesforceService {
         AND (
           Action LIKE '%Flow%'
           OR Action LIKE '%Permission%'
+          OR Action LIKE '%PermSet%'
           OR Action LIKE '%Object%'
           OR Action LIKE '%Validation%'
           OR Action LIKE '%Formula%'
@@ -751,6 +752,7 @@ export class SalesforceService {
         AND (
           Action LIKE '%Flow%' 
           OR Action LIKE '%Permission%'
+          OR Action LIKE '%PermSet%'
           OR Action LIKE '%Object%'
           OR Action LIKE '%Validation%'
           OR Action LIKE '%Formula%'

@@ -48,8 +48,20 @@ export async function ensureWaitingRoomStarted(): Promise<void> {
  *         name: hours
  *         schema:
  *           type: integer
- *         description: Optional. Look back X hours instead of default time window (10 minutes). Use this to check for changes that happened earlier.
+ *         description: Optional. Look back X hours instead of default time window (300 seconds).
  *         example: 12
+ *       - in: query
+ *         name: debug
+ *         schema:
+ *           type: boolean
+ *           default: false
+ *         description: If true, skip isAuditRecordProcessed check to re-test the same change without clearing Redis cache.
+ *       - in: query
+ *         name: forceImmediate
+ *         schema:
+ *           type: boolean
+ *           default: false
+ *         description: Bypass aggregation for on-demand triggers.
  *     responses:
  *       200:
  *         description: Check initiated
@@ -76,6 +88,36 @@ export async function ensureWaitingRoomStarted(): Promise<void> {
  *       400:
  *         description: Bad request - invalid hours parameter
  */
+/**
+ * Safe Slack invite - Flow calls before posting to avoid already_in_channel errors
+ * Body: { channelId: string, userIds: string | string[] } (comma-separated or array)
+ */
+router.post('/slack-invite', async (req: Request, res: Response) => {
+  try {
+    const { channelId, userIds } = req.body;
+    if (!channelId) {
+      return res.status(400).json({ success: false, error: 'channelId is required' });
+    }
+    let ids: string[];
+    if (Array.isArray(userIds)) {
+      ids = userIds;
+    } else if (typeof userIds === 'string') {
+      ids = userIds.split(',').map((s) => s.trim()).filter(Boolean);
+    } else {
+      ids = [];
+    }
+    const slackService = new (await import('../services/slackService')).SlackService();
+    await slackService.inviteUsersSafely(channelId, ids);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[slack-invite] Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
 /**
  * Callback for Salesforce Flow to store Slack thread_ts after posting
  * Flow calls this after sending to Slack; we store for threaded replies (36h TTL)
