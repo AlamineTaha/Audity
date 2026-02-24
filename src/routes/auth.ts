@@ -169,7 +169,7 @@ router.get('/callback', async (req: Request, res: Response) => {
     // Pass state to authorize for PKCE code_verifier lookup
     const orgSettings = await authService.authorize(code, billingMode, gcpProjectId, state);
 
-    res.json({
+    return res.json({
       success: true,
       orgId: orgSettings.orgId,
       message: 'Organization successfully authenticated',
@@ -177,7 +177,7 @@ router.get('/callback', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('OAuth callback error:', error);
     const errorMessage = error instanceof Error ? error.message : 'Authentication failed';
-    res.status(500).json({ error: errorMessage });
+    return res.status(500).json({ error: errorMessage });
   }
 });
 

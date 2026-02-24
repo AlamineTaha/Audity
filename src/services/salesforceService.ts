@@ -19,6 +19,10 @@ export class SalesforceService {
    * @param queryFn Function that performs the Salesforce query
    * @returns Result of the query function
    */
+  /**
+   * Execute a Salesforce query with automatic token refresh retry on INVALID_SESSION_ID
+   * Wraps queries to ensure reliability by refreshing tokens when sessions expire
+   */
   private async executeWithTokenRefresh<T>(
     orgId: string,
     queryFn: (conn: any) => Promise<T>
@@ -794,9 +798,6 @@ export class SalesforceService {
    * @returns Array of SetupAuditTrail records
    */
   async queryAuditTrailByHours(orgId: string, hours: number = 24): Promise<SetupAuditTrail[]> {
-    const conn = await this.authService.getConnection(orgId);
-    
-    // Calculate the timestamp for X hours ago
     const cutoffTime = new Date();
     cutoffTime.setHours(cutoffTime.getHours() - hours);
     const cutoffTimeStr = cutoffTime.toISOString();
@@ -809,9 +810,8 @@ export class SalesforceService {
       LIMIT 500
     `;
 
-    try {
-      const result = await conn.query<any>(soql);
-      
+    return this.executeWithTokenRefresh<SetupAuditTrail[]>(orgId, async (conn) => {
+      const result = await conn.query(soql);
       return result.records.map((record: any) => ({
         Id: record.Id,
         Action: record.Action,
@@ -827,10 +827,7 @@ export class SalesforceService {
           Name: record.DelegateUser.Name,
         } : undefined,
       })) as SetupAuditTrail[];
-    } catch (error) {
-      console.error('Error querying audit trail:', error);
-      throw error;
-    }
+    });
   }
 
   /**

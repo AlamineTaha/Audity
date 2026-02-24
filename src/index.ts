@@ -8,6 +8,7 @@ import dotenv from 'dotenv';
 // This call here is redundant but ensures env vars are available even if app.ts is imported elsewhere
 dotenv.config();
 
+import { Server } from 'http';
 import app from './app';
 import { SalesforceAuthService } from './services/authService';
 import { SalesforceService } from './services/salesforceService';
@@ -15,60 +16,56 @@ import { AIService } from './services/aiService';
 import { PollingService } from './services/pollingService';
 import { ensureWaitingRoomStarted } from './routes/monitoring';
 
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 async function startServer() {
+  let server: Server | null = null;
+  let authService: SalesforceAuthService | null = null;
+  let pollingService: PollingService | null = null;
+
+  const shutdown = async (signal: string) => {
+    console.log(`${signal} received, shutting down gracefully...`);
+    if (pollingService) pollingService.stop();
+    if (server) {
+      server.close((err) => {
+        if (err) console.error('Error closing server:', err);
+      });
+    }
+    if (authService) await authService.disconnect();
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', async () => { await shutdown('SIGTERM'); });
+  process.on('SIGINT', async () => { await shutdown('SIGINT'); });
+
   try {
-    // Initialize services
-    const authService = new SalesforceAuthService();
+    authService = new SalesforceAuthService();
     await authService.connect();
 
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
 
-    // Initialize polling service (uses Salesforce native integration, no webhook needed)
-    const pollingService = new PollingService(
+    pollingService = new PollingService(
       salesforceService,
       aiService,
       authService
     );
-
-    // Start polling service
     pollingService.start();
 
-    // Waiting Room Listener: Background process monitors Redis TTL
-    // When a session expires (5 min), automatically triggers processAggregation
     await ensureWaitingRoomStarted();
 
-    // Cleanup audit_processed keys every 24h
     setInterval(async () => {
       try {
-        await authService.cleanupAuditProcessedKeys();
+        await authService!.cleanupAuditProcessedKeys();
       } catch (err) {
         console.error('[Startup] audit_processed cleanup failed:', err);
       }
     }, 24 * 60 * 60 * 1000);
 
-    // Start Express server
-    app.listen(PORT, () => {
+    server = app.listen(PORT, () => {
       console.log(`🚀 AuditDelta server running on port ${PORT}`);
       console.log(`📚 API Documentation: http://localhost:${PORT}/api-docs`);
       console.log(`🏥 Health Check: http://localhost:${PORT}/api/v1/health`);
-    });
-
-    // Graceful shutdown
-    process.on('SIGTERM', async () => {
-      console.log('SIGTERM received, shutting down gracefully...');
-      pollingService.stop();
-      await authService.disconnect();
-      process.exit(0);
-    });
-
-    process.on('SIGINT', async () => {
-      console.log('SIGINT received, shutting down gracefully...');
-      pollingService.stop();
-      await authService.disconnect();
-      process.exit(0);
     });
   } catch (error) {
     console.error('Failed to start server:', error);

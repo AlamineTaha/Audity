@@ -1,0 +1,48 @@
+# Dependencies
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output (built inside container)
+dist
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Git
+.git
+.gitignore
+
+# IDE and editor
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation and prompts (not needed at runtime)
+*.md
+prompts/
+llm_prompts_log*
+GEMINI*.md
+AUDIT_DELTA_CONTEXT.md
+API_DOCUMENTATION.md
+
+# Test and coverage
+coverage
+.nyc_output
+*.test.ts
+*.spec.ts
+__tests__
+jest.config.*
+.eslintrc*
+
+# Misc
+*.log
+.cursorrules
