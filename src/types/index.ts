@@ -80,7 +80,7 @@ export interface AuditDiff {
   newVersion: number;
   summary: string;
   changes: string[];
-  securityFindings?: string[]; // Security and performance findings from AI analysis
+  securityFindings?: string[];
   timestamp: string;
   orgId: string;
 }
@@ -114,6 +114,39 @@ export interface AnalyzeFlowResponse {
   summary: string;
   changes?: string[];
   error?: string;
+  revertOptions?: {
+    summary: string;
+    versionsToday: number[];
+    recommendedStableVersion: number | null;
+    revertPrompt: string;
+  };
+  riskAnalysis?: { riskLevel: string; riskReason: string };
+  revertImpact?: { warnings: string[]; activeSessions: number; canRevert: boolean };
+  dependencies?: {
+    reportedDependencies: Array<{
+      type: string;
+      name: string;
+      description?: string;
+    }>;
+    uiDependencies: {
+      buttons: Array<{
+        name: string;
+        label: string;
+        linkType: string;
+        objectType?: string;
+      }>;
+      quickActions: Array<{
+        actionTarget: string;
+        label: string;
+        targetObject?: string;
+      }>;
+    };
+    subflowDependencies: Array<{
+      flowApiName: string;
+      elementLabel?: string;
+    }>;
+    securityNote: string;
+  };
 }
 
 /**
@@ -141,4 +174,3 @@ export interface ChangeNotification {
   riskLevel: 'Low' | 'Medium' | 'High';
   salesforceUrl: string;
 }
-

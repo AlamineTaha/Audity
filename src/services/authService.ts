@@ -22,13 +22,26 @@ export class SalesforceAuthService {
     this.loginUrl = process.env.SF_LOGIN_URL || 'https://login.salesforce.com';
 
     // Initialize Redis client
-    this.redisClient = createClient({
-      socket: {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: parseInt(process.env.REDIS_PORT || '6379'),
-      },
-      password: process.env.REDIS_PASSWORD || undefined,
-    });
+    // Prefer REDIS_URL (Heroku Redis uses rediss:// for TLS)
+    const redisUrl = process.env.REDIS_URL;
+    if (redisUrl) {
+      this.redisClient = createClient({
+        url: redisUrl,
+        socket: {
+          tls: redisUrl.startsWith('rediss://'),
+          rejectUnauthorized: false,
+          reconnectStrategy: (retries) => Math.min(retries * 50, 500),
+        },
+      });
+    } else {
+      this.redisClient = createClient({
+        socket: {
+          host: process.env.REDIS_HOST || 'localhost',
+          port: parseInt(process.env.REDIS_PORT || '6379'),
+        },
+        password: process.env.REDIS_PASSWORD || undefined,
+      });
+    }
 
     this.redisClient.on('error', (err) => {
       if (err.message.includes('NOAUTH') || err.message.includes('Authentication required')) {
@@ -46,16 +59,12 @@ export class SalesforceAuthService {
   async connect(): Promise<void> {
     if (!this.redisClient.isOpen) {
       await this.redisClient.connect();
-      
-      // Authenticate if password is set
-      // Note: Redis v4+ client should handle auth automatically via password option,
-      // but we'll ensure it's authenticated explicitly for compatibility
-      if (process.env.REDIS_PASSWORD) {
+      // When using REDIS_URL, auth is included in the URL. When using REDIS_HOST/PORT,
+      // authenticate explicitly if REDIS_PASSWORD is set.
+      if (!process.env.REDIS_URL && process.env.REDIS_PASSWORD) {
         try {
           await this.redisClient.sendCommand(['AUTH', process.env.REDIS_PASSWORD]);
         } catch (error) {
-          // If AUTH fails, it might be because auth was already done or not required
-          // Log but don't fail - the connection might still work
           console.warn('Redis AUTH command failed (this may be normal if auth is handled automatically):', error);
         }
       }

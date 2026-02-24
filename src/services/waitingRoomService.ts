@@ -171,7 +171,7 @@ export class WaitingRoomService {
   async addToWaitingRoom(
     orgId: string,
     metadataName: string,
-    userId: string,
+    _userId: string,
     metadataType: string,
     auditRecord: SetupAuditTrail,
     version?: number,
