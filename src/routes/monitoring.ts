@@ -169,8 +169,10 @@ router.post('/clear-audit-cache', async (_req: Request, res: Response) => {
 
 router.post('/trigger-check', async (req: Request, res: Response) => {
   try {
-    const { hours, debug } = req.query;
-    const hoursNum = hours ? parseInt(hours as string, 10) : undefined;
+    // Accept params from query string (curl) or request body (Salesforce External Service)
+    const hours = req.query.hours ?? req.body.hours;
+    const debug = req.query.debug ?? req.body.debug;
+    const hoursNum = hours ? parseInt(String(hours), 10) : undefined;
     
     // Validate hours parameter if provided
     if (hoursNum !== undefined && (isNaN(hoursNum) || hoursNum < 1)) {
@@ -183,8 +185,9 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
     }
 
     const service = getMonitorService();
-    const forceImmediate = req.query.forceImmediate === 'true' || req.query.immediate === 'true';
-    const debugMode = debug === 'true';
+    const forceImmediate = String(req.query.forceImmediate ?? req.body.forceImmediate ?? '') === 'true'
+      || String(req.query.immediate ?? req.body.immediate ?? '') === 'true';
+    const debugMode = String(debug) === 'true';
     const result = await service.runChangeCheck(hoursNum, forceImmediate, debugMode);
 
     const timeWindow = hoursNum ? `${hoursNum} hour(s)` : '300 seconds';

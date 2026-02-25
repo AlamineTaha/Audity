@@ -158,29 +158,21 @@ const swaggerOptions: swaggerJsdoc.Options = {
           description: 'Manually triggers the polling engine to check for Salesforce changes immediately, analyze them with AI, and send Slack alerts if issues are found.',
           operationId: 'triggerCheck',
           tags: ['Monitoring'],
-          parameters: [
-            {
-              in: 'query',
-              name: 'hours',
-              required: false,
-              schema: { type: 'integer' },
-              description: 'Look back X hours instead of default time window (300 seconds).',
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    hours: { type: 'integer', description: 'Look back X hours instead of default time window (300 seconds).' },
+                    debug: { type: 'boolean', default: false, description: 'Skip cache check to re-test the same change.' },
+                    forceImmediate: { type: 'boolean', default: false, description: 'Bypass aggregation for on-demand triggers.' },
+                  },
+                },
+              },
             },
-            {
-              in: 'query',
-              name: 'debug',
-              required: false,
-              schema: { type: 'boolean', default: false },
-              description: 'If true, skip isAuditRecordProcessed check to re-test the same change without clearing Redis cache.',
-            },
-            {
-              in: 'query',
-              name: 'forceImmediate',
-              required: false,
-              schema: { type: 'boolean', default: false },
-              description: 'Bypass aggregation for on-demand triggers.',
-            },
-          ],
+          },
           responses: {
             '200': {
               description: 'Check initiated',
