@@ -32,6 +32,7 @@ COPY --from=builder /app/dist ./dist
 
 # Expose port (Heroku sets PORT; default 3000 for local)
 ENV PORT=3000
+ENV NODE_ENV=production
 EXPOSE 3000
 
 # Run the application
