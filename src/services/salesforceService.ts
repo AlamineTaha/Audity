@@ -2487,26 +2487,46 @@ export class SalesforceService {
       if (!defResult.records?.length) return null;
 
       const definitionId = defResult.records[0].Id;
-      const flowQuery = `
+      const escapedDefId = definitionId.replace(/'/g, "''");
+
+      // Tooling API requires LIMIT 1 when selecting Metadata/FullName,
+      // so we must fetch current and previous versions in separate queries.
+      const currentQuery = `
         SELECT Id, VersionNumber, Metadata, Status
         FROM Flow
-        WHERE DefinitionId = '${definitionId.replace(/'/g, "''")}'
+        WHERE DefinitionId = '${escapedDefId}'
         ORDER BY VersionNumber DESC
-        LIMIT 2
+        LIMIT 1
       `;
-      const flowResult = await tooling.query<any>(flowQuery);
-      if (!flowResult.records?.length) return null;
+      const currentResult = await tooling.query<any>(currentQuery);
+      if (!currentResult.records?.length) return null;
 
-      const current = flowResult.records[0];
-      const previous = flowResult.records[1] || null;
+      const current = currentResult.records[0];
       const currentMetadata = current.Metadata ?? current;
-      const previousMetadata = previous?.Metadata ?? previous ?? null;
+
+      let previousMetadata: unknown = null;
+      let previousVersion = 0;
+
+      if (current.VersionNumber > 1) {
+        const prevQuery = `
+          SELECT Id, VersionNumber, Metadata
+          FROM Flow
+          WHERE DefinitionId = '${escapedDefId}'
+            AND VersionNumber = ${current.VersionNumber - 1}
+          LIMIT 1
+        `;
+        const prevResult = await tooling.query<any>(prevQuery);
+        if (prevResult.records?.length) {
+          previousMetadata = prevResult.records[0].Metadata ?? prevResult.records[0];
+          previousVersion = prevResult.records[0].VersionNumber ?? 0;
+        }
+      }
 
       return {
         current: currentMetadata,
         previous: previousMetadata,
         currentVersion: current.VersionNumber ?? 0,
-        previousVersion: previous?.VersionNumber ?? 0,
+        previousVersion,
       };
     } catch (error) {
       console.error(`Error fetching flow delta for ${flowName}:`, error);
