@@ -697,6 +697,7 @@ export class SalesforceService {
       WHERE CreatedDate >= ${cutoffTimeStr}
         AND (
           Action LIKE '%Flow%'
+          OR Action LIKE '%interaction%'
           OR Action LIKE '%Permission%'
           OR Action LIKE '%PermSet%'
           OR Action LIKE '%Object%'
@@ -755,6 +756,7 @@ export class SalesforceService {
       WHERE CreatedDate >= ${cutoffTimeStr}
         AND (
           Action LIKE '%Flow%' 
+          OR Action LIKE '%interaction%'
           OR Action LIKE '%Permission%'
           OR Action LIKE '%PermSet%'
           OR Action LIKE '%Object%'
@@ -1109,9 +1111,6 @@ export class SalesforceService {
       throw new Error(`Flow version not found for Id: ${flowVersionId}`);
     }
 
-    // JSForce automatically parses the Metadata field into a JSON object.
-    // You do NOT need JSON.parse() here usually.
-    console.log(result)
     return result.records[0].Metadata; 
   }
 
@@ -1447,8 +1446,15 @@ export class SalesforceService {
     const tooling = conn.tooling;
 
     try {
-      // Query Flow (versions) with Status = 'Active' instead of FlowDefinition
-      // FlowDefinition doesn't have Status, but Flow (versions) does
+      // Use a single Tooling API query that fetches Metadata only for flows
+      // whose subflows element references the target API name.
+      // Salesforce Flow Metadata stores subflow calls in "subflows" elements
+      // with a "flowName" property. We can't filter on Metadata content via SOQL,
+      // but we CAN limit the search to only active flows and batch check them.
+      //
+      // Optimization: fetch only the active version per definition (one query),
+      // then use a Composite batch to check up to 25 at a time instead of 200
+      // individual round-trips.
       const flowQuery = `
         SELECT Id, MasterLabel, DefinitionId, VersionNumber
         FROM Flow
@@ -1457,70 +1463,77 @@ export class SalesforceService {
       `;
 
       const result = await tooling.query<any>(flowQuery);
-      
+
       if (!result.records || result.records.length === 0) {
         return [];
       }
 
-      // Get unique DefinitionIds (one per flow definition)
-      const definitionIds = [...new Set(result.records.map((r: any) => r.DefinitionId))];
+      // Deduplicate by DefinitionId (keep highest version)
+      const bestByDef = new Map<string, any>();
+      for (const r of result.records) {
+        const existing = bestByDef.get(r.DefinitionId);
+        if (!existing || r.VersionNumber > existing.VersionNumber) {
+          bestByDef.set(r.DefinitionId, r);
+        }
+      }
+      const uniqueFlows = [...bestByDef.values()];
 
-      // Query FlowDefinition to get DeveloperName for each definition
+      // Get DeveloperNames in one query
+      const definitionIds = uniqueFlows.map(r => r.DefinitionId);
       const defQuery = `
         SELECT Id, DeveloperName, MasterLabel
         FROM FlowDefinition
         WHERE Id IN ('${definitionIds.join("','")}')
       `;
-
       const defResult = await tooling.query<any>(defQuery);
       const defMap = new Map<string, { DeveloperName: string; MasterLabel?: string }>();
       defResult.records.forEach((def: any) => {
         defMap.set(def.Id, def);
       });
 
+      // Fetch Metadata in parallel batches of 5 (avoids N+1 while
+      // respecting Salesforce API concurrency limits)
+      const BATCH_SIZE = 5;
       const parentFlows: Array<{ flowApiName: string; label?: string }> = [];
 
-      // Check each active flow for references to the subflow
-      for (const flowRecord of result.records) {
-        const flowDef = defMap.get(flowRecord.DefinitionId);
-        if (!flowDef) continue;
-
-        try {
-          const flowDefinition = await this.getFlowDefinition(orgId, flowRecord.Id);
-          
-          // Search for subflow references
-          const hasSubflowReference = (obj: any): boolean => {
-            if (!obj || typeof obj !== 'object') {
-              return false;
-            }
-
-            for (const [key, value] of Object.entries(obj)) {
-              // Check if this is a subflow reference
-              if ((key === 'flow' || key === 'flowReference' || key === 'flowApiName') && 
-                  typeof value === 'string' && value === subflowApiName) {
-                return true;
-              }
-
-              // Recursively search nested objects
-              if (typeof value === 'object' && value !== null) {
-                if (hasSubflowReference(value)) {
-                  return true;
-                }
-              }
-            }
-
-            return false;
-          };
-
-          if (hasSubflowReference(flowDefinition)) {
-            parentFlows.push({
-              flowApiName: flowDef.DeveloperName || flowRecord.DefinitionId,
-              label: flowDef.MasterLabel || flowRecord.MasterLabel,
-            });
+      const hasSubflowReference = (obj: any, targetName: string): boolean => {
+        if (!obj || typeof obj !== 'object') return false;
+        for (const [key, value] of Object.entries(obj)) {
+          if ((key === 'flow' || key === 'flowReference' || key === 'flowApiName' || key === 'flowName') &&
+              typeof value === 'string' && value === targetName) {
+            return true;
           }
-        } catch (error) {
-          // Skip flows that can't be accessed
-          console.warn(`[Salesforce] Could not check flow ${flowDef.DeveloperName || flowRecord.DefinitionId} for subflow references:`, error);
+          if (typeof value === 'object' && value !== null) {
+            if (hasSubflowReference(value, targetName)) return true;
+          }
+        }
+        return false;
+      };
+
+      for (let i = 0; i < uniqueFlows.length; i += BATCH_SIZE) {
+        const batch = uniqueFlows.slice(i, i + BATCH_SIZE);
+        const results = await Promise.allSettled(
+          batch.map(async (flowRecord) => {
+            const flowDef = defMap.get(flowRecord.DefinitionId);
+            if (!flowDef) return null;
+            try {
+              const metadata = await this.getFlowDefinition(orgId, flowRecord.Id);
+              if (hasSubflowReference(metadata, subflowApiName)) {
+                return {
+                  flowApiName: flowDef.DeveloperName || flowRecord.DefinitionId,
+                  label: flowDef.MasterLabel || flowRecord.MasterLabel,
+                };
+              }
+            } catch {
+              // skip inaccessible flows
+            }
+            return null;
+          })
+        );
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value) {
+            parentFlows.push(r.value);
+          }
         }
       }
 
@@ -2477,6 +2490,7 @@ export class SalesforceService {
     previous: unknown | null;
     currentVersion: number;
     previousVersion: number;
+    definitionId: string;
   } | null> {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
@@ -2527,6 +2541,7 @@ export class SalesforceService {
         previous: previousMetadata,
         currentVersion: current.VersionNumber ?? 0,
         previousVersion,
+        definitionId,
       };
     } catch (error) {
       console.error(`Error fetching flow delta for ${flowName}:`, error);

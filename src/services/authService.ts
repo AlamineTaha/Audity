@@ -301,8 +301,9 @@ export class SalesforceAuthService {
     return data ? JSON.parse(data) : null;
   }
 
-  /** Deduplication: SetupAuditTrail.Id is the source of truth; keys expire after 10 min */
-  private static readonly AUDIT_PROCESSED_TTL_SEC = 600; // 10 minutes
+  /** Deduplication: SetupAuditTrail.Id is the source of truth; keys expire after 25 hours
+   *  (must exceed the maximum lookback window of 24 hours to avoid reprocessing) */
+  private static readonly AUDIT_PROCESSED_TTL_SEC = 90000; // 25 hours
 
   /**
    * Check if this SetupAuditTrail record was already processed
