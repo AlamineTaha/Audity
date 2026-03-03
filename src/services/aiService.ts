@@ -127,6 +127,130 @@ Focus on the differences and their business impact.`;
   }
 
   /**
+   * Analyze a validation rule in the context of all validation rules on the same object.
+   * Explains the rule, infers change impact from the action, and assesses object health.
+   */
+  async analyzeValidationRuleInContext(
+    ruleName: string,
+    formula: string,
+    errorMessage: string,
+    action: string,
+    objectName: string,
+    allRulesOnObject: Array<{ name: string; active: boolean }>,
+    settings: OrgSettings
+  ): Promise<string> {
+    const activeCount = allRulesOnObject.filter(r => r.active).length;
+
+    const prompt = `Analyze this Salesforce validation rule for a Slack message. Be direct, no fluff.
+
+Rule: \`${ruleName}\` on \`${objectName}\`
+Action: ${action}
+Formula: \`\`\`${formula}\`\`\`
+Error Message shown to users: "${errorMessage || '(none)'}"
+
+Rules: No emoji. No HTML entities. Slack markdown only (*bold*, \`code\`). Under 100 words.
+
+Answer EXACTLY:
+
+*What it does:* [One sentence — what the formula blocks or enforces]
+
+*Impact:* [One sentence — which users or processes are affected]
+
+*Naming & Error Message:* [Flag if the rule name is unclear/misleading, or if the error message is vague/missing/unhelpful to end users. Say "OK" if both are fine.]
+
+*Object Health:* ${activeCount} active rules on \`${objectName}\` (${allRulesOnObject.length} total). [If >10 active, say "Review recommended." Otherwise "OK."]`;
+
+    try {
+      return await this.callLLM(prompt, settings, 'analyzeValidationRuleInContext');
+    } catch (error) {
+      console.error('Error analyzing validation rule in context:', error);
+      throw new Error(`Failed to analyze validation rule: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Analyze a formula field change concisely.
+   */
+  async analyzeFormulaField(
+    fieldName: string,
+    objectName: string,
+    formula: string | undefined,
+    label: string | undefined,
+    settings: OrgSettings
+  ): Promise<string> {
+    const prompt = `You are the "AuditDelta Guardian," an expert Salesforce Auditor. Analyze this formula field for a Slack notification.
+
+Object: \`${objectName}\`
+Field: \`${fieldName}\`
+Label: ${label || 'N/A'}
+${formula ? `Formula:\n\`\`\`\n${formula}\n\`\`\`` : 'Formula: not available'}
+
+Rules:
+- Do NOT use any emoji, HTML entities, or special Unicode characters.
+- Use Slack markdown only: *bold*, _italic_, \`code\` for names.
+- Be concise. Under 150 words total.
+
+Format your response EXACTLY as:
+
+*Summary:* [One sentence — what this formula field calculates and why it matters]
+
+*Impact:* [One sentence — how this affects reports, workflows, or user experience]`;
+
+    try {
+      return await this.callLLM(prompt, settings, 'analyzeFormulaField');
+    } catch (error) {
+      console.error('Error analyzing formula field:', error);
+      throw new Error(`Failed to analyze formula field: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Analyze a batch of permission changes from the same user.
+   * All permission types (PermSetAssign, PermSetEnableUserPerm, PermSetEntityPermChanged, etc.)
+   * are sent in one call. Output follows the same concise format as Flow summaries.
+   */
+  async analyzePermissionBatch(
+    changes: Array<{ action: string; display: string }>,
+    userName: string,
+    settings: OrgSettings
+  ): Promise<string> {
+    const changesList = changes
+      .map((c, i) => `${i + 1}. [${c.action}] ${c.display}`)
+      .join('\n');
+
+    const prompt = `You are the "AuditDelta Guardian," an expert Salesforce Security Auditor. Analyze these permission changes for a Slack notification.
+
+The admin "${userName}" made ${changes.length} permission change(s):
+
+${changesList}
+
+Rules:
+- Do NOT use any emoji, HTML entities, or special Unicode characters.
+- Use Slack markdown only: *bold*, _italic_, \`code\` for names.
+- Be concise. Under 200 words total.
+
+Format your response EXACTLY as:
+
+*Summary:* [One sentence — what was changed and on which Permission Set]
+
+*Changes:*
+- [change 1 — what permission/object access was granted or revoked]
+- [change 2]
+
+*Security:*
+- [CRITICAL] or [MEDIUM] or [LOW]: [one-sentence justification]
+
+*Impact:* [Who is affected and what can they now do or no longer do]`;
+
+    try {
+      return await this.callLLM(prompt, settings, 'analyzePermissionBatch');
+    } catch (error) {
+      console.error('Error analyzing permission batch:', error);
+      throw new Error(`Failed to analyze permission batch: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
    * Interpret any Salesforce metadata change in human-readable business terms
    * Generic method that works for Flows, Validation Rules, Custom Fields, etc.
    * 
@@ -457,21 +581,9 @@ Format your response in clear sections. Use Slack markdown formatting (*bold* fo
       parentFlowContext = `\n\n**⚠️ IMPORTANT CONTEXT:** This Flow is used as a SUBFLOW by the following parent Flow(s):\n${parentList}\n\n**Risk Assessment:** Changes to this subflow will affect all parent flows listed above. Consider the impact on parent flows when assessing risk level.`;
     }
 
-    return `**System Role:** You are the "AuditDelta Guardian," an expert Salesforce Technical Architect and Security Auditor. Your task is to analyze changes between two versions of a Salesforce Flow and provide a "Bang" summary for a Slack notification.
+    return `You are the "AuditDelta Guardian," an expert Salesforce Technical Architect and Security Auditor. Analyze changes between two Flow versions for a Slack notification.
 
-**Instructions:**
-1. **The Summary:** Start with one sentence explaining the "Why" of the change in business terms.
-2. **The Logic Diff:** List exactly what elements were added, modified, or deleted. 
-3. **Security & Performance (The Auditor's Eye):** Flag the following as 🔴 CRITICAL if found:
-   - Hardcoded IDs (e.g., '005...' or '001...').
-   - Database operations (Create/Update/Delete) inside a Loop.
-   - Missing Fault Paths on critical DML elements.
-4. **Subflow Impact:** ${parentFlows && parentFlows.length > 0 ? 'This Flow is a SUBFLOW used by parent flows. Changes here will cascade to parent flows. Assess risk accordingly.' : 'This Flow does not appear to be used as a subflow by other flows.'}
-5. **Tone:** Be professional, concise, and focused on impact. Use bolding for element names.
-
-**Constraint:** Output your response in Markdown suitable for Slack. Do not use technical jargon like 'JSON' or 'Metadata tags.'
-
-Flow Name: **${flowName}**${parentFlowContext}
+Flow Name: *${flowName}*${parentFlowContext}
 
 OLD VERSION:
 ${JSON.stringify(oldJson, null, 2)}
@@ -479,18 +591,24 @@ ${JSON.stringify(oldJson, null, 2)}
 NEW VERSION:
 ${JSON.stringify(newJson, null, 2)}
 
-Format your response as:
-SUMMARY: [One sentence explaining the business reason for the change]
+Rules:
+- Do NOT use any emoji, HTML entities, or special Unicode characters.
+- Use Slack markdown only: *bold*, _italic_, \`code\` for element names.
+- Be concise. Under 250 words total.
+- Flag: hardcoded IDs, DML inside loops, missing fault paths.
 
-CHANGES:
-- [change 1 - what element was added/modified/deleted]
+Format your response EXACTLY as:
+
+*Summary:* [One sentence — the business reason for this change]
+
+*Changes:*
+- [change 1 — element name in \`code\`, what was added/modified/deleted]
 - [change 2]
-- [change 3]
 
-SECURITY & PERFORMANCE:
-[🔴 CRITICAL: List any security/performance issues found, or "✅ No critical issues detected"]
+*Security & Performance:*
+- [CRITICAL] or [MEDIUM] or [LOW]: [description]. Or "No issues detected."
 
-IMPACTS: [Any business impacts or concerns${parentFlows && parentFlows.length > 0 ? ', including impact on parent flows' : ''}]`;
+*Impact:* [One sentence — who/what is affected]`;
   }
 
   /**
@@ -498,9 +616,11 @@ IMPACTS: [Any business impacts or concerns${parentFlows && parentFlows.length > 
    * Logs prompt and response to llm_prompts_log.jsonl for debugging duplicate messages
    */
   private async callLLM(prompt: string, settings: OrgSettings, method: string = 'unknown'): Promise<string> {
-    const response = settings.billingMode === 'ENTERPRISE'
+    const raw = settings.billingMode === 'ENTERPRISE'
       ? await this.callVertexAI(prompt, settings)
       : await this.callGeminiAPI(prompt);
+
+    const response = this.decodeHtmlEntities(raw);
 
     logLLMCall({
       timestamp: new Date().toISOString(),
@@ -513,6 +633,25 @@ IMPACTS: [Any business impacts or concerns${parentFlows && parentFlows.length > 
     });
 
     return response;
+  }
+
+  /**
+   * Decode HTML entities that the LLM sometimes emits
+   * (e.g. &#128308; → 🔴, &quot; → ", &#39; → ')
+   */
+  private decodeHtmlEntities(text: string): string {
+    const named: Record<string, string> = {
+      '&amp;': '&', '&lt;': '<', '&gt;': '>',
+      '&quot;': '"', '&apos;': "'", '&#39;': "'",
+      '&nbsp;': ' ',
+    };
+    let result = text;
+    for (const [entity, char] of Object.entries(named)) {
+      result = result.split(entity).join(char);
+    }
+    result = result.replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
+    result = result.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)));
+    return result;
   }
 
   /**

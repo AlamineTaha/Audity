@@ -402,6 +402,7 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
       return [
         'changedValidationFormula',
         'changedValidationMessage',
+        'newValidation',
         'createdValidationRule',
         'changedValidationRule',
         'deletedValidationRule'
@@ -1113,6 +1114,102 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
       success: false,
       error: errorMessage,
     });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/compare-flow-versions:
+ *   post:
+ *     summary: Compare two specific Flow versions
+ *     description: Fetches metadata for two Flow versions and returns an AI-generated diff. Does NOT create an AuditDelta_Event__c record.
+ *     tags:
+ *       - Monitoring
+ *     parameters:
+ *       - name: flowName
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Flow API name (DeveloperName)
+ *       - name: versionA
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: First version number (older)
+ *       - name: versionB
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: Second version number (newer)
+ *     responses:
+ *       200:
+ *         description: Comparison result
+ *       400:
+ *         description: Missing or invalid parameters
+ *       500:
+ *         description: Server error
+ */
+router.post('/compare-flow-versions', async (req: Request, res: Response) => {
+  try {
+    const flowName = String(req.query.flowName ?? req.body.flowName ?? '').trim();
+    const versionA = parseInt(String(req.query.versionA ?? req.body.versionA ?? ''), 10);
+    const versionB = parseInt(String(req.query.versionB ?? req.body.versionB ?? ''), 10);
+
+    if (!flowName) {
+      return res.status(400).json({ success: false, error: 'flowName is required' });
+    }
+    if (isNaN(versionA) || isNaN(versionB) || versionA < 1 || versionB < 1) {
+      return res.status(400).json({ success: false, error: 'versionA and versionB must be positive integers' });
+    }
+    if (versionA === versionB) {
+      return res.status(400).json({ success: false, error: 'versionA and versionB must be different' });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+    const aiService = new AIService();
+
+    const orgIds = await authService.getAllOrgIds();
+    if (orgIds.length === 0) {
+      return res.status(400).json({ success: false, error: 'No authenticated Salesforce orgs found' });
+    }
+    const orgId = orgIds[0];
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(400).json({ success: false, error: 'Could not load org settings' });
+    }
+
+    const versions = await salesforceService.getFlowVersionsByNumber(orgId, flowName, versionA, versionB);
+
+    const older = versionA < versionB ? versions.versionA : versions.versionB;
+    const newer = versionA < versionB ? versions.versionB : versions.versionA;
+
+    const diff = await aiService.generateSummary(
+      older.metadata,
+      newer.metadata,
+      flowName,
+      settings
+    );
+
+    const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${versions.definitionId}`;
+
+    return res.json({
+      success: true,
+      flowName,
+      versionA: older.version,
+      versionB: newer.version,
+      flowUrl,
+      analysis: diff.summary,
+      changes: diff.changes,
+      securityFindings: diff.securityFindings,
+    });
+  } catch (error) {
+    console.error('Error in compare-flow-versions endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
