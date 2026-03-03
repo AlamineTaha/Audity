@@ -304,8 +304,15 @@ export class MonitorService {
           } else if (metadataType === 'ValidationRule') {
             await this.processValidationChangeGroup(orgId, oldest, newest, records, settings);
           } else if (metadataType === 'Permission') {
+            const byUser = new Map<string, SetupAuditTrail[]>();
             for (const r of records) {
-              await this.processPermissionChange(orgId, r, settings, forceImmediate);
+              const userId = r.CreatedBy?.Id || 'unknown';
+              const list = byUser.get(userId) || [];
+              list.push(r);
+              byUser.set(userId, list);
+            }
+            for (const [, userRecords] of byUser) {
+              await this.processPermissionBatch(orgId, userRecords, settings, forceImmediate);
             }
           } else if (metadataType === 'Object') {
             for (const r of records) {
@@ -330,7 +337,7 @@ export class MonitorService {
           }
 
           for (const r of records) {
-            if (!debug) await this.authService.markAuditRecordProcessed(orgId, r.Id);
+            await this.authService.markAuditRecordProcessed(orgId, r.Id);
             changesProcessed++;
             changes.push({
               orgId,
@@ -348,13 +355,53 @@ export class MonitorService {
       }
 
       // Process records that couldn't be grouped (no metadata key)
+      // Re-group ungrouped permission changes by user before the main loop
+      const ungroupedPerms: SetupAuditTrail[] = [];
+      const trulyUngrouped: SetupAuditTrail[] = [];
       for (const record of ungrouped) {
+        if (this.isPermissionChange(record)) {
+          ungroupedPerms.push(record);
+        } else {
+          trulyUngrouped.push(record);
+        }
+      }
+      if (ungroupedPerms.length > 0) {
+        const byUser = new Map<string, SetupAuditTrail[]>();
+        for (const r of ungroupedPerms) {
+          const userId = r.CreatedBy?.Id || 'unknown';
+          const list = byUser.get(userId) || [];
+          list.push(r);
+          byUser.set(userId, list);
+        }
+        for (const [, userRecords] of byUser) {
+          try {
+            await this.processPermissionBatch(orgId, userRecords, settings, forceImmediate);
+            for (const r of userRecords) {
+              await this.authService.markAuditRecordProcessed(orgId, r.Id);
+              changesProcessed++;
+              changes.push({
+                orgId,
+                action: r.Action,
+                display: r.Display || 'No description',
+                type: 'Permission',
+                timestamp: r.CreatedDate,
+                user: r.CreatedBy?.Name || 'Unknown'
+              });
+              console.log(`[PROCESSED] Org ${orgId} SetupAuditTrail.Id=${r.Id} | Op=Permission | Action=${r.Action} | Section=${r.Section || '-'} | Display=${(r.Display || '')?.substring(0, 60)}`);
+            }
+          } catch (error) {
+            console.error(`[Monitor] Error processing ungrouped permission batch:`, error);
+          }
+        }
+      }
+
+      for (const record of trulyUngrouped) {
         try {
           const changeType = this.getChangeType(record);
           let processed = false;
 
-          if (this.isPermissionChange(record)) {
-            await this.processPermissionChange(orgId, record, settings, forceImmediate);
+          if (this.isFlowChange(record)) {
+            await this.processFlowChangeGroupOldestNewest(orgId, record, record, [record], settings, forceImmediate);
             processed = true;
           } else if (this.isObjectChange(record)) {
             await this.processObjectChange(orgId, record, settings, forceImmediate);
@@ -378,7 +425,7 @@ export class MonitorService {
           }
 
           if (processed) {
-            if (!debug) await this.authService.markAuditRecordProcessed(orgId, record.Id);
+            await this.authService.markAuditRecordProcessed(orgId, record.Id);
             const op = this.getChangeType(record);
             console.log(`[PROCESSED] Org ${orgId} SetupAuditTrail.Id=${record.Id} | Op=${op} | Action=${record.Action} | Section=${record.Section || '-'} | Display=${(record.Display || '')?.substring(0, 60)}`);
             changesProcessed++;
@@ -440,8 +487,9 @@ export class MonitorService {
 
   private extractValidationRuleName(display: string): string | null {
     const m = display.match(/(?:ValidationRule|Validation Rule):\s*(.+?)(?:\s|$)/i) ||
-      display.match(/validation rule\s+(.+?)(?:\s|$)/i) ||
+      display.match(/validation rule\s+["']([^"']+)["']/i) ||
       display.match(/validation\s+["']([^"']+)["']/i) ||
+      display.match(/validation rule\s+(\S+)/i) ||
       display.match(/rule\s+["']?([^"'\s]+)["']?/i);
     return m?.[1]?.trim() || null;
   }
@@ -487,13 +535,24 @@ export class MonitorService {
   }
 
   /**
-   * Extract flow name from Display field
+   * Extract flow API name from Display field.
+   * Salesforce Display formats:
+   *   - "Activated flow with Name "Label" and Unique Name "API_Name""
+   *   - "Created flow version #1 "Label" for flow definition "API_Name""
+   *   - "Deleted flow version #-1 "Label" for flow definition "API_Name""
    */
   private extractFlowName(display: string): string | null {
-    const flowNameMatch = display.match(/Unique Name\s+["']([^"']+)["']/i) ||
-      display.match(/flow[:\s]+(.+?)(?:\s+for flow|\s+with|$)/i) ||
-      display.match(/version[^"']*["']([^"']+)["']/i);
-    return flowNameMatch?.[1]?.trim() || null;
+    // Priority 1: Unique Name (definition-level records)
+    const uniqueName = display.match(/Unique Name\s+["']([^"']+)["']/i);
+    if (uniqueName) return uniqueName[1].trim();
+
+    // Priority 2: "for flow definition" or "for flow" (version-level records)
+    const forFlowDef = display.match(/for flow(?:\s+definition)?\s+["']([^"']+)["']/i);
+    if (forFlowDef) return forFlowDef[1].trim();
+
+    // Fallback: first quoted string (usually the label, better than nothing)
+    const quoted = display.match(/["']([^"']+)["']/);
+    return quoted?.[1]?.trim() || null;
   }
 
   /**
@@ -532,21 +591,23 @@ export class MonitorService {
       return;
     }
 
-    const parentFlows = await this.salesforceService.findParentFlows(orgId, flowName);
     const diff = await this.aiService.generateSummary(
       delta.previous,
       delta.current,
       flowName,
-      settings,
-      parentFlows.length > 0 ? parentFlows : undefined
+      settings
     );
 
+    const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${delta.definitionId}`;
+
     const mainMessage = allRecords.length === 1
-      ? this.buildSingleFlowMessage(flowName, diff.summary, newest, parentFlows, settings)
-      : `🔔 *Flow activation: "${flowName}"*\n\n` +
-        `*Version:* v${delta.previousVersion} → v${delta.currentVersion}\n` +
-        `*Summary:*\n${diff.summary}\n\n` +
-        `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/Flows/home`;
+      ? this.buildSingleFlowMessage(flowName, diff.summary, newest, [], settings, flowUrl)
+      : `*[FLOW] ${flowName}*\n` +
+        `v${delta.previousVersion} → v${delta.currentVersion}\n\n` +
+        `${diff.summary}\n\n` +
+        `*Changed by:* ${newest.CreatedBy?.Name || 'Unknown'}\n` +
+        `*Time:* ${new Date(newest.CreatedDate).toLocaleString()}\n` +
+        `*View in Salesforce:* ${flowUrl}`;
 
     const threadTs = await this.authService.getFlowThreadTs(orgId, flowName);
     const category = this.getCategoryForMetadataType('FlowDefinition');
@@ -578,26 +639,27 @@ export class MonitorService {
       return;
     }
 
-    const versions = await this.salesforceService.getValidationRuleVersions(orgId, ruleName, newest.CreatedDate);
-    const diffExplanation = await this.aiService.compareValidationRuleFormulas(
-      versions.previous,
-      versions.current,
-      ruleName,
-      settings
+    const metadata = await this.salesforceService.getValidationRuleMetadata(orgId, ruleName);
+    const formula = metadata?.errorConditionFormula || '(not available)';
+    const errorMsg = metadata?.errorMessage || '';
+    const objectName = (metadata?.fullName?.split('.')[0]) ||
+      this.extractObjectNameFromSection(newest.Section || oldest.Section || '') || 'Unknown';
+    const allRules = await this.salesforceService.getValidationRulesForObject(orgId, objectName);
+
+    const analysis = await this.aiService.analyzeValidationRuleInContext(
+      ruleName, formula, errorMsg, newest.Action, objectName, allRules, settings
     );
 
-    const summaryText = `🔍 *Validation Rule (snapshot): ${ruleName}*\n\n` +
-      (versions.previous ? `*Previous:*\n\`\`\`${versions.previous}\`\`\`\n\n` : '') +
-      `*Current:*\n\`\`\`${versions.current}\`\`\`\n\n` +
-      `*AI Explanation:*\n${diffExplanation}\n\n` +
-      `*Records in window:* ${allRecords.length} (oldest→newest only)\n` +
+    const summaryText = `*[VALIDATION RULE] ${objectName}.${ruleName}*\n\n` +
+      `${analysis}\n\n` +
       `*Changed by:* ${newest.CreatedBy?.Name || 'Unknown'}\n` +
-      `*Time:* ${new Date(newest.CreatedDate).toLocaleString()}`;
+      `*Time:* ${new Date(newest.CreatedDate).toLocaleString()}\n` +
+      `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/${objectName}/ValidationRules/view`;
 
     const category = this.getCategoryForMetadataType('ValidationRule');
     await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, ruleName, category);
     await this.authService.markValidationRuleProcessed(orgId, ruleName);
-    console.log(`[Monitor] Published Validation Rule snapshot for ${ruleName}`);
+    console.log(`[Monitor] Published Validation Rule for ${objectName}.${ruleName}`);
   }
 
   /**
@@ -608,31 +670,40 @@ export class MonitorService {
     summary: string,
     auditRecord: SetupAuditTrail,
     parentFlows: Array<{ flowApiName: string; label?: string }>,
-    settings: OrgSettings
+    settings: OrgSettings,
+    flowUrl?: string
   ): string {
     const riskLevel = this.determineRiskLevel(summary);
-    const riskEmoji = riskLevel === 'High' ? '🔴' : riskLevel === 'Medium' ? '🟡' : '🟢';
-    let result = `🚨 *Flow Change Detected: ${flowName}*\n\n`;
+    let result = `*[FLOW] ${flowName}*\n\n`;
     if (parentFlows.length > 0) {
-      result += `⚠️ *This Flow is a SUBFLOW used by ${parentFlows.length} parent Flow(s):*\n`;
+      result += `*[SUBFLOW] Used by ${parentFlows.length} parent Flow(s):*\n`;
       parentFlows.forEach(p => { result += `  • *${p.flowApiName}*${p.label ? ` (${p.label})` : ''}\n`; });
       result += `\n*Impact:* Changes to this subflow will affect all parent flows listed above.\n\n`;
     }
-    result += `*Summary:*\n${summary}\n\n`;
-    result += `*Risk Level:* ${riskEmoji} ${riskLevel}\n` +
+    result += `${summary}\n\n`;
+    result += `*Risk:* ${riskLevel}\n` +
       `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
       `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
-      `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/Flows/home`;
+      `*View in Salesforce:* ${flowUrl || `${settings.instanceUrl}/lightning/setup/Flows/home`}`;
     return result;
   }
 
   /**
-   * Check if audit record is a Flow ACTIVATION (Tooling API only)
-   * Only proceed for activation - immediate reaction, no waiting room
+   * Check if audit record is a Flow change
    */
   private isFlowChange(record: SetupAuditTrail): boolean {
     const action = (record.Action || '').toLowerCase();
-    return action === 'activatedinteractiondefversion';
+    const flowActions = [
+      'activatedinteractiondefversion',
+      'deactivatedinteractiondefversion',
+      'createdinteractiondefversion',
+      'deletedinteractiondefversion',
+      'activatedinteractiondefinition',
+      'deactivatedinteractiondefinition',
+      'createdinteractiondefinition',
+      'deletedinteractiondefinition',
+    ];
+    return flowActions.includes(action);
   }
 
   /**
@@ -640,12 +711,14 @@ export class MonitorService {
    * Uses exact 2026 Salesforce Action codes (case-sensitive)
    */
   private isPermissionChange(record: SetupAuditTrail): boolean {
+    if (record.Section !== 'Manage Users') return false;
     const action = record.Action;
     const permissionActions = [
       'PermSetAssign',
       'PermSetUnassign',
       'PermSetCreate',
       'PermSetEnableUserPerm',
+      'PermSetEntityPermChanged',
       'profile_entity_permissions'
     ];
     return permissionActions.includes(action);
@@ -672,7 +745,7 @@ export class MonitorService {
     const action = (record.Action || '').toLowerCase();
     const validationActions = [
       'changedvalidationformula',
-      'newValidation',
+      'newvalidation',
       'changedvalidationmessage',
       'createdvalidationrule',
       'changedvalidationrule',
@@ -712,28 +785,51 @@ export class MonitorService {
   }
 
   /**
-   * Process Permission change
-   * Uses Salesforce native integration (publishAuditToSalesforce) instead of webhook
+   * Process a batch of permission changes from the same user.
+   * All types (PermSetAssign, PermSetEnableUserPerm, PermSetEntityPermChanged, etc.)
+   * are grouped and sent to the LLM in one call. Message matches the Flow format.
    */
-  private async processPermissionChange(orgId: string, auditRecord: SetupAuditTrail, settings: OrgSettings, _forceImmediate: boolean = false): Promise<void> {
+  private async processPermissionBatch(
+    orgId: string,
+    records: SetupAuditTrail[],
+    settings: OrgSettings,
+    _forceImmediate: boolean = false
+  ): Promise<void> {
     try {
-      const display = auditRecord.Display || auditRecord.Action || 'Unknown Permission Change';
-      
-      // Build summary text for Slack (formatted for Salesforce Flow → Slack)
-      const summaryText = `🔐 *Permission Change Detected*\n\n` +
-        `*Change:* ${display}\n\n` +
-        `*Changed by:* ${auditRecord.CreatedBy.Name}\n` +
-        `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
-        `*Risk Level:* 🟡 Medium\n` +
-        `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/Security/home`;
+      const userName = records[0]?.CreatedBy?.Name || 'Unknown';
+      const sorted = [...records].sort(
+        (a, b) => new Date(a.CreatedDate).getTime() - new Date(b.CreatedDate).getTime()
+      );
 
-      // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
+      const analysis = await this.aiService.analyzePermissionBatch(
+        sorted.map(r => ({
+          action: r.Action,
+          display: r.Display || r.Action || '',
+        })),
+        userName,
+        settings
+      );
+
+      const newest = sorted[sorted.length - 1];
+
+      const summaryText =
+        `*[PERMISSION] ${records.length} change${records.length > 1 ? 's' : ''}*\n\n` +
+        `${analysis}\n\n` +
+        `*Changed by:* ${userName}\n` +
+        `*Time:* ${new Date(newest.CreatedDate).toLocaleString()}\n` +
+        `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/PermSets/home`;
+
       const category = this.getCategoryForMetadataType('PermissionSet');
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, display, category);
+      await this.salesforceService.publishAuditToSalesforce(
+        orgId,
+        summaryText,
+        `Permission batch (${userName})`,
+        category
+      );
 
-      console.log(`[Monitor] Published Permission change notification to Salesforce for: ${display}`);
+      console.log(`[Monitor] Published permission batch for ${userName} (${records.length} changes)`);
     } catch (error) {
-      console.error(`[Monitor] Error processing permission change:`, error);
+      console.error(`[Monitor] Error processing permission batch:`, error);
       throw error;
     }
   }
@@ -747,11 +843,10 @@ export class MonitorService {
       const display = auditRecord.Display || auditRecord.Action || 'Unknown Object Change';
       
       // Build summary text for Slack (formatted for Salesforce Flow → Slack)
-      const summaryText = `📊 *Object Change Detected*\n\n` +
+      const summaryText = `*[OBJECT] Change Detected*\n\n` +
         `*Change:* ${display}\n\n` +
         `*Changed by:* ${auditRecord.CreatedBy.Name}\n` +
         `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
-        `*Risk Level:* 🟡 Medium\n` +
         `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/home`;
 
       // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
@@ -766,106 +861,49 @@ export class MonitorService {
   }
 
   /**
-   * Process Validation Rule change
-   * Gets validation rule ID, finds previous version, compares formulas, and explains diff in human language
+   * Process a single Validation Rule change.
+   * Fetches all validation rules on the same object and sends context to the LLM.
    */
   private async processValidationChange(orgId: string, auditRecord: SetupAuditTrail, settings: OrgSettings, _forceImmediate: boolean = false): Promise<void> {
     const display = auditRecord.Display || '';
-    
+
     try {
-      // Extract validation rule name from Display field using regex
-      // Format examples:
-      // - "ValidationRule: RuleName"
-      // - "Validation Rule: RuleName"
-      // - "Changed validation rule Prevent_Invalid_Email"
-      // - "Changed error message for Accounts validation "In_dustry_validation_rule" from ..."
-      let ruleNameMatch = display.match(/(?:ValidationRule|Validation Rule):\s*(.+?)(?:\s|$)/i) ||
-                         display.match(/validation rule\s+(.+?)(?:\s|$)/i) ||
-                         display.match(/validation\s+["']([^"']+)["']/i) ||  // Handles: "validation "RuleName""
-                         display.match(/rule\s+["']?([^"'\s]+)["']?/i);
-      
-      if (!ruleNameMatch || !ruleNameMatch[1]) {
+      const ruleName = this.extractValidationRuleName(display);
+      if (!ruleName) {
         console.warn(`[Monitor] Could not extract validation rule name from: ${display}`);
-        // Fallback: publish with raw display text
         await this.publishFallbackNotification(orgId, 'Validation Rule Change', display, auditRecord, settings);
         return;
       }
 
-      const ruleName = ruleNameMatch[1].trim();
-
-      // Deduplication: SF creates multiple SetupAuditTrail records per validation change (formula, message, etc.)
-      // Only send one Slack message per rule per 5 min
-      const alreadySentForRule = await this.authService.isValidationRuleRecentlyProcessed(orgId, ruleName);
-      if (alreadySentForRule) {
-        console.log(`[SKIP_VALIDATION_DUPE] Org ${orgId} Rule=${ruleName} | Action=${auditRecord.Action} - already sent Slack for this rule`);
+      const alreadySent = await this.authService.isValidationRuleRecentlyProcessed(orgId, ruleName);
+      if (alreadySent) {
+        console.log(`[SKIP_VALIDATION_DUPE] Org ${orgId} Rule=${ruleName} - already sent`);
         return;
       }
-      const currentChangeTime = auditRecord.CreatedDate;
 
-      try {
-        // Get validation rule ID and current formula using Tooling API
-        const metadata = await this.salesforceService.getValidationRuleMetadata(orgId, ruleName);
-        
-        if (!metadata || !metadata.errorConditionFormula) {
-          console.warn(`[Monitor] Could not fetch validation rule metadata for: ${ruleName}`);
-          await this.publishFallbackNotification(orgId, `Validation Rule: ${ruleName}`, display, auditRecord, settings);
-          await this.authService.markValidationRuleProcessed(orgId, ruleName);
-          return;
-        }
+      const metadata = await this.salesforceService.getValidationRuleMetadata(orgId, ruleName);
+      const formula = metadata?.errorConditionFormula || '(not available)';
+      const errorMsg = metadata?.errorMessage || '';
+      const objectName = (metadata?.fullName?.split('.')[0]) ||
+        this.extractObjectNameFromSection(auditRecord.Section || '') || 'Unknown';
+      const allRules = await this.salesforceService.getValidationRulesForObject(orgId, objectName);
 
-        const validationRuleId = metadata.id;
-        const currentFormula = metadata.errorConditionFormula;
+      const analysis = await this.aiService.analyzeValidationRuleInContext(
+        ruleName, formula, errorMsg, auditRecord.Action, objectName, allRules, settings
+      );
 
-        console.log(`[Monitor] Processing Validation Rule change: ${ruleName} (ID: ${validationRuleId})`);
+      const summaryText = `*[VALIDATION RULE] ${objectName}.${ruleName}*\n\n` +
+        `${analysis}\n\n` +
+        `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
+        `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
+        `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/${objectName}/ValidationRules/view`;
 
-        // Get previous and current versions for comparison
-        const versions = await this.salesforceService.getValidationRuleVersions(
-          orgId,
-          ruleName,
-          currentChangeTime
-        );
-
-        // Compare formulas and get AI explanation of the diff
-        const diffExplanation = await this.aiService.compareValidationRuleFormulas(
-          versions.previous,
-          versions.current,
-          ruleName,
-          settings
-        );
-
-        // Build summary text for Slack (formatted for Salesforce Flow → Slack)
-        let summaryText = `🔍 *Validation Rule Updated: ${ruleName}*\n\n`;
-        
-        if (versions.previous) {
-          summaryText += `*Previous Formula:*\n\`\`\`${versions.previous}\`\`\`\n\n`;
-        }
-        
-        summaryText += `*New Formula:*\n\`\`\`${currentFormula}\`\`\`\n\n` +
-          `*AI Explanation of Changes:*\n${diffExplanation}\n\n` +
-          `*Validation Rule ID:* ${validationRuleId}\n` +
-          `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
-          `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}`;
-
-        // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
-        const category = this.getCategoryForMetadataType('ValidationRule');
-        const recordId = await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, ruleName, category);
-
-        await this.authService.markValidationRuleProcessed(orgId, ruleName);
-        console.log(`[Monitor] Created AuditDelta_Event__c ${recordId} for Validation Rule: ${ruleName}`);
-      } catch (error) {
-        console.error(`[Monitor] Error fetching Validation Rule metadata for ${ruleName}:`, error);
-        await this.publishFallbackNotification(orgId, `Validation Rule: ${ruleName}`, display, auditRecord, settings);
-        await this.authService.markValidationRuleProcessed(orgId, ruleName);
-      }
+      const category = this.getCategoryForMetadataType('ValidationRule');
+      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, ruleName, category);
+      await this.authService.markValidationRuleProcessed(orgId, ruleName);
+      console.log(`[Monitor] Published Validation Rule for ${objectName}.${ruleName}`);
     } catch (error) {
       console.error(`[Monitor] Error processing validation rule change:`, error);
-      // Only mark if we extracted ruleName (avoid double-processing fallback)
-      const ruleNameMatch = display.match(/(?:ValidationRule|Validation Rule):\s*(.+?)(?:\s|$)/i) ||
-        display.match(/validation rule\s+(.+?)(?:\s|$)/i) ||
-        display.match(/validation\s+["']([^"']+)["']/i);
-      if (ruleNameMatch?.[1]) {
-        await this.authService.markValidationRuleProcessed(orgId, ruleNameMatch[1].trim());
-      }
       await this.publishFallbackNotification(orgId, 'Validation Rule Change', display, auditRecord, settings);
     }
   }
@@ -892,23 +930,18 @@ export class MonitorService {
   }
 
   /**
-   * Process Formula Field change (separate from Validation Rules)
-   * Fetches metadata via Tooling API and generates AI interpretation
+   * Process Formula Field change.
+   * Fetches metadata and sends a concise AI analysis.
    */
   private async processFormulaFieldChange(orgId: string, auditRecord: SetupAuditTrail, settings: OrgSettings, _forceImmediate: boolean = false): Promise<void> {
     const display = auditRecord.Display || '';
     const section = auditRecord.Section || '';
-    
+
     try {
-      // Extract field name from Display field
-      // Format examples: 
-      // - "Created custom formula field: Formula Test (Text)"
-      // - "Changed custom field: Account.CustomField__c"
-      // - "Formula Test"
-      let fieldMatch = display.match(/(?:field|formula field):\s*(.+?)(?:\s*\(|$)/i) ||
-                       display.match(/\.([A-Za-z0-9_]+__c)/) ||
-                       display.match(/^([A-Za-z0-9_\s]+?)(?:\s*\(|$)/);
-      
+      const fieldMatch = display.match(/(?:field|formula field):\s*(.+?)(?:\s*\(|$)/i) ||
+                         display.match(/\.([A-Za-z0-9_]+__c)/) ||
+                         display.match(/^([A-Za-z0-9_\s]+?)(?:\s*\(|$)/);
+
       if (!fieldMatch || !fieldMatch[1]) {
         console.warn(`[Monitor] Could not extract field name from: ${display}`);
         await this.publishFallbackNotification(orgId, 'Custom Field Change', display, auditRecord, settings);
@@ -916,65 +949,33 @@ export class MonitorService {
       }
 
       const fieldName = fieldMatch[1].trim();
-      
-      // Extract object name from multiple sources (priority order):
-      // 1. Display field if it contains Object.Field format
-      // 2. Section field (e.g., "Customize Accounts" -> "Account")
-      // 3. Fallback to "Unknown"
       let objectName = 'Unknown';
-      
-      // Try Display field first (e.g., "Account.CustomField__c")
       const objectMatch = display.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/);
       if (objectMatch && objectMatch[1]) {
         objectName = objectMatch[1];
       } else {
-        // Try Section field (e.g., "Customize Accounts")
-        const sectionObjectName = this.extractObjectNameFromSection(section);
-        if (sectionObjectName) {
-          objectName = sectionObjectName;
-        } else {
-          console.warn(`[Monitor] Could not determine object name from Display: "${display}" or Section: "${section}"`);
-        }
+        objectName = this.extractObjectNameFromSection(section) || 'Unknown';
       }
 
-      try {
-        // Get Formula Field metadata using Tooling API (separate from Validation Rules)
-        const fieldMetadata = await this.salesforceService.getFormulaFieldMetadata(
-          orgId,
-          fieldName,
-          objectName
-        );
-
-        if (!fieldMetadata) {
-          console.warn(`[Monitor] Could not fetch Formula Field metadata for ${objectName}.${fieldName}`);
-          await this.publishFallbackNotification(orgId, `Formula Field: ${fieldName}`, display, auditRecord, settings);
-          return;
-        }
-
-        // Generate AI interpretation with type flag for Formula Field (calculation, not blocker)
-        const interpretation = await this.aiService.interpretMetadataChange(
-          fieldMetadata,
-          'FormulaField',
-          `${objectName}.${fieldName}`,
-          settings
-        );
-
-        // Build summary text
-        const summaryText = `🔢 *Formula Field Updated: ${objectName}.${fieldName}*\n\n` +
-          `*Field Label:* ${fieldMetadata.label || 'N/A'}\n` +
-          `*Field Type:* ${fieldMetadata.type || 'N/A'}\n` +
-          (fieldMetadata.formula ? `*Formula:*\n\`\`\`${fieldMetadata.formula}\`\`\`\n\n` : '') +
-          `*AI Interpretation:*\n${interpretation}\n\n` +
-          `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
-          `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}`;
-
-        const category = this.getCategoryForMetadataType('CustomField');
-        await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, `${objectName}.${fieldName}`, category);
-        console.log(`[Monitor] Published Formula Field change notification for: ${objectName}.${fieldName}`);
-      } catch (error) {
-        console.error(`[Monitor] Error fetching Formula Field metadata:`, error);
+      const fieldMetadata = await this.salesforceService.getFormulaFieldMetadata(orgId, fieldName, objectName);
+      if (!fieldMetadata) {
         await this.publishFallbackNotification(orgId, `Formula Field: ${fieldName}`, display, auditRecord, settings);
+        return;
       }
+
+      const analysis = await this.aiService.analyzeFormulaField(
+        fieldName, objectName, fieldMetadata.formula, fieldMetadata.label, settings
+      );
+
+      const summaryText = `*[FORMULA FIELD] ${objectName}.${fieldName}*\n\n` +
+        `${analysis}\n\n` +
+        `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
+        `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
+        `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/${objectName}/FieldsAndRelationships/view`;
+
+      const category = this.getCategoryForMetadataType('CustomField');
+      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, `${objectName}.${fieldName}`, category);
+      console.log(`[Monitor] Published Formula Field for ${objectName}.${fieldName}`);
     } catch (error) {
       console.error(`[Monitor] Error processing formula field change:`, error);
       await this.publishFallbackNotification(orgId, 'Formula Field Change', display, auditRecord, settings);
@@ -990,24 +991,17 @@ export class MonitorService {
       const display = auditRecord.Display || auditRecord.Action || 'Unknown Metadata Change';
       const action = auditRecord.Action;
       
-      // Determine change type and icon based on action
-      let changeType = 'Metadata Change';
-      let icon = '📝';
-      
+      let changeType = 'METADATA';
       if (action === 'accountlayout' || action?.includes('layout')) {
-        changeType = 'Page Layout Change';
-        icon = '📄';
+        changeType = 'PAGE LAYOUT';
       } else if (action?.includes('CustomField')) {
-        changeType = 'Custom Field Change';
-        icon = '📋';
+        changeType = 'CUSTOM FIELD';
       }
       
-      // Build summary text for Slack (formatted for Salesforce Flow → Slack)
-      const summaryText = `${icon} *${changeType} Detected*\n\n` +
+      const summaryText = `*[${changeType}] Change Detected*\n\n` +
         `*Change:* ${display}\n\n` +
         `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
         `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
-        `*Risk Level:* 🟡 Medium\n` +
         `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/home`;
 
       // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
@@ -1032,7 +1026,7 @@ export class MonitorService {
     auditRecord: SetupAuditTrail,
     _settings: OrgSettings // Kept for API consistency, but not used in fallback
   ): Promise<void> {
-    const summaryText = `📝 *${changeType} Detected*\n\n` +
+    const summaryText = `*[${changeType}]*\n\n` +
       `*Change:* ${display}\n\n` +
       `*Note:* Full metadata could not be retrieved. This may indicate the item was deleted or is not accessible.\n\n` +
       `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
@@ -1075,7 +1069,7 @@ export class MonitorService {
       );
 
       // Build summary text
-      const summaryText = `📋 *Unmapped Change Detected*\n\n` +
+      const summaryText = `*[UNMAPPED] Change Detected*\n\n` +
         `*Action:* ${action}\n` +
         `*Description:* ${display}\n` +
         `*Section:* ${auditRecord.Section || 'Unknown'}\n\n` +

@@ -2338,7 +2338,7 @@ export class SalesforceService {
   async getValidationRuleMetadata(
     orgId: string,
     validationRuleName: string
-  ): Promise<{ id: string; errorConditionFormula: string } | null> {
+  ): Promise<{ id: string; fullName: string; errorConditionFormula: string; errorMessage: string } | null> {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
@@ -2371,18 +2371,56 @@ export class SalesforceService {
         const metadata = fallbackResult.records[0].Metadata || {};
         return {
           id: fallbackResult.records[0].Id,
-          errorConditionFormula: metadata.errorConditionFormula || metadata.ValidationFormula || ''
+          fullName: fallbackResult.records[0].FullName || '',
+          errorConditionFormula: metadata.errorConditionFormula || metadata.ValidationFormula || '',
+          errorMessage: metadata.errorMessage || '',
         };
       }
 
       const metadata = result.records[0].Metadata || {};
       return {
         id: result.records[0].Id,
-        errorConditionFormula: metadata.errorConditionFormula || metadata.ValidationFormula || ''
+        fullName: result.records[0].FullName || '',
+        errorConditionFormula: metadata.errorConditionFormula || metadata.ValidationFormula || '',
+        errorMessage: metadata.errorMessage || '',
       };
     } catch (error) {
       console.error(`Error fetching validation rule metadata for ${validationRuleName}:`, error);
       throw error;
+    }
+  }
+
+  /**
+   * Get all validation rules on a specific object.
+   * Returns rule names and active status (no Metadata to avoid LIMIT 1 restriction).
+   */
+  async getValidationRulesForObject(
+    orgId: string,
+    objectName: string
+  ): Promise<Array<{ name: string; active: boolean }>> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      const sanitized = objectName.replace(/'/g, "''");
+      const soql = `
+        SELECT Id, ValidationName, Active
+        FROM ValidationRule
+        WHERE EntityDefinition.QualifiedApiName = '${sanitized}'
+      `;
+
+      const result = await tooling.query<any>(soql);
+      if (!result.records || result.records.length === 0) {
+        return [];
+      }
+
+      return result.records.map((r: any) => ({
+        name: r.ValidationName || 'Unknown',
+        active: r.Active === true || r.Active === 'true',
+      }));
+    } catch (error) {
+      console.error(`Error fetching validation rules for object ${objectName}:`, error);
+      return [];
     }
   }
 
@@ -2545,6 +2583,56 @@ export class SalesforceService {
       };
     } catch (error) {
       console.error(`Error fetching flow delta for ${flowName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get two specific flow versions by version number for comparison.
+   */
+  async getFlowVersionsByNumber(orgId: string, flowName: string, versionA: number, versionB: number): Promise<{
+    versionA: { version: number; metadata: unknown };
+    versionB: { version: number; metadata: unknown };
+    definitionId: string;
+  }> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowName.replace(/'/g, "''")}' LIMIT 1`;
+      const defResult = await tooling.query<any>(defQuery);
+      if (!defResult.records?.length) {
+        throw new Error(`Flow '${flowName}' not found`);
+      }
+
+      const definitionId = defResult.records[0].Id;
+      const escapedDefId = definitionId.replace(/'/g, "''");
+
+      const [resultA, resultB] = await Promise.all([
+        tooling.query<any>(`
+          SELECT Id, VersionNumber, Metadata
+          FROM Flow
+          WHERE DefinitionId = '${escapedDefId}' AND VersionNumber = ${versionA}
+          LIMIT 1
+        `),
+        tooling.query<any>(`
+          SELECT Id, VersionNumber, Metadata
+          FROM Flow
+          WHERE DefinitionId = '${escapedDefId}' AND VersionNumber = ${versionB}
+          LIMIT 1
+        `),
+      ]);
+
+      if (!resultA.records?.length) throw new Error(`Flow '${flowName}' version ${versionA} not found`);
+      if (!resultB.records?.length) throw new Error(`Flow '${flowName}' version ${versionB} not found`);
+
+      return {
+        versionA: { version: versionA, metadata: resultA.records[0].Metadata ?? resultA.records[0] },
+        versionB: { version: versionB, metadata: resultB.records[0].Metadata ?? resultB.records[0] },
+        definitionId,
+      };
+    } catch (error) {
+      console.error(`Error fetching flow versions ${versionA} vs ${versionB} for ${flowName}:`, error);
       throw error;
     }
   }

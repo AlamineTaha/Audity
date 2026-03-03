@@ -127,6 +127,84 @@ Focus on the differences and their business impact.`;
   }
 
   /**
+   * Analyze a validation rule in the context of all validation rules on the same object.
+   * Explains the rule, infers change impact from the action, and assesses object health.
+   */
+  async analyzeValidationRuleInContext(
+    ruleName: string,
+    formula: string,
+    errorMessage: string,
+    action: string,
+    objectName: string,
+    allRulesOnObject: Array<{ name: string; active: boolean }>,
+    settings: OrgSettings
+  ): Promise<string> {
+    const activeCount = allRulesOnObject.filter(r => r.active).length;
+
+    const prompt = `Analyze this Salesforce validation rule for a Slack message. Be direct, no fluff.
+
+Rule: \`${ruleName}\` on \`${objectName}\`
+Action: ${action}
+Formula: \`\`\`${formula}\`\`\`
+Error Message shown to users: "${errorMessage || '(none)'}"
+
+Rules: No emoji. No HTML entities. Slack markdown only (*bold*, \`code\`). Under 100 words.
+
+Answer EXACTLY:
+
+*What it does:* [One sentence — what the formula blocks or enforces]
+
+*Impact:* [One sentence — which users or processes are affected]
+
+*Naming & Error Message:* [Flag if the rule name is unclear/misleading, or if the error message is vague/missing/unhelpful to end users. Say "OK" if both are fine.]
+
+*Object Health:* ${activeCount} active rules on \`${objectName}\` (${allRulesOnObject.length} total). [If >10 active, say "Review recommended." Otherwise "OK."]`;
+
+    try {
+      return await this.callLLM(prompt, settings, 'analyzeValidationRuleInContext');
+    } catch (error) {
+      console.error('Error analyzing validation rule in context:', error);
+      throw new Error(`Failed to analyze validation rule: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Analyze a formula field change concisely.
+   */
+  async analyzeFormulaField(
+    fieldName: string,
+    objectName: string,
+    formula: string | undefined,
+    label: string | undefined,
+    settings: OrgSettings
+  ): Promise<string> {
+    const prompt = `You are the "AuditDelta Guardian," an expert Salesforce Auditor. Analyze this formula field for a Slack notification.
+
+Object: \`${objectName}\`
+Field: \`${fieldName}\`
+Label: ${label || 'N/A'}
+${formula ? `Formula:\n\`\`\`\n${formula}\n\`\`\`` : 'Formula: not available'}
+
+Rules:
+- Do NOT use any emoji, HTML entities, or special Unicode characters.
+- Use Slack markdown only: *bold*, _italic_, \`code\` for names.
+- Be concise. Under 150 words total.
+
+Format your response EXACTLY as:
+
+*Summary:* [One sentence — what this formula field calculates and why it matters]
+
+*Impact:* [One sentence — how this affects reports, workflows, or user experience]`;
+
+    try {
+      return await this.callLLM(prompt, settings, 'analyzeFormulaField');
+    } catch (error) {
+      console.error('Error analyzing formula field:', error);
+      throw new Error(`Failed to analyze formula field: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
    * Analyze a batch of permission changes from the same user.
    * All permission types (PermSetAssign, PermSetEnableUserPerm, PermSetEntityPermChanged, etc.)
    * are sent in one call. Output follows the same concise format as Flow summaries.
