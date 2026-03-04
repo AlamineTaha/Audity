@@ -2590,49 +2590,100 @@ export class SalesforceService {
   /**
    * Get two specific flow versions by version number for comparison.
    */
-  async getFlowVersionsByNumber(orgId: string, flowName: string, versionA: number, versionB: number): Promise<{
+  /**
+   * Look up a FlowDefinition by label or API name.
+   * Tries DeveloperName first, then MasterLabel.
+   */
+  async resolveFlowDefinition(orgId: string, flowNameOrLabel: string): Promise<{ definitionId: string; developerName: string; label: string }> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+    const escaped = flowNameOrLabel.replace(/'/g, "''");
+
+    const byDev = await tooling.query<any>(
+      `SELECT Id, DeveloperName, MasterLabel FROM FlowDefinition WHERE DeveloperName = '${escaped}' LIMIT 1`
+    );
+    if (byDev.records?.length) {
+      const r = byDev.records[0];
+      return { definitionId: r.Id, developerName: r.DeveloperName, label: r.MasterLabel || r.DeveloperName };
+    }
+
+    const byLabel = await tooling.query<any>(
+      `SELECT Id, DeveloperName, MasterLabel FROM FlowDefinition WHERE MasterLabel = '${escaped}' LIMIT 1`
+    );
+    if (byLabel.records?.length) {
+      const r = byLabel.records[0];
+      return { definitionId: r.Id, developerName: r.DeveloperName, label: r.MasterLabel || r.DeveloperName };
+    }
+
+    throw new Error(`Flow '${flowNameOrLabel}' not found. Try using the exact Flow label or API name.`);
+  }
+
+  /**
+   * Get two specific flow versions for comparison.
+   * If versionA/versionB are not provided, defaults to latest and latest-1.
+   */
+  async getFlowVersionsByNumber(orgId: string, flowNameOrLabel: string, versionA?: number, versionB?: number): Promise<{
     versionA: { version: number; metadata: unknown };
     versionB: { version: number; metadata: unknown };
     definitionId: string;
+    developerName: string;
+    label: string;
   }> {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
     try {
-      const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowName.replace(/'/g, "''")}' LIMIT 1`;
-      const defResult = await tooling.query<any>(defQuery);
-      if (!defResult.records?.length) {
-        throw new Error(`Flow '${flowName}' not found`);
+      const flowDef = await this.resolveFlowDefinition(orgId, flowNameOrLabel);
+      const escapedDefId = flowDef.definitionId.replace(/'/g, "''");
+
+      if (!versionA || !versionB) {
+        const latestQuery = `
+          SELECT Id, VersionNumber, Metadata
+          FROM Flow
+          WHERE DefinitionId = '${escapedDefId}'
+          ORDER BY VersionNumber DESC
+          LIMIT 1
+        `;
+        const latestResult = await tooling.query<any>(latestQuery);
+        if (!latestResult.records?.length) throw new Error(`No versions found for flow '${flowNameOrLabel}'`);
+
+        const latestVersion = latestResult.records[0].VersionNumber;
+        if (latestVersion < 2) throw new Error(`Flow '${flowNameOrLabel}' only has version 1 — nothing to compare.`);
+
+        versionB = versionB || latestVersion;
+        versionA = versionA || latestVersion - 1;
       }
 
-      const definitionId = defResult.records[0].Id;
-      const escapedDefId = definitionId.replace(/'/g, "''");
+      const verA = versionA as number;
+      const verB = versionB as number;
 
       const [resultA, resultB] = await Promise.all([
         tooling.query<any>(`
           SELECT Id, VersionNumber, Metadata
           FROM Flow
-          WHERE DefinitionId = '${escapedDefId}' AND VersionNumber = ${versionA}
+          WHERE DefinitionId = '${escapedDefId}' AND VersionNumber = ${verA}
           LIMIT 1
         `),
         tooling.query<any>(`
           SELECT Id, VersionNumber, Metadata
           FROM Flow
-          WHERE DefinitionId = '${escapedDefId}' AND VersionNumber = ${versionB}
+          WHERE DefinitionId = '${escapedDefId}' AND VersionNumber = ${verB}
           LIMIT 1
         `),
       ]);
 
-      if (!resultA.records?.length) throw new Error(`Flow '${flowName}' version ${versionA} not found`);
-      if (!resultB.records?.length) throw new Error(`Flow '${flowName}' version ${versionB} not found`);
+      if (!resultA.records?.length) throw new Error(`Flow '${flowNameOrLabel}' version ${verA} not found`);
+      if (!resultB.records?.length) throw new Error(`Flow '${flowNameOrLabel}' version ${verB} not found`);
 
       return {
-        versionA: { version: versionA, metadata: resultA.records[0].Metadata ?? resultA.records[0] },
-        versionB: { version: versionB, metadata: resultB.records[0].Metadata ?? resultB.records[0] },
-        definitionId,
+        versionA: { version: verA, metadata: resultA.records[0].Metadata ?? resultA.records[0] },
+        versionB: { version: verB, metadata: resultB.records[0].Metadata ?? resultB.records[0] },
+        definitionId: flowDef.definitionId,
+        developerName: flowDef.developerName,
+        label: flowDef.label,
       };
     } catch (error) {
-      console.error(`Error fetching flow versions ${versionA} vs ${versionB} for ${flowName}:`, error);
+      console.error(`Error fetching flow versions for ${flowNameOrLabel}:`, error);
       throw error;
     }
   }

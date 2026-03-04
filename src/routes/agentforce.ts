@@ -742,7 +742,9 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
  */
 router.post('/flows/check-revert-impact', async (req: Request, res: Response) => {
   try {
-    const { flowApiName, orgId, targetVersionNumber } = req.body;
+    const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
+    const orgId = req.query.orgId ?? req.body.orgId;
+    const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
 
     if (!flowApiName || !orgId || targetVersionNumber === undefined) {
       return res.status(400).json({
@@ -862,7 +864,9 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
  */
 router.post('/flows/activate-version', async (req: Request, res: Response) => {
   try {
-    const { flowApiName, orgId, targetVersionNumber } = req.body;
+    const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
+    const orgId = req.query.orgId ?? req.body.orgId;
+    const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
 
     if (!flowApiName || !orgId || targetVersionNumber === undefined) {
       return res.status(400).json({

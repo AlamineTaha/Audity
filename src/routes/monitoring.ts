@@ -94,7 +94,8 @@ export async function ensureWaitingRoomStarted(): Promise<void> {
  */
 router.post('/slack-invite', async (req: Request, res: Response) => {
   try {
-    const { channelId, userIds } = req.body;
+    const channelId = req.query.channelId ?? req.body.channelId;
+    const userIds = req.query.userIds ?? req.body.userIds;
     if (!channelId) {
       return res.status(400).json({ success: false, error: 'channelId is required' });
     }
@@ -124,7 +125,9 @@ router.post('/slack-invite', async (req: Request, res: Response) => {
  */
 router.post('/slack-thread-callback', async (req: Request, res: Response) => {
   try {
-    const { orgId, flowDeveloperName, threadTs } = req.body;
+    const orgId = req.query.orgId ?? req.body.orgId;
+    const flowDeveloperName = req.query.flowDeveloperName ?? req.body.flowDeveloperName;
+    const threadTs = req.query.threadTs ?? req.body.threadTs;
     if (!orgId || !flowDeveloperName || !threadTs) {
       return res.status(400).json({
         success: false,
@@ -681,14 +684,9 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  */
 router.post('/analyze-permission', async (req: Request, res: Response) => {
   try {
-    // Validate request body exists
-    if (!req.body || typeof req.body !== 'object') {
-      return res.status(400).json({
-        error: 'Invalid request body. Expected JSON object.',
-      });
-    }
-
-    const { userId, permissionName, orgId } = req.body;
+    const userId = req.query.userId ?? req.body?.userId;
+    const permissionName = req.query.permissionName ?? req.body?.permissionName;
+    const orgId = req.query.orgId ?? req.body?.orgId;
 
     if (!userId) {
       return res.status(400).json({
@@ -1007,7 +1005,10 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
  */
 router.post('/explain-metadata', async (req: Request, res: Response) => {
   try {
-    const { orgId, name, type, objectName } = req.body;
+    const orgId = req.query.orgId ?? req.body.orgId;
+    const name = req.query.name ?? req.body.name;
+    const type = req.query.type ?? req.body.type;
+    const objectName = req.query.objectName ?? req.body.objectName;
 
     // Validate required parameters
     if (!orgId || !name || !type) {
@@ -1121,8 +1122,8 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
  * @swagger
  * /api/v1/compare-flow-versions:
  *   post:
- *     summary: Compare two specific Flow versions
- *     description: Fetches metadata for two Flow versions and returns an AI-generated diff. Does NOT create an AuditDelta_Event__c record.
+ *     summary: Compare two Flow versions
+ *     description: Fetches metadata for two Flow versions and returns an AI-generated diff. Accepts either the Flow label or API name. If versions are omitted, compares the latest two. Does NOT create an AuditDelta_Event__c record.
  *     tags:
  *       - Monitoring
  *     parameters:
@@ -1131,19 +1132,19 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: Flow API name (DeveloperName)
+ *         description: Flow label or API name (DeveloperName)
  *       - name: versionA
  *         in: query
- *         required: true
+ *         required: false
  *         schema:
  *           type: integer
- *         description: First version number (older)
+ *         description: First version number (optional — defaults to latest - 1)
  *       - name: versionB
  *         in: query
- *         required: true
+ *         required: false
  *         schema:
  *           type: integer
- *         description: Second version number (newer)
+ *         description: Second version number (optional — defaults to latest)
  *     responses:
  *       200:
  *         description: Comparison result
@@ -1155,16 +1156,21 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
 router.post('/compare-flow-versions', async (req: Request, res: Response) => {
   try {
     const flowName = String(req.query.flowName ?? req.body.flowName ?? '').trim();
-    const versionA = parseInt(String(req.query.versionA ?? req.body.versionA ?? ''), 10);
-    const versionB = parseInt(String(req.query.versionB ?? req.body.versionB ?? ''), 10);
+    const rawA = req.query.versionA ?? req.body.versionA;
+    const rawB = req.query.versionB ?? req.body.versionB;
+    const versionA = rawA ? parseInt(String(rawA), 10) : undefined;
+    const versionB = rawB ? parseInt(String(rawB), 10) : undefined;
 
     if (!flowName) {
-      return res.status(400).json({ success: false, error: 'flowName is required' });
+      return res.status(400).json({ success: false, error: 'flowName is required (label or API name)' });
     }
-    if (isNaN(versionA) || isNaN(versionB) || versionA < 1 || versionB < 1) {
-      return res.status(400).json({ success: false, error: 'versionA and versionB must be positive integers' });
+    if (versionA !== undefined && (isNaN(versionA) || versionA < 1)) {
+      return res.status(400).json({ success: false, error: 'versionA must be a positive integer' });
     }
-    if (versionA === versionB) {
+    if (versionB !== undefined && (isNaN(versionB) || versionB < 1)) {
+      return res.status(400).json({ success: false, error: 'versionB must be a positive integer' });
+    }
+    if (versionA !== undefined && versionB !== undefined && versionA === versionB) {
       return res.status(400).json({ success: false, error: 'versionA and versionB must be different' });
     }
 
@@ -1184,13 +1190,13 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
 
     const versions = await salesforceService.getFlowVersionsByNumber(orgId, flowName, versionA, versionB);
 
-    const older = versionA < versionB ? versions.versionA : versions.versionB;
-    const newer = versionA < versionB ? versions.versionB : versions.versionA;
+    const older = versions.versionA.version < versions.versionB.version ? versions.versionA : versions.versionB;
+    const newer = versions.versionA.version < versions.versionB.version ? versions.versionB : versions.versionA;
 
     const diff = await aiService.generateSummary(
       older.metadata,
       newer.metadata,
-      flowName,
+      versions.developerName,
       settings
     );
 
@@ -1198,7 +1204,8 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
 
     return res.json({
       success: true,
-      flowName,
+      flowName: versions.label,
+      flowApiName: versions.developerName,
       versionA: older.version,
       versionB: newer.version,
       flowUrl,
