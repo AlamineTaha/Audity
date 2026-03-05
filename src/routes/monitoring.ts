@@ -1122,8 +1122,12 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
  * @swagger
  * /api/v1/compare-flow-versions:
  *   post:
- *     summary: Compare two Flow versions
- *     description: Fetches metadata for two Flow versions and returns an AI-generated diff. Accepts either the Flow label or API name. If versions are omitted, compares the latest two. Does NOT create an AuditDelta_Event__c record.
+ *     summary: Compare or analyze Flow versions
+ *     description: |
+ *       Three modes:
+ *       1. flowName + versionA + versionB — compare two specific versions
+ *       2. flowName only — compare the latest two versions
+ *       3. flowName + analyze=true — analyze the latest version (no comparison)
  *     tags:
  *       - Monitoring
  *     parameters:
@@ -1132,22 +1136,29 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
  *         required: true
  *         schema:
  *           type: string
- *         description: Flow label or API name (DeveloperName)
+ *         description: Flow label or API name
  *       - name: versionA
  *         in: query
  *         required: false
  *         schema:
  *           type: integer
- *         description: First version number (optional — defaults to latest - 1)
+ *         description: First version number (optional)
  *       - name: versionB
  *         in: query
  *         required: false
  *         schema:
  *           type: integer
- *         description: Second version number (optional — defaults to latest)
+ *         description: Second version number (optional)
+ *       - name: analyze
+ *         in: query
+ *         required: false
+ *         schema:
+ *           type: boolean
+ *           default: false
+ *         description: If true, analyze the latest version only (no comparison)
  *     responses:
  *       200:
- *         description: Comparison result
+ *         description: Analysis or comparison result
  *       400:
  *         description: Missing or invalid parameters
  *       500:
@@ -1156,6 +1167,7 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
 router.post('/compare-flow-versions', async (req: Request, res: Response) => {
   try {
     const flowName = String(req.query.flowName ?? req.body.flowName ?? '').trim();
+    const analyzeOnly = String(req.query.analyze ?? req.body.analyze ?? '') === 'true';
     const rawA = req.query.versionA ?? req.body.versionA;
     const rawB = req.query.versionB ?? req.body.versionB;
     const versionA = rawA ? parseInt(String(rawA), 10) : undefined;
@@ -1163,15 +1175,6 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
 
     if (!flowName) {
       return res.status(400).json({ success: false, error: 'flowName is required (label or API name)' });
-    }
-    if (versionA !== undefined && (isNaN(versionA) || versionA < 1)) {
-      return res.status(400).json({ success: false, error: 'versionA must be a positive integer' });
-    }
-    if (versionB !== undefined && (isNaN(versionB) || versionB < 1)) {
-      return res.status(400).json({ success: false, error: 'versionB must be a positive integer' });
-    }
-    if (versionA !== undefined && versionB !== undefined && versionA === versionB) {
-      return res.status(400).json({ success: false, error: 'versionA and versionB must be different' });
     }
 
     const authService = new SalesforceAuthService();
@@ -1188,22 +1191,57 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'Could not load org settings' });
     }
 
+    if (analyzeOnly) {
+      const latest = await salesforceService.getLatestFlowVersion(orgId, flowName);
+      const analysis = await aiService.analyzeFlowVersion(
+        latest.metadata, latest.developerName, latest.version, settings
+      );
+      const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${latest.definitionId}`;
+
+      const displayText = `Flow: ${latest.label} (v${latest.version})\n\n${analysis}\n\nOpen in Flow Builder: ${flowUrl}`;
+
+      return res.json({
+        success: true,
+        mode: 'analyze',
+        flowName: latest.label,
+        flowApiName: latest.developerName,
+        version: latest.version,
+        flowUrl,
+        analysis,
+        displayText,
+      });
+    }
+
+    if (versionA !== undefined && (isNaN(versionA) || versionA < 1)) {
+      return res.status(400).json({ success: false, error: 'versionA must be a positive integer' });
+    }
+    if (versionB !== undefined && (isNaN(versionB) || versionB < 1)) {
+      return res.status(400).json({ success: false, error: 'versionB must be a positive integer' });
+    }
+    if (versionA !== undefined && versionB !== undefined && versionA === versionB) {
+      return res.status(400).json({ success: false, error: 'versionA and versionB must be different' });
+    }
+
     const versions = await salesforceService.getFlowVersionsByNumber(orgId, flowName, versionA, versionB);
 
     const older = versions.versionA.version < versions.versionB.version ? versions.versionA : versions.versionB;
     const newer = versions.versionA.version < versions.versionB.version ? versions.versionB : versions.versionA;
 
     const diff = await aiService.generateSummary(
-      older.metadata,
-      newer.metadata,
-      versions.developerName,
-      settings
+      older.metadata, newer.metadata, versions.developerName, settings
     );
 
     const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${versions.definitionId}`;
 
+    const changes = diff.changes || [];
+    const findings = diff.securityFindings || [];
+    const changesList = changes.length > 0 ? '\n' + changes.map(c => `- ${c}`).join('\n') : '';
+    const secList = findings.length > 0 ? '\nSecurity: ' + findings.join(', ') : '';
+    const displayText = `Flow: ${versions.label} (v${older.version} vs v${newer.version})\n\n${diff.summary}${changesList}${secList}\n\nOpen in Flow Builder: ${flowUrl}`;
+
     return res.json({
       success: true,
+      mode: 'compare',
       flowName: versions.label,
       flowApiName: versions.developerName,
       versionA: older.version,
@@ -1212,6 +1250,7 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
       analysis: diff.summary,
       changes: diff.changes,
       securityFindings: diff.securityFindings,
+      displayText,
     });
   } catch (error) {
     console.error('Error in compare-flow-versions endpoint:', error);
