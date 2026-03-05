@@ -2591,28 +2591,37 @@ export class SalesforceService {
    * Get two specific flow versions by version number for comparison.
    */
   /**
-   * Look up a FlowDefinition by label or API name.
-   * Tries DeveloperName first, then MasterLabel.
+   * Look up a FlowDefinition by label (from Flow entity) or DeveloperName.
+   * Tries MasterLabel on Flow first, then DeveloperName on FlowDefinition.
    */
   async resolveFlowDefinition(orgId: string, flowNameOrLabel: string): Promise<{ definitionId: string; developerName: string; label: string }> {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
     const escaped = flowNameOrLabel.replace(/'/g, "''");
 
-    const byDev = await tooling.query<any>(
-      `SELECT Id, DeveloperName, MasterLabel FROM FlowDefinition WHERE DeveloperName = '${escaped}' LIMIT 1`
-    );
-    if (byDev.records?.length) {
-      const r = byDev.records[0];
-      return { definitionId: r.Id, developerName: r.DeveloperName, label: r.MasterLabel || r.DeveloperName };
-    }
-
     const byLabel = await tooling.query<any>(
-      `SELECT Id, DeveloperName, MasterLabel FROM FlowDefinition WHERE MasterLabel = '${escaped}' LIMIT 1`
+      `SELECT DefinitionId, Definition.DeveloperName, MasterLabel FROM Flow WHERE MasterLabel = '${escaped}' ORDER BY VersionNumber DESC LIMIT 1`
     );
     if (byLabel.records?.length) {
       const r = byLabel.records[0];
-      return { definitionId: r.Id, developerName: r.DeveloperName, label: r.MasterLabel || r.DeveloperName };
+      return {
+        definitionId: r.DefinitionId,
+        developerName: r.Definition?.DeveloperName || flowNameOrLabel,
+        label: r.MasterLabel || flowNameOrLabel,
+      };
+    }
+
+    const byDev = await tooling.query<any>(
+      `SELECT Id, DeveloperName FROM FlowDefinition WHERE DeveloperName = '${escaped}' LIMIT 1`
+    );
+    if (byDev.records?.length) {
+      const defId = byDev.records[0].Id;
+      const devName = byDev.records[0].DeveloperName;
+      const labelQuery = await tooling.query<any>(
+        `SELECT MasterLabel FROM Flow WHERE DefinitionId = '${defId.replace(/'/g, "''")}' ORDER BY VersionNumber DESC LIMIT 1`
+      );
+      const label = labelQuery.records?.[0]?.MasterLabel || devName;
+      return { definitionId: defId, developerName: devName, label };
     }
 
     throw new Error(`Flow '${flowNameOrLabel}' not found. Try using the exact Flow label or API name.`);
@@ -2686,6 +2695,41 @@ export class SalesforceService {
       console.error(`Error fetching flow versions for ${flowNameOrLabel}:`, error);
       throw error;
     }
+  }
+
+  /**
+   * Get the latest flow version's metadata for single-version analysis.
+   */
+  async getLatestFlowVersion(orgId: string, flowNameOrLabel: string): Promise<{
+    version: number;
+    metadata: unknown;
+    definitionId: string;
+    developerName: string;
+    label: string;
+  }> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    const flowDef = await this.resolveFlowDefinition(orgId, flowNameOrLabel);
+    const escapedDefId = flowDef.definitionId.replace(/'/g, "''");
+
+    const result = await tooling.query<any>(`
+      SELECT Id, VersionNumber, Metadata
+      FROM Flow
+      WHERE DefinitionId = '${escapedDefId}'
+      ORDER BY VersionNumber DESC
+      LIMIT 1
+    `);
+
+    if (!result.records?.length) throw new Error(`No versions found for flow '${flowNameOrLabel}'`);
+
+    return {
+      version: result.records[0].VersionNumber,
+      metadata: result.records[0].Metadata ?? result.records[0],
+      definitionId: flowDef.definitionId,
+      developerName: flowDef.developerName,
+      label: flowDef.label,
+    };
   }
 
   /**

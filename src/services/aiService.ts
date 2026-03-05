@@ -577,13 +577,13 @@ Format your response in clear sections. Use Slack markdown formatting (*bold* fo
   ): string {
     let parentFlowContext = '';
     if (parentFlows && parentFlows.length > 0) {
-      const parentList = parentFlows.map(p => `- **${p.flowApiName}**${p.label ? ` (${p.label})` : ''}`).join('\n');
-      parentFlowContext = `\n\n**⚠️ IMPORTANT CONTEXT:** This Flow is used as a SUBFLOW by the following parent Flow(s):\n${parentList}\n\n**Risk Assessment:** Changes to this subflow will affect all parent flows listed above. Consider the impact on parent flows when assessing risk level.`;
+      const parentList = parentFlows.map(p => `- ${p.flowApiName}${p.label ? ` (${p.label})` : ''}`).join('\n');
+      parentFlowContext = `\n\nIMPORTANT: This Flow is used as a subflow by:\n${parentList}\nChanges here affect all parent flows above.`;
     }
 
-    return `You are the "AuditDelta Guardian," an expert Salesforce Technical Architect and Security Auditor. Analyze changes between two Flow versions for a Slack notification.
+    return `You are an expert Salesforce Technical Architect. Compare two Flow versions and explain what changed.
 
-Flow Name: *${flowName}*${parentFlowContext}
+Flow: ${flowName}${parentFlowContext}
 
 OLD VERSION:
 ${JSON.stringify(oldJson, null, 2)}
@@ -592,23 +592,62 @@ NEW VERSION:
 ${JSON.stringify(newJson, null, 2)}
 
 Rules:
-- Do NOT use any emoji, HTML entities, or special Unicode characters.
-- Use Slack markdown only: *bold*, _italic_, \`code\` for element names.
-- Be concise. Under 250 words total.
+- Plain text only. No markdown, no stars, no backticks, no quotes, no emoji, no HTML.
+- Be concise. Under 200 words.
 - Flag: hardcoded IDs, DML inside loops, missing fault paths.
 
 Format your response EXACTLY as:
 
-*Summary:* [One sentence — the business reason for this change]
+Summary: [One sentence — the business reason for this change]
 
-*Changes:*
-- [change 1 — element name in \`code\`, what was added/modified/deleted]
+Changes:
+- [change 1 — element name, what was added/modified/deleted]
 - [change 2]
 
-*Security & Performance:*
-- [CRITICAL] or [MEDIUM] or [LOW]: [description]. Or "No issues detected."
+Security:
+- [CRITICAL or MEDIUM or LOW]: [description]. Or "No issues detected."
 
-*Impact:* [One sentence — who/what is affected]`;
+Impact: [One sentence — who or what is affected]`;
+  }
+
+  /**
+   * Analyze a single flow version (no comparison).
+   */
+  async analyzeFlowVersion(
+    metadata: unknown,
+    flowName: string,
+    version: number,
+    settings: OrgSettings
+  ): Promise<string> {
+    const sanitized = this.sanitizeJson(metadata);
+
+    const prompt = `You are an expert Salesforce Technical Architect. Analyze this Flow and explain what it does.
+
+Flow: ${flowName} (Version ${version})
+
+FLOW METADATA:
+${JSON.stringify(sanitized, null, 2)}
+
+Rules:
+- Plain text only. No markdown, no stars, no backticks, no quotes, no emoji, no HTML.
+- Be concise. Under 200 words.
+- Flag: hardcoded IDs, DML inside loops, missing fault paths.
+
+Format your response EXACTLY as:
+
+Purpose: [One sentence — what this flow does and when it runs]
+
+How it works:
+- [step 1 — element name, what it does]
+- [step 2]
+- [step 3]
+
+Security:
+- [CRITICAL or MEDIUM or LOW]: [description]. Or "No issues detected."
+
+Impact: [One sentence — which users, objects, or processes are affected]`;
+
+    return await this.callLLM(prompt, settings, 'analyzeFlowVersion');
   }
 
   /**
