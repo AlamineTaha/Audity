@@ -1181,11 +1181,10 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
 
-    const orgIds = await authService.getAllOrgIds();
-    if (orgIds.length === 0) {
-      return res.status(400).json({ success: false, error: 'No authenticated Salesforce orgs found' });
+    const orgId = await authService.getFirstValidOrgId();
+    if (!orgId) {
+      return res.status(400).json({ success: false, error: 'No authenticated Salesforce orgs found (all expired or removed)' });
     }
-    const orgId = orgIds[0];
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
       return res.status(400).json({ success: false, error: 'Could not load org settings' });
@@ -1202,12 +1201,6 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
 
       return res.json({
         success: true,
-        mode: 'analyze',
-        flowName: latest.label,
-        flowApiName: latest.developerName,
-        version: latest.version,
-        flowUrl,
-        analysis,
         displayText,
       });
     }
@@ -1241,15 +1234,6 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
 
     return res.json({
       success: true,
-      mode: 'compare',
-      flowName: versions.label,
-      flowApiName: versions.developerName,
-      versionA: older.version,
-      versionB: newer.version,
-      flowUrl,
-      analysis: diff.summary,
-      changes: diff.changes,
-      securityFindings: diff.securityFindings,
       displayText,
     });
   } catch (error) {

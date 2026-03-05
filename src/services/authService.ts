@@ -381,8 +381,34 @@ export class SalesforceAuthService {
   async getAllOrgIds(): Promise<string[]> {
     await this.connect();
     const keys = await this.redisClient.keys('org:*');
-    // Extract org IDs from keys (format: "org:00D000000000000AAA")
     return keys.map(key => key.replace('org:', ''));
+  }
+
+  /**
+   * Remove an org's settings from Redis (for cleaning up stale orgs).
+   */
+  async removeOrg(orgId: string): Promise<void> {
+    await this.connect();
+    await this.redisClient.del(`org:${orgId}`);
+    console.log(`[Auth] Removed stale org ${orgId} from Redis`);
+  }
+
+  /**
+   * Returns the first org whose token can be refreshed successfully.
+   * Removes stale orgs that fail refresh from Redis.
+   */
+  async getFirstValidOrgId(): Promise<string | null> {
+    const orgIds = await this.getAllOrgIds();
+    for (const orgId of orgIds) {
+      try {
+        await this.refreshSession(orgId);
+        return orgId;
+      } catch (err) {
+        console.warn(`[Auth] Org ${orgId} refresh failed, removing stale entry:`, (err as Error).message);
+        await this.removeOrg(orgId);
+      }
+    }
+    return null;
   }
 
 
