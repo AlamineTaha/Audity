@@ -2,6 +2,8 @@
  * Type definitions for AuditDelta application
  */
 
+import { Request } from 'express';
+
 /**
  * Organization settings including authentication and billing configuration
  */
@@ -11,7 +13,25 @@ export interface OrgSettings {
   refreshToken: string;
   instanceUrl: string;
   billingMode: 'PERSONAL' | 'ENTERPRISE';
-  gcpProjectId?: string; // Required when billingMode === 'ENTERPRISE'
+  gcpProjectId?: string;
+}
+
+/**
+ * Tenant context resolved by the tenantAuth middleware.
+ * Attached to every authenticated request as `req.tenant`.
+ */
+export interface TenantContext {
+  orgId: string;
+  instanceUrl: string;
+  billingMode: 'PERSONAL' | 'ENTERPRISE';
+  gcpProjectId?: string;
+}
+
+/**
+ * Express Request augmented with tenant context.
+ */
+export interface AuthenticatedRequest extends Request {
+  tenant: TenantContext;
 }
 
 /**

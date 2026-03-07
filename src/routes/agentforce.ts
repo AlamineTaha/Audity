@@ -1,13 +1,16 @@
 /**
  * Agentforce Integration Routes
- * REST API endpoints for Salesforce Einstein Agent to query Flow changes
+ * REST API endpoints for Salesforce Einstein Agent to query Flow changes.
+ *
+ * All protected routes receive tenant context via the tenantAuth middleware.
+ * The orgId is resolved from the X-API-Key header — never from request body/query.
  */
 
 import { Router, Request, Response } from 'express';
 import { SalesforceService } from '../services/salesforceService';
 import { AIService } from '../services/aiService';
 import { SalesforceAuthService } from '../services/authService';
-import { AnalyzeFlowRequest, AnalyzeFlowResponse } from '../types';
+import { AuthenticatedRequest, AnalyzeFlowResponse } from '../types';
 
 const router = Router();
 
@@ -19,6 +22,8 @@ const router = Router();
  *     description: Fetches current and previous Flow versions, uses AI to analyze differences, and returns a summary
  *     tags:
  *       - Agentforce
+ *     security:
+ *       - ApiKeyAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -27,63 +32,18 @@ const router = Router();
  *             type: object
  *             required:
  *               - flowName
- *               - orgId
  *             properties:
  *               flowName:
  *                 type: string
  *                 description: The API name of the Flow to analyze
  *                 example: "My_Flow"
- *               orgId:
- *                 type: string
- *                 description: The Salesforce Organization ID
- *                 example: "00D000000000000AAA"
  *     responses:
  *       200:
  *         description: Successful analysis
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 flowName:
- *                   type: string
- *                   example: "My_Flow"
- *                 summary:
- *                   type: string
- *                   example: "The Flow was updated to include a new decision element..."
- *                 changes:
- *                   type: array
- *                   items:
- *                     type: string
- *                   example: ["Added new decision element", "Modified field update logic"]
- *                 revertOptions:
- *                   type: object
- *                   description: Safe-revert options for Flow version management
- *                   properties:
- *                     summary:
- *                       type: string
- *                       description: Summary of changes detected
- *                       example: "5 change(s) detected today."
- *                     versionsToday:
- *                       type: array
- *                       description: List of version numbers modified today
- *                       items:
- *                         type: integer
- *                       example: [39, 38, 37, 36, 35]
- *                     recommendedStableVersion:
- *                       type: integer
- *                       nullable: true
- *                       description: Recommended stable version number before today's changes
- *                       example: 34
- *                     revertPrompt:
- *                       type: string
- *                       description: Prompt message for revert action
- *                       example: "Would you like to activate Version 34 (Last Stable), a specific version, or keep the current changes?"
  *       400:
  *         description: Bad request - missing required fields
+ *       401:
+ *         description: Missing or invalid API key
  *       404:
  *         description: Flow not found
  *       500:
@@ -91,31 +51,29 @@ const router = Router();
  */
 router.post('/analyze-flow', async (req: Request, res: Response) => {
   try {
-    const { flowName, orgId }: AnalyzeFlowRequest = req.body;
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
+    const { flowName } = req.body;
 
-    // Validate input
-    if (!flowName || !orgId) {
+    if (!flowName) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowName and orgId are required',
+        error: 'Missing required field: flowName',
       } as AnalyzeFlowResponse);
     }
 
-    // Initialize services
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
 
-    // Get org settings for billing mode
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
       return res.status(404).json({
         success: false,
-        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first by visiting /auth/authorize?billingMode=PERSONAL`,
+        error: `Organization settings not found for this tenant. Please re-authenticate at /auth/authorize`,
       } as AnalyzeFlowResponse);
     }
 
-    // Fetch Flow versions
     let versions;
     try {
       versions = await salesforceService.getFlowVersions(orgId, flowName);
@@ -131,7 +89,6 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       throw error;
     }
 
-    // Generate AI summary
     const diff = await aiService.generateSummary(
       versions.previous,
       versions.current,
@@ -139,30 +96,24 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       settings
     );
 
-    // Get versions modified today for revert options
     const versionsToday = await salesforceService.getFlowVersionsInTimeWindow(orgId, flowName, 24);
     const versionNumbersToday = versionsToday.map(v => v.versionNumber);
     const recommendedStableVersion = await salesforceService.findLastStableVersion(orgId, flowName, 24);
 
-    // Build revert prompt
     let revertPrompt = '';
     if (versionNumbersToday.length > 0) {
-      if (recommendedStableVersion) {
-        revertPrompt = `Would you like to activate Version ${recommendedStableVersion} (Last Stable), a specific version, or keep the current changes?`;
-      } else {
-        revertPrompt = `Would you like to activate a specific version or keep the current changes?`;
-      }
+      revertPrompt = recommendedStableVersion
+        ? `Would you like to activate Version ${recommendedStableVersion} (Last Stable), a specific version, or keep the current changes?`
+        : `Would you like to activate a specific version or keep the current changes?`;
     } else {
       revertPrompt = 'No changes detected today. No revert action needed.';
     }
 
-    // Get dependency report
     let dependencies;
     try {
       dependencies = await salesforceService.getFlowDependencyReport(orgId, flowName);
     } catch (error) {
       console.error(`Error fetching dependency report for ${flowName}:`, error);
-      // Don't fail the entire request if dependency check fails
       dependencies = {
         reportedDependencies: [],
         uiDependencies: { buttons: [], quickActions: [] },
@@ -175,14 +126,12 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       };
     }
 
-    // Get revert impact analysis (merged with analyze-flow)
     let revertImpact;
     if (recommendedStableVersion) {
       try {
         revertImpact = await salesforceService.checkRevertImpact(orgId, flowName, recommendedStableVersion);
       } catch (error) {
         console.error(`Error checking revert impact for ${flowName}:`, error);
-        // Don't fail the entire request if impact check fails
         revertImpact = {
           warnings: ['Could not analyze revert impact. Please verify manually before reverting.'],
           activeSessions: 0,
@@ -190,23 +139,17 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
         };
       }
     } else {
-      revertImpact = {
-        warnings: [],
-        activeSessions: 0,
-        canRevert: true,
-      };
+      revertImpact = { warnings: [], activeSessions: 0, canRevert: true };
     }
 
-    // Extract risk analysis from Flow metadata (PII/God Mode detection)
     let riskAnalysis;
     try {
       const flowMetadata = await salesforceService.getFlowMetadata(orgId, flowName);
       if (flowMetadata) {
-        // Check for PII fields and high-risk operations
         const metadataStr = JSON.stringify(flowMetadata).toLowerCase();
         const hasPII = /(ssn|social|credit|card|password|pin|salary|wage|compensation)/i.test(metadataStr);
         const hasModifyAll = /modifyall|viewall/i.test(metadataStr);
-        
+
         if (hasModifyAll) {
           riskAnalysis = {
             riskLevel: 'CRITICAL' as const,
@@ -232,7 +175,6 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       };
     }
 
-    // Return response with merged analysis
     const response: AnalyzeFlowResponse = {
       success: true,
       flowName: diff.flowName,
@@ -265,23 +207,12 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
  * /api/v1/health:
  *   get:
  *     summary: Health check endpoint
- *     description: Returns the health status of the API
+ *     description: Returns the health status of the API (no auth required)
  *     tags:
  *       - Agentforce
  *     responses:
  *       200:
  *         description: Service is healthy
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 status:
- *                   type: string
- *                   example: "ok"
- *                 timestamp:
- *                   type: string
- *                   example: "2024-01-01T00:00:00.000Z"
  */
 router.get('/health', (_req: Request, res: Response) => {
   res.json({
@@ -295,26 +226,12 @@ router.get('/health', (_req: Request, res: Response) => {
  * /api/v1/test-oauth-config:
  *   get:
  *     summary: Test OAuth configuration
- *     description: |
- *       Validates that OAuth environment variables are configured correctly.
- *       This endpoint does not require an authenticated org.
+ *     description: Validates that OAuth environment variables are configured correctly. No auth required.
  *     tags:
  *       - Agentforce
  *     responses:
  *       200:
  *         description: OAuth configuration test results
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 config:
- *                   type: object
- *                   description: Masked configuration values
- *                 message:
- *                   type: string
  */
 router.get('/test-oauth-config', (_req: Request, res: Response) => {
   const config = {
@@ -322,22 +239,23 @@ router.get('/test-oauth-config', (_req: Request, res: Response) => {
     SF_CLIENT_SECRET: process.env.SF_CLIENT_SECRET ? '***SET***' : 'NOT SET',
     SF_REDIRECT_URI: process.env.SF_REDIRECT_URI || 'NOT SET',
     SF_LOGIN_URL: process.env.SF_LOGIN_URL || 'NOT SET',
+    DATABASE_URL: process.env.DATABASE_URL ? '***SET***' : 'NOT SET',
     REDIS_HOST: process.env.REDIS_HOST || 'NOT SET',
-    REDIS_PORT: process.env.REDIS_PORT || 'NOT SET',
   };
 
-  const isValid = 
+  const isValid =
     process.env.SF_CLIENT_ID &&
     process.env.SF_CLIENT_SECRET &&
     process.env.SF_REDIRECT_URI &&
-    process.env.SF_LOGIN_URL;
+    process.env.SF_LOGIN_URL &&
+    process.env.DATABASE_URL;
 
   res.json({
     success: !!isValid,
     config,
-    message: isValid 
-      ? 'OAuth configuration appears valid' 
-      : 'Some OAuth configuration is missing',
+    message: isValid
+      ? 'OAuth and database configuration appears valid'
+      : 'Some configuration is missing',
   });
 });
 
@@ -346,60 +264,23 @@ router.get('/test-oauth-config', (_req: Request, res: Response) => {
  * /api/v1/test-connection:
  *   post:
  *     summary: Test Salesforce org connection
- *     description: |
- *       Tests the connection to a Salesforce org, validates OAuth tokens,
- *       and returns detailed error information for debugging.
+ *     description: Tests the connection to the tenant's Salesforce org, validates OAuth tokens, and returns detailed error information.
  *     tags:
  *       - Agentforce
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - orgId
- *             properties:
- *               orgId:
- *                 type: string
- *                 description: The Salesforce Organization ID to test
- *                 example: "00D000000000000AAA"
+ *     security:
+ *       - ApiKeyAuth: []
  *     responses:
  *       200:
  *         description: Connection test results
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 orgId:
- *                   type: string
- *                 tests:
- *                   type: object
- *                   properties:
- *                     orgSettingsFound:
- *                       type: boolean
- *                     tokenRefresh:
- *                       type: boolean
- *                     apiQuery:
- *                       type: boolean
- *                 userInfo:
- *                   type: object
- *                 errors:
- *                   type: array
- *                   items:
- *                     type: object
- *       400:
- *         description: Bad request - missing orgId
- *       404:
- *         description: Org not found
+ *       401:
+ *         description: Missing or invalid API key
  *       500:
  *         description: Internal server error
  */
 router.post('/test-connection', async (req: Request, res: Response) => {
-  const { orgId } = req.body;
+  const { tenant } = req as AuthenticatedRequest;
+  const orgId = tenant.orgId;
+
   const testResults = {
     success: false,
     orgId,
@@ -413,17 +294,9 @@ router.post('/test-connection', async (req: Request, res: Response) => {
   };
 
   try {
-    if (!orgId) {
-      return res.status(400).json({
-        success: false,
-        error: 'orgId is required',
-      });
-    }
-
     const authService = new SalesforceAuthService();
     await authService.connect();
 
-    // Test 1: Check if org settings exist
     try {
       const settings = await authService.getOrgSettings(orgId);
       if (!settings) {
@@ -434,48 +307,26 @@ router.post('/test-connection', async (req: Request, res: Response) => {
         return res.status(404).json(testResults);
       }
       testResults.tests.orgSettingsFound = true;
-      console.log(`[TEST] Org settings found for ${orgId}`);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      testResults.errors.push({
-        step: 'orgSettingsFound',
-        error: errorMsg,
-        details: error,
-      });
-      console.error(`[TEST] Error fetching org settings:`, error);
+      testResults.errors.push({ step: 'orgSettingsFound', error: errorMsg });
     }
 
-    // Test 2: Test token refresh
     try {
       await authService.refreshSession(orgId);
       testResults.tests.tokenRefresh = true;
-      console.log(`[TEST] Token refresh successful for ${orgId}`);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      testResults.errors.push({
-        step: 'tokenRefresh',
-        error: `Token refresh failed: ${errorMsg}`,
-        details: error instanceof Error ? {
-          name: error.name,
-          message: error.message,
-          stack: error.stack,
-        } : error,
-      });
-      console.error(`[TEST] Token refresh error:`, error);
+      testResults.errors.push({ step: 'tokenRefresh', error: `Token refresh failed: ${errorMsg}` });
     }
 
-    // Test 3: Test API query (get user info)
     try {
       const conn = await authService.getConnection(orgId);
       const userId = conn.userInfo?.id;
-      
-      if (!userId) {
-        throw new Error('User ID not available in connection');
-      }
+      if (!userId) throw new Error('User ID not available in connection');
 
       const userInfo = await conn.query(`SELECT Id, Name, Email, Username FROM User WHERE Id = '${userId}' LIMIT 1`);
-      
-      if (userInfo && userInfo.records && userInfo.records.length > 0) {
+      if (userInfo?.records?.length) {
         testResults.tests.apiQuery = true;
         testResults.userInfo = {
           id: conn.userInfo?.id,
@@ -483,44 +334,23 @@ router.post('/test-connection', async (req: Request, res: Response) => {
           url: conn.userInfo?.url,
           user: userInfo.records[0],
         };
-        console.log(`[TEST] API query successful for ${orgId}`);
       } else {
         throw new Error('No user info returned from query');
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      testResults.errors.push({
-        step: 'apiQuery',
-        error: `API query failed: ${errorMsg}`,
-        details: error instanceof Error ? {
-          name: error.name,
-          message: error.message,
-          stack: error.stack,
-        } : error,
-      });
-      console.error(`[TEST] API query error:`, error);
+      testResults.errors.push({ step: 'apiQuery', error: `API query failed: ${errorMsg}` });
     }
 
-    // Determine overall success
-    testResults.success = testResults.tests.orgSettingsFound && 
-                          testResults.tests.tokenRefresh && 
-                          testResults.tests.apiQuery;
+    testResults.success =
+      testResults.tests.orgSettingsFound &&
+      testResults.tests.tokenRefresh &&
+      testResults.tests.apiQuery;
 
-    const statusCode = testResults.success ? 200 : 500;
-    return res.status(statusCode).json(testResults);
-
+    return res.status(testResults.success ? 200 : 500).json(testResults);
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-    testResults.errors.push({
-      step: 'general',
-      error: errorMsg,
-      details: error instanceof Error ? {
-        name: error.name,
-        message: error.message,
-        stack: error.stack,
-      } : error,
-    });
-    console.error(`[TEST] General error:`, error);
+    testResults.errors.push({ step: 'general', error: errorMsg });
     return res.status(500).json(testResults);
   }
 });
@@ -530,50 +360,9 @@ router.post('/test-connection', async (req: Request, res: Response) => {
  * /api/v1/test-gemini:
  *   post:
  *     summary: Test Gemini API call
- *     description: |
- *       Tests the Gemini API call directly with different configurations.
- *       Useful for debugging API version and model name issues.
+ *     description: Tests the Gemini API directly with different configurations. No org auth required.
  *     tags:
  *       - Agentforce
- *     requestBody:
- *       required: false
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               prompt:
- *                 type: string
- *                 description: Test prompt to send to Gemini
- *                 example: "Say hello"
- *               apiVersion:
- *                 type: string
- *                 description: API version to test (v1 or v1beta)
- *                 example: "v1"
- *               model:
- *                 type: string
- *                 description: Model name to test
- *                 example: "gemini-1.5-flash"
- *     responses:
- *       200:
- *         description: Gemini API test results
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                 url:
- *                   type: string
- *                 model:
- *                   type: string
- *                 apiVersion:
- *                   type: string
- *                 response:
- *                   type: string
- *                 error:
- *                   type: string
  */
 router.post('/test-gemini', async (req: Request, res: Response) => {
   const { prompt = 'Say hello in one sentence', apiVersion = 'v1', model } = req.body;
@@ -581,13 +370,9 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
   const geminiApiKey = process.env.GEMINI_API_KEY || '';
 
   if (!geminiApiKey) {
-    return res.status(400).json({
-      success: false,
-      error: 'GEMINI_API_KEY is not configured',
-    });
+    return res.status(400).json({ success: false, error: 'GEMINI_API_KEY is not configured' });
   }
 
-  // Test different configurations
   const testConfigs = [
     { apiVersion: 'v1', model: testModel },
     { apiVersion: 'v1beta', model: testModel },
@@ -597,7 +382,6 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
     { apiVersion: 'v1beta', model: 'gemini-1.5-pro' },
   ];
 
-  // If specific config provided, test only that
   if (apiVersion && model) {
     testConfigs.length = 0;
     testConfigs.push({ apiVersion, model });
@@ -607,56 +391,25 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
 
   for (const config of testConfigs) {
     const url = `https://generativelanguage.googleapis.com/${config.apiVersion}/models/${config.model}:generateContent?key=${geminiApiKey}`;
-    
     try {
       const axios = require('axios');
       const response = await axios.post(
         url,
-        {
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          timeout: 30000,
-        }
+        { contents: [{ parts: [{ text: prompt }] }] },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
       );
-
       const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      
-      results.push({
-        success: true,
-        url,
-        apiVersion: config.apiVersion,
-        model: config.model,
-        response: text || 'No text in response',
-        fullResponse: response.data,
-      });
-      
-      // If one succeeds, return immediately
+      results.push({ success: true, url, apiVersion: config.apiVersion, model: config.model, response: text || 'No text', fullResponse: response.data });
       if (text) {
         return res.json({
           success: true,
-          workingConfig: {
-            apiVersion: config.apiVersion,
-            model: config.model,
-          },
+          workingConfig: { apiVersion: config.apiVersion, model: config.model },
           url,
           response: text,
           allResults: results,
         });
       }
     } catch (error: any) {
-      const errorData = error.response?.data || error.message;
       results.push({
         success: false,
         url,
@@ -664,17 +417,12 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
         model: config.model,
         error: error.response?.status || 'Unknown',
         errorMessage: error.message,
-        errorData,
+        errorData: error.response?.data || error.message,
       });
     }
   }
 
-  // If we get here, all configs failed
-  return res.status(500).json({
-    success: false,
-    message: 'All Gemini API configurations failed',
-    allResults: results,
-  });
+  return res.status(500).json({ success: false, message: 'All Gemini API configurations failed', allResults: results });
 });
 
 /**
@@ -682,12 +430,10 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
  * /api/v1/flows/check-revert-impact:
  *   post:
  *     summary: Check revert impact before activating a Flow version
- *     description: |
- *       Analyzes the impact of reverting to a specific Flow version by comparing
- *       the active version with the target version. Identifies potential issues
- *       like deleted fields/objects or active sessions.
  *     tags:
  *       - Flows
+ *     security:
+ *       - ApiKeyAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -696,74 +442,29 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
  *             type: object
  *             required:
  *               - flowApiName
- *               - orgId
  *               - targetVersionNumber
  *             properties:
  *               flowApiName:
  *                 type: string
- *                 description: The API name of the Flow
- *                 example: "My_Flow"
- *               orgId:
- *                 type: string
- *                 description: Salesforce Organization ID
- *                 example: "00D000000000000AAA"
  *               targetVersionNumber:
  *                 type: integer
- *                 description: Target version number to check impact for
- *                 example: 34
- *     responses:
- *       200:
- *         description: Impact assessment result
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 warnings:
- *                   type: array
- *                   items:
- *                     type: string
- *                   description: List of warnings about potential issues
- *                   example: ["Warning: Reverting to Version 34 may fail if it references fields that have since been deleted or modified."]
- *                 activeSessions:
- *                   type: integer
- *                   description: Number of active flow interviews (mock value)
- *                   example: 5
- *                 canRevert:
- *                   type: boolean
- *                   description: Whether it's safe to revert based on warnings
- *                   example: true
- *       400:
- *         description: Bad request - missing required fields
- *       404:
- *         description: Flow or version not found
- *       500:
- *         description: Internal server error
  */
 router.post('/flows/check-revert-impact', async (req: Request, res: Response) => {
   try {
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
     const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
-    const orgId = req.query.orgId ?? req.body.orgId;
     const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
 
-    if (!flowApiName || !orgId || targetVersionNumber === undefined) {
+    if (!flowApiName || targetVersionNumber === undefined) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowApiName, orgId, and targetVersionNumber are required',
+        error: 'Missing required fields: flowApiName and targetVersionNumber are required',
       });
     }
 
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
-
-    // Get org settings
-    const settings = await authService.getOrgSettings(orgId);
-    if (!settings) {
-      return res.status(404).json({
-        success: false,
-        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
-      });
-    }
 
     const impact = await salesforceService.checkRevertImpact(orgId, flowApiName, targetVersionNumber);
 
@@ -772,25 +473,17 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
       warnings: impact.warnings,
       activeSessions: impact.activeSessions,
       canRevert: impact.canRevert,
-      note: impact.activeSessions > 0 
+      note: impact.activeSessions > 0
         ? `Note: Reverting will affect approximately ${impact.activeSessions} active flow interviews currently in progress.`
         : undefined,
     });
   } catch (error) {
     console.error('Error in check-revert-impact endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    
     if (errorMessage.includes('not found')) {
-      return res.status(404).json({
-        success: false,
-        error: errorMessage,
-      });
+      return res.status(404).json({ success: false, error: errorMessage });
     }
-    
-    return res.status(500).json({
-      success: false,
-      error: errorMessage,
-    });
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
@@ -799,14 +492,10 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
  * /api/v1/flows/activate-version:
  *   post:
  *     summary: Activate a specific Flow version (Safe-Revert)
- *     description: |
- *       Activates a specific Flow version by changing its status to 'Active'
- *       and setting the current active version to 'Obsolete'. This does NOT delete anything.
- *       
- *       **Important:** Active/Paused Flow Interviews will continue to run on the old version
- *       until they are completed or deleted manually in Salesforce.
  *     tags:
  *       - Flows
+ *     security:
+ *       - ApiKeyAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -815,77 +504,29 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
  *             type: object
  *             required:
  *               - flowApiName
- *               - orgId
  *               - targetVersionNumber
  *             properties:
  *               flowApiName:
  *                 type: string
- *                 description: The API name of the Flow
- *                 example: "My_Flow"
- *               orgId:
- *                 type: string
- *                 description: Salesforce Organization ID
- *                 example: "00D000000000000AAA"
  *               targetVersionNumber:
  *                 type: integer
- *                 description: Target version number to activate
- *                 example: 34
- *     responses:
- *       200:
- *         description: Version activation successful
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 message:
- *                   type: string
- *                   example: "Successfully activated Version 34. Previous active version 39 set to Obsolete."
- *                 previousActiveVersion:
- *                   type: integer
- *                   example: 39
- *                 newActiveVersion:
- *                   type: integer
- *                   example: 34
- *                 warnings:
- *                   type: array
- *                   items:
- *                     type: string
- *                   example: ["Active/Paused Flow Interviews will continue to run on the old version until they are completed or deleted manually in Salesforce."]
- *       400:
- *         description: Bad request - missing required fields
- *       404:
- *         description: Flow or version not found
- *       500:
- *         description: Internal server error
  */
 router.post('/flows/activate-version', async (req: Request, res: Response) => {
   try {
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
     const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
-    const orgId = req.query.orgId ?? req.body.orgId;
     const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
 
-    if (!flowApiName || !orgId || targetVersionNumber === undefined) {
+    if (!flowApiName || targetVersionNumber === undefined) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowApiName, orgId, and targetVersionNumber are required',
+        error: 'Missing required fields: flowApiName and targetVersionNumber are required',
       });
     }
 
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
-
-    // Get org settings
-    const settings = await authService.getOrgSettings(orgId);
-    if (!settings) {
-      return res.status(404).json({
-        success: false,
-        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
-      });
-    }
 
     const result = await salesforceService.activateSpecificVersion(orgId, flowApiName, targetVersionNumber);
 
@@ -899,18 +540,10 @@ router.post('/flows/activate-version', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error in activate-version endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    
     if (errorMessage.includes('not found')) {
-      return res.status(404).json({
-        success: false,
-        error: errorMessage,
-      });
+      return res.status(404).json({ success: false, error: errorMessage });
     }
-    
-    return res.status(500).json({
-      success: false,
-      error: errorMessage,
-    });
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
@@ -919,14 +552,10 @@ router.post('/flows/activate-version', async (req: Request, res: Response) => {
  * /api/v1/flows/revert-today:
  *   post:
  *     summary: Batch revert all changes made today
- *     description: |
- *       Reverts all changes made today by activating the last stable version
- *       (the last version modified before the specified time window).
- *       
- *       **Important:** Active/Paused Flow Interviews will continue to run on the old version
- *       until they are completed or deleted manually in Salesforce.
  *     tags:
  *       - Flows
+ *     security:
+ *       - ApiKeyAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -935,73 +564,28 @@ router.post('/flows/activate-version', async (req: Request, res: Response) => {
  *             type: object
  *             required:
  *               - flowApiName
- *               - orgId
  *             properties:
  *               flowApiName:
  *                 type: string
- *                 description: The API name of the Flow
- *                 example: "My_Flow"
- *               orgId:
- *                 type: string
- *                 description: Salesforce Organization ID
- *                 example: "00D000000000000AAA"
  *               hours:
  *                 type: integer
- *                 description: Number of hours to look back (default: 24 for "today")
- *                 example: 24
- *     responses:
- *       200:
- *         description: Batch revert successful
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 message:
- *                   type: string
- *                   example: "Batch revert completed: Activated Version 34 (Last Stable). Successfully activated Version 34..."
- *                 stableVersion:
- *                   type: integer
- *                   example: 34
- *                 previousActiveVersion:
- *                   type: integer
- *                   example: 39
- *                 warnings:
- *                   type: array
- *                   items:
- *                     type: string
- *       400:
- *         description: Bad request - missing required fields
- *       404:
- *         description: Flow or stable version not found
- *       500:
- *         description: Internal server error
+ *                 default: 24
  */
 router.post('/flows/revert-today', async (req: Request, res: Response) => {
   try {
-    const { flowApiName, orgId, hours = 24 } = req.body;
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
+    const { flowApiName, hours = 24 } = req.body;
 
-    if (!flowApiName || !orgId) {
+    if (!flowApiName) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowApiName and orgId are required',
+        error: 'Missing required field: flowApiName',
       });
     }
 
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
-
-    // Get org settings
-    const settings = await authService.getOrgSettings(orgId);
-    if (!settings) {
-      return res.status(404).json({
-        success: false,
-        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
-      });
-    }
 
     const result = await salesforceService.batchRevertTodayChanges(orgId, flowApiName, hours);
 
@@ -1015,18 +599,10 @@ router.post('/flows/revert-today', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error in revert-today endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    
     if (errorMessage.includes('not found')) {
-      return res.status(404).json({
-        success: false,
-        error: errorMessage,
-      });
+      return res.status(404).json({ success: false, error: errorMessage });
     }
-    
-    return res.status(500).json({
-      success: false,
-      error: errorMessage,
-    });
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
@@ -1035,101 +611,41 @@ router.post('/flows/revert-today', async (req: Request, res: Response) => {
  * /api/v1/flows/versions:
  *   get:
  *     summary: Get Flow version history within a time window
- *     description: |
- *       Retrieves a list of all Flow versions modified within a specific timeframe.
- *       Useful for understanding recent changes and identifying which version to revert to.
  *     tags:
  *       - Flows
+ *     security:
+ *       - ApiKeyAuth: []
  *     parameters:
  *       - in: query
  *         name: flowApiName
  *         required: true
  *         schema:
  *           type: string
- *         description: The API name of the Flow
- *         example: "My_Flow"
- *       - in: query
- *         name: orgId
- *         required: true
- *         schema:
- *           type: string
- *         description: Salesforce Organization ID
- *         example: "00D000000000000AAA"
  *       - in: query
  *         name: hours
- *         required: false
  *         schema:
  *           type: integer
  *           default: 24
- *         description: Number of hours to look back (default: 24 for "today")
- *         example: 24
- *     responses:
- *       200:
- *         description: List of versions modified within the time window
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 flowApiName:
- *                   type: string
- *                   example: "My_Flow"
- *                 versions:
- *                   type: array
- *                   items:
- *                     type: object
- *                     properties:
- *                       versionNumber:
- *                         type: integer
- *                         example: 39
- *                       modifiedBy:
- *                         type: string
- *                         example: "John Doe"
- *                       timestamp:
- *                         type: string
- *                         example: "2024-01-15T10:30:00.000Z"
- *                       status:
- *                         type: string
- *                         example: "Active"
- *                       versionId:
- *                         type: string
- *                         example: "301..."
- *       400:
- *         description: Bad request - missing required query parameters
- *       404:
- *         description: Flow not found
- *       500:
- *         description: Internal server error
  */
 router.get('/flows/versions', async (req: Request, res: Response) => {
   try {
-    const { flowApiName, orgId, hours } = req.query;
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
+    const { flowApiName, hours } = req.query;
 
-    if (!flowApiName || !orgId) {
+    if (!flowApiName) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required query parameters: flowApiName and orgId are required',
+        error: 'Missing required query parameter: flowApiName',
       });
     }
 
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
 
-    // Get org settings
-    const settings = await authService.getOrgSettings(orgId as string);
-    if (!settings) {
-      return res.status(404).json({
-        success: false,
-        error: `Organization settings not found for orgId: ${orgId}. Please authenticate the organization first.`,
-      });
-    }
-
     const hoursNum = hours ? parseInt(hours as string, 10) : 24;
     const versions = await salesforceService.getFlowVersionsInTimeWindow(
-      orgId as string,
+      orgId,
       flowApiName as string,
       hoursNum
     );
@@ -1143,20 +659,11 @@ router.get('/flows/versions', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error in versions endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    
     if (errorMessage.includes('not found')) {
-      return res.status(404).json({
-        success: false,
-        error: errorMessage,
-      });
+      return res.status(404).json({ success: false, error: errorMessage });
     }
-    
-    return res.status(500).json({
-      success: false,
-      error: errorMessage,
-    });
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
 export default router;
-
