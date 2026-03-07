@@ -2384,6 +2384,52 @@ export class SalesforceService {
   }
 
   /**
+   * Get all validation rules for an object with full audit fields.
+   * Used by analyze-validation-rules endpoint for AI analysis.
+   */
+  async getValidationRulesForObjectAudit(
+    orgId: string,
+    objectApiName: string
+  ): Promise<Array<{
+    id: string;
+    validationName: string;
+    active: boolean;
+    description: string | null;
+    errorMessage: string | null;
+    objectApiName: string;
+  }>> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      const sanitized = objectApiName.replace(/'/g, "''");
+      const soql = `
+        SELECT Id, ValidationName, Active, Description, ErrorMessage, EntityDefinition.DeveloperName
+        FROM ValidationRule
+        WHERE EntityDefinition.DeveloperName = '${sanitized}'
+           OR EntityDefinition.QualifiedApiName = '${sanitized}'
+      `;
+
+      const result = await tooling.query<any>(soql);
+      if (!result.records || result.records.length === 0) {
+        return [];
+      }
+
+      return result.records.map((r: any) => ({
+        id: r.Id,
+        validationName: r.ValidationName || 'Unknown',
+        active: r.Active === true || r.Active === 'true',
+        description: r.Description || null,
+        errorMessage: r.ErrorMessage || null,
+        objectApiName: r.EntityDefinition?.DeveloperName || objectApiName,
+      }));
+    } catch (error) {
+      console.error(`Error fetching validation rules for object ${objectApiName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * Get all validation rules on a specific object.
    * Returns rule names and active status (no Metadata to avoid LIMIT 1 restriction).
    */

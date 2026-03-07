@@ -205,6 +205,92 @@ Format your response EXACTLY as:
   }
 
   /**
+   * Analyze all validation rules for an object: health summary, grouping by functional area,
+   * and suggestions for vague error messages.
+   */
+  async analyzeValidationRulesForObject(
+    objectApiName: string,
+    rules: Array<{
+      id: string;
+      validationName: string;
+      active: boolean;
+      description: string | null;
+      errorMessage: string | null;
+      objectApiName: string;
+    }>,
+    settings: OrgSettings
+  ): Promise<{
+    summary: string;
+    categories: Array<{ name: string; rules: Array<{ validationName: string; active: boolean; errorMessage: string | null }> }>;
+    vagueErrorSuggestions: Array<{ ruleName: string; currentMessage: string; suggestedMessage: string }>;
+  }> {
+    const rulesJson = JSON.stringify(
+      rules.map(r => ({
+        validationName: r.validationName,
+        active: r.active,
+        description: r.description,
+        errorMessage: r.errorMessage,
+      })),
+      null,
+      2
+    );
+
+    const prompt = `You are a Salesforce Technical Architect performing a Validation Rule audit.
+
+Object: ${objectApiName}
+Validation Rules (${rules.length} total, ${rules.filter(r => r.active).length} active):
+
+${rulesJson}
+
+Analyze and respond with a valid JSON object only. No markdown, no code fences, no extra text.
+
+Required structure:
+{
+  "summary": "2-4 sentences summarizing the overall Validation Health of this object. Include: total/active count, any concerns (e.g. too many rules, redundancy), and overall assessment.",
+  "categories": [
+    {
+      "name": "Functional area name (e.g. Address Validation, Revenue Requirements, Data Quality)",
+      "rules": [
+        { "validationName": "rule API name", "active": true/false, "errorMessage": "current message or null" }
+      ]
+    }
+  ],
+  "vagueErrorSuggestions": [
+    {
+      "ruleName": "rule API name",
+      "currentMessage": "the vague or unhelpful current message",
+      "suggestedMessage": "a clearer, user-friendly replacement"
+    }
+  ]
+}
+
+Rules:
+- Group rules by inferred functional area based on name, description, and error message.
+- Include ALL rules in categories (each rule in exactly one category).
+- For vagueErrorSuggestions: flag rules with generic messages like "Error", "Invalid", "Please fix", empty messages, or messages that don't explain what to fix. Suggest specific, actionable messages.
+- If no vague messages, return empty array for vagueErrorSuggestions.`;
+
+    try {
+      const raw = await this.callLLM(prompt, settings, 'analyzeValidationRulesForObject');
+      const cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const parsed = JSON.parse(cleaned) as {
+        summary?: string;
+        categories?: Array<{ name: string; rules: Array<{ validationName: string; active: boolean; errorMessage: string | null }> }>;
+        vagueErrorSuggestions?: Array<{ ruleName: string; currentMessage: string; suggestedMessage: string }>;
+      };
+
+      return {
+        summary: parsed.summary || 'No summary generated.',
+        categories: parsed.categories || [],
+        vagueErrorSuggestions: parsed.vagueErrorSuggestions || [],
+      };
+    } catch (error) {
+      console.error('Error analyzing validation rules:', error);
+      throw new Error(`Failed to analyze validation rules: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
    * Analyze a batch of permission changes from the same user.
    * All permission types (PermSetAssign, PermSetEnableUserPerm, PermSetEntityPermChanged, etc.)
    * are sent in one call. Output follows the same concise format as Flow summaries.

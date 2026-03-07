@@ -1120,6 +1120,147 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
 
 /**
  * @swagger
+ * /api/v1/analyze-validation-rules:
+ *   post:
+ *     summary: Object Validation Audit
+ *     description: |
+ *       Retrieves all validation rules for a Salesforce object and uses AI to analyze them.
+ *       Returns a Validation Health summary, rules grouped by functional area, and suggestions
+ *       for rules with vague error messages. Org is identified via x-sfdc-org-id header.
+ *     tags:
+ *       - Monitoring
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - objectApiName
+ *             properties:
+ *               objectApiName:
+ *                 type: string
+ *                 description: Object API name (e.g. Account, Opportunity, CustomObject__c)
+ *                 example: "Account"
+ *     responses:
+ *       200:
+ *         description: Validation rules analysis
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 count:
+ *                   type: integer
+ *                   description: Total number of validation rules
+ *                 activeCount:
+ *                   type: integer
+ *                   description: Number of active rules
+ *                 summary:
+ *                   type: string
+ *                   description: AI-generated Validation Health summary
+ *                 categories:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       name:
+ *                         type: string
+ *                       rules:
+ *                         type: array
+ *                         items:
+ *                           type: object
+ *                           properties:
+ *                             validationName:
+ *                               type: string
+ *                             active:
+ *                               type: boolean
+ *                             errorMessage:
+ *                               type: string
+ *                 vagueErrorSuggestions:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       ruleName:
+ *                         type: string
+ *                       currentMessage:
+ *                         type: string
+ *                       suggestedMessage:
+ *                         type: string
+ *       400:
+ *         description: Missing objectApiName
+ *       404:
+ *         description: Object not found or no rules
+ *       500:
+ *         description: Server error
+ */
+router.post('/analyze-validation-rules', async (req: Request, res: Response) => {
+  try {
+    const objectApiName = String(req.query.objectApiName ?? req.body.objectApiName ?? '').trim();
+    const orgId: string = res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
+
+    if (!objectApiName) {
+      return res.status(400).json({
+        success: false,
+        error: 'objectApiName is required',
+      });
+    }
+
+    if (!orgId) {
+      return res.status(400).json({
+        success: false,
+        error: 'orgId is required (send via x-sfdc-org-id header)',
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+    const aiService = new AIService();
+
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({
+        success: false,
+        error: `Organization ${orgId} not found or not configured`,
+      });
+    }
+
+    const rules = await salesforceService.getValidationRulesForObjectAudit(orgId, objectApiName);
+
+    if (rules.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: `No validation rules found for object ${objectApiName}`,
+      });
+    }
+
+    const analysis = await aiService.analyzeValidationRulesForObject(objectApiName, rules, settings);
+
+    const activeCount = rules.filter(r => r.active).length;
+
+    return res.json({
+      success: true,
+      count: rules.length,
+      activeCount,
+      summary: analysis.summary,
+      categories: analysis.categories,
+      vagueErrorSuggestions: analysis.vagueErrorSuggestions,
+    });
+  } catch (error) {
+    console.error('Error in analyze-validation-rules endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    return res.status(500).json({
+      success: false,
+      error: errorMessage,
+    });
+  }
+});
+
+/**
+ * @swagger
  * /api/v1/compare-flow-versions:
  *   post:
  *     summary: Compare or analyze Flow versions
