@@ -125,7 +125,7 @@ router.post('/slack-invite', async (req: Request, res: Response) => {
  */
 router.post('/slack-thread-callback', async (req: Request, res: Response) => {
   try {
-    const orgId = req.query.orgId ?? req.body.orgId;
+    const orgId: string = res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
     const flowDeveloperName = req.query.flowDeveloperName ?? req.body.flowDeveloperName;
     const threadTs = req.query.threadTs ?? req.body.threadTs;
     if (!orgId || !flowDeveloperName || !threadTs) {
@@ -362,14 +362,15 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
   console.log(`[Recent Changes] Endpoint called - Query params:`, req.query);
   
   try {
-    const { orgId, hours } = req.query;
+    const { hours } = req.query;
+    const orgId: string = res.locals.orgId ?? req.query.orgId;
 
     console.log(`[Recent Changes] Processing request - orgId: ${orgId}, hours: ${hours}`);
 
     if (!orgId || typeof orgId !== 'string') {
-      console.warn(`[Recent Changes] Missing or invalid orgId parameter`);
+      console.warn(`[Recent Changes] Missing or invalid orgId`);
       return res.status(400).json({
-        error: 'orgId query parameter is required',
+        error: 'orgId is required (send via x-sfdc-org-id header)',
       });
     }
 
@@ -686,7 +687,7 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
   try {
     const userId = req.query.userId ?? req.body?.userId;
     const permissionName = req.query.permissionName ?? req.body?.permissionName;
-    const orgId = req.query.orgId ?? req.body?.orgId;
+    const orgId: string = res.locals.orgId ?? req.query.orgId ?? req.body?.orgId;
 
     if (!userId) {
       return res.status(400).json({
@@ -696,7 +697,7 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
 
     if (!orgId) {
       return res.status(400).json({
-        error: 'orgId is required',
+        error: 'orgId is required (send via x-sfdc-org-id header)',
       });
     }
 
@@ -1005,7 +1006,7 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
  */
 router.post('/explain-metadata', async (req: Request, res: Response) => {
   try {
-    const orgId = req.query.orgId ?? req.body.orgId;
+    const orgId: string = res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
     const name = req.query.name ?? req.body.name;
     const type = req.query.type ?? req.body.type;
     const objectName = req.query.objectName ?? req.body.objectName;
@@ -1014,7 +1015,7 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
     if (!orgId || !name || !type) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required parameters: orgId, name, and type are required',
+        error: 'Missing required parameters: name and type are required (orgId via x-sfdc-org-id header)',
       });
     }
 
@@ -1181,13 +1182,14 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
 
-    const orgId = await authService.getFirstValidOrgId();
+    // Prefer header-injected orgId; fall back to first valid org for backwards compatibility
+    const orgId: string = res.locals.orgId || (await authService.getFirstValidOrgId()) || '';
     if (!orgId) {
-      return res.status(400).json({ success: false, error: 'No authenticated Salesforce orgs found (all expired or removed)' });
+      return res.status(400).json({ success: false, error: 'No authenticated Salesforce org found. Send x-sfdc-org-id header.' });
     }
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
-      return res.status(400).json({ success: false, error: 'Could not load org settings' });
+      return res.status(400).json({ success: false, error: 'Could not load org settings for the provided org' });
     }
 
     if (analyzeOnly) {

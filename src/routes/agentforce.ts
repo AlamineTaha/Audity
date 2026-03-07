@@ -91,13 +91,14 @@ const router = Router();
  */
 router.post('/analyze-flow', async (req: Request, res: Response) => {
   try {
-    const { flowName, orgId }: AnalyzeFlowRequest = req.body;
+    const { flowName }: Omit<AnalyzeFlowRequest, 'orgId'> = req.body;
+    const orgId: string = res.locals.orgId ?? req.body.orgId;
 
     // Validate input
     if (!flowName || !orgId) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowName and orgId are required',
+        error: 'Missing required fields: flowName is required; orgId must be sent via x-sfdc-org-id header',
       } as AnalyzeFlowResponse);
     }
 
@@ -399,7 +400,7 @@ router.get('/test-oauth-config', (_req: Request, res: Response) => {
  *         description: Internal server error
  */
 router.post('/test-connection', async (req: Request, res: Response) => {
-  const { orgId } = req.body;
+  const orgId: string = res.locals.orgId ?? req.body.orgId;
   const testResults = {
     success: false,
     orgId,
@@ -416,7 +417,7 @@ router.post('/test-connection', async (req: Request, res: Response) => {
     if (!orgId) {
       return res.status(400).json({
         success: false,
-        error: 'orgId is required',
+        error: 'orgId is required (send via x-sfdc-org-id header)',
       });
     }
 
@@ -743,13 +744,13 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
 router.post('/flows/check-revert-impact', async (req: Request, res: Response) => {
   try {
     const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
-    const orgId = req.query.orgId ?? req.body.orgId;
+    const orgId: string = res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
     const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
 
     if (!flowApiName || !orgId || targetVersionNumber === undefined) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowApiName, orgId, and targetVersionNumber are required',
+        error: 'Missing required fields: flowApiName and targetVersionNumber are required (orgId via x-sfdc-org-id header)',
       });
     }
 
@@ -865,13 +866,13 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
 router.post('/flows/activate-version', async (req: Request, res: Response) => {
   try {
     const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
-    const orgId = req.query.orgId ?? req.body.orgId;
+    const orgId: string = res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
     const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
 
     if (!flowApiName || !orgId || targetVersionNumber === undefined) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowApiName, orgId, and targetVersionNumber are required',
+        error: 'Missing required fields: flowApiName and targetVersionNumber are required (orgId via x-sfdc-org-id header)',
       });
     }
 
@@ -982,12 +983,13 @@ router.post('/flows/activate-version', async (req: Request, res: Response) => {
  */
 router.post('/flows/revert-today', async (req: Request, res: Response) => {
   try {
-    const { flowApiName, orgId, hours = 24 } = req.body;
+    const { flowApiName, hours = 24 } = req.body;
+    const orgId: string = res.locals.orgId ?? req.body.orgId;
 
     if (!flowApiName || !orgId) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: flowApiName and orgId are required',
+        error: 'Missing required fields: flowApiName is required (orgId via x-sfdc-org-id header)',
       });
     }
 
@@ -1106,12 +1108,13 @@ router.post('/flows/revert-today', async (req: Request, res: Response) => {
  */
 router.get('/flows/versions', async (req: Request, res: Response) => {
   try {
-    const { flowApiName, orgId, hours } = req.query;
+    const { flowApiName, hours } = req.query;
+    const orgId: string = res.locals.orgId ?? (req.query.orgId as string);
 
     if (!flowApiName || !orgId) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required query parameters: flowApiName and orgId are required',
+        error: 'Missing required parameters: flowApiName is required (orgId via x-sfdc-org-id header)',
       });
     }
 
@@ -1119,7 +1122,7 @@ router.get('/flows/versions', async (req: Request, res: Response) => {
     const salesforceService = new SalesforceService(authService);
 
     // Get org settings
-    const settings = await authService.getOrgSettings(orgId as string);
+    const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
       return res.status(404).json({
         success: false,
@@ -1129,7 +1132,7 @@ router.get('/flows/versions', async (req: Request, res: Response) => {
 
     const hoursNum = hours ? parseInt(hours as string, 10) : 24;
     const versions = await salesforceService.getFlowVersionsInTimeWindow(
-      orgId as string,
+      orgId,
       flowApiName as string,
       hoursNum
     );

@@ -14,6 +14,7 @@ import swaggerUi from 'swagger-ui-express';
 import agentforceRoutes from './routes/agentforce';
 import authRoutes from './routes/auth';
 import monitoringRoutes from './routes/monitoring';
+import { orgAuth } from './middleware/orgAuth';
 
 const app: Express = express();
 
@@ -419,8 +420,26 @@ const swaggerOptions: swaggerJsdoc.Options = {
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
 
 // Routes
-app.use('/api/v1', agentforceRoutes);
-app.use('/api/v1', monitoringRoutes);
+// Paths that don't require the x-sfdc-org-id header (health checks, OAuth, internal scheduler calls)
+const UNPROTECTED_API_PATHS = new Set([
+  '/health',
+  '/test-oauth-config',
+  '/trigger-check',
+  '/clear-audit-cache',
+  '/slack-invite',        // called by Salesforce Flow internally after authentication
+  '/slack-thread-callback',
+]);
+
+const conditionalOrgAuth = (req: express.Request, res: express.Response, next: express.NextFunction): void => {
+  if (UNPROTECTED_API_PATHS.has(req.path)) {
+    next();
+  } else {
+    orgAuth(req, res, next);
+  }
+};
+
+app.use('/api/v1', conditionalOrgAuth, agentforceRoutes);
+app.use('/api/v1', conditionalOrgAuth, monitoringRoutes);
 app.use('/auth', authRoutes);
 
 // Swagger UI

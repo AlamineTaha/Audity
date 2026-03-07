@@ -2,6 +2,15 @@
  * Type definitions for AuditDelta application
  */
 
+// Extend Express res.locals so TypeScript knows about orgId injected by orgAuth middleware
+declare global {
+  namespace Express {
+    interface Locals {
+      orgId: string;
+    }
+  }
+}
+
 /**
  * Organization settings including authentication and billing configuration
  */
