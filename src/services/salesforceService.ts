@@ -842,7 +842,7 @@ export class SalesforceService {
    */
   async getFlowVersionsInTimeWindow(
     orgId: string,
-    flowApiName: string,
+    flowNameOrLabel: string,
     hours: number = 24
   ): Promise<Array<{
     versionNumber: number;
@@ -851,19 +851,18 @@ export class SalesforceService {
     status: string;
     versionId: string;
   }>> {
+    let definitionId: string;
+    try {
+      const flowDef = await this.resolveFlowDefinition(orgId, flowNameOrLabel);
+      definitionId = flowDef.definitionId;
+    } catch {
+      return [];
+    }
+
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
-    // Step 1: Find the Container ID
-    const defQuery = `SELECT Id, DeveloperName FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
-    const defResult = await tooling.query<any>(defQuery);
-    
-    if (!defResult.records || defResult.records.length === 0) {
-      return [];
-    }
-    const definitionId = defResult.records[0].Id;
-
-    // Step 2: Calculate cutoff time
+    // Calculate cutoff time
     const cutoffTime = new Date();
     cutoffTime.setHours(cutoffTime.getHours() - hours);
     const cutoffTimeStr = cutoffTime.toISOString();
@@ -894,31 +893,32 @@ export class SalesforceService {
 
   /**
    * Corrected getFlowMetadata
-   * 1. Gets the Container ID (FlowDefinition)
+   * 1. Gets the Container ID (FlowDefinition) via label or API name
    * 2. Gets the Version list (Flow)
-   * 
+   *
    * @param orgId Salesforce Organization ID
-   * @param flowApiName Flow API name
+   * @param flowNameOrLabel Flow label (MasterLabel) or API name (DeveloperName)
    * @param includeTimeWindow If true, also returns versions modified today
    */
   async getFlowMetadata(
     orgId: string,
-    flowApiName: string,
+    flowNameOrLabel: string,
     includeTimeWindow?: boolean
   ): Promise<FlowMetadata | null> {
-    const conn = await this.authService.getConnection(orgId);
-    const tooling = conn.tooling;
-  
-    // Step 1: Find the Container ID using the API Name
-    const defQuery = `SELECT Id, DeveloperName FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
-    const defResult = await tooling.query<any>(defQuery);
-    
-    if (!defResult.records || defResult.records.length === 0) {
+    let definitionId: string;
+    let developerName: string;
+    try {
+      const flowDef = await this.resolveFlowDefinition(orgId, flowNameOrLabel);
+      definitionId = flowDef.definitionId;
+      developerName = flowDef.developerName;
+    } catch {
       return null;
     }
-    const definitionId = defResult.records[0].Id;
 
-    // Step 2: Get the latest versions belonging to this container
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    // Get the latest versions belonging to this container
     // We query the 'Flow' table, which represents specific versions
     const flowQuery = `
       SELECT Id, MasterLabel, VersionNumber, Status, DefinitionId
@@ -938,7 +938,7 @@ export class SalesforceService {
   
     const metadata: FlowMetadata = {
       Id: definitionId, // The Container ID
-      ApiName: flowApiName,
+      ApiName: developerName,
       Label: latestVersion.MasterLabel,
       VersionNumber: latestVersion.VersionNumber,
       Status: latestVersion.Status,
@@ -947,7 +947,7 @@ export class SalesforceService {
 
     // If requested, add time window versions
     if (includeTimeWindow) {
-      const versionsToday = await this.getFlowVersionsInTimeWindow(orgId, flowApiName, 24);
+      const versionsToday = await this.getFlowVersionsInTimeWindow(orgId, developerName, 24);
       (metadata as any).versionsToday = versionsToday;
     }
 
@@ -957,32 +957,26 @@ export class SalesforceService {
   /**
    * Check revert impact by comparing Active version with Target version
    * Identifies potential issues like deleted fields/objects or active sessions
-   * 
+   *
    * @param orgId Salesforce Organization ID
-   * @param flowApiName Flow API name
+   * @param flowNameOrLabel Flow label (MasterLabel) or API name (DeveloperName)
    * @param targetVersionNumber Target version number to revert to
    * @returns Impact assessment with warnings
    */
   async checkRevertImpact(
     orgId: string,
-    flowApiName: string,
+    flowNameOrLabel: string,
     targetVersionNumber: number
   ): Promise<{
     warnings: string[];
     activeSessions: number;
     canRevert: boolean;
   }> {
+    const flowDef = await this.resolveFlowDefinition(orgId, flowNameOrLabel);
+    const definitionId = flowDef.definitionId;
+
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
-
-    // Step 1: Get Flow Definition ID
-    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
-    const defResult = await tooling.query<any>(defQuery);
-    
-    if (!defResult.records || defResult.records.length === 0) {
-      throw new Error(`Flow not found: ${flowApiName}`);
-    }
-    const definitionId = defResult.records[0].Id;
 
     // Step 2: Get Active version
     const activeVersionQuery = `
@@ -995,7 +989,7 @@ export class SalesforceService {
     const activeResult = await tooling.query<any>(activeVersionQuery);
     
     if (!activeResult.records || activeResult.records.length === 0) {
-      throw new Error(`No active version found for flow: ${flowApiName}`);
+      throw new Error(`No active version found for flow: ${flowNameOrLabel}`);
     }
     const activeVersion = activeResult.records[0];
     const activeMetadata = activeVersion.Metadata || {};
@@ -1011,7 +1005,7 @@ export class SalesforceService {
     const targetResult = await tooling.query<any>(targetVersionQuery);
     
     if (!targetResult.records || targetResult.records.length === 0) {
-      throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowApiName}`);
+      throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowNameOrLabel}`);
     }
     const targetMetadata = targetResult.records[0].Metadata || {};
 
@@ -1117,30 +1111,29 @@ export class SalesforceService {
   /**
    * Find the last stable version before a specific time window
    * Used for batch revert operations
-   * 
+   *
    * @param orgId Salesforce Organization ID
-   * @param flowApiName Flow API name
+   * @param flowNameOrLabel Flow label (MasterLabel) or API name (DeveloperName)
    * @param hours Number of hours to look back (default: 24 for "today")
    * @returns Version number of the last stable version before the time window, or null if not found
    */
   async findLastStableVersion(
     orgId: string,
-    flowApiName: string,
+    flowNameOrLabel: string,
     hours: number = 24
   ): Promise<number | null> {
+    let definitionId: string;
+    try {
+      const flowDef = await this.resolveFlowDefinition(orgId, flowNameOrLabel);
+      definitionId = flowDef.definitionId;
+    } catch {
+      return null;
+    }
+
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
-    // Step 1: Find the Container ID
-    const defQuery = `SELECT Id FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
-    const defResult = await tooling.query<any>(defQuery);
-    
-    if (!defResult.records || defResult.records.length === 0) {
-      return null;
-    }
-    const definitionId = defResult.records[0].Id;
-
-    // Step 2: Calculate cutoff time
+    // Calculate cutoff time
     const cutoffTime = new Date();
     cutoffTime.setHours(cutoffTime.getHours() - hours);
     const cutoffTimeStr = cutoffTime.toISOString();
@@ -1167,15 +1160,15 @@ export class SalesforceService {
   /**
    * Activate a specific Flow version (Safe-Revert)
    * This method ONLY changes status - it does NOT delete anything
-   * 
+   *
    * @param orgId Salesforce Organization ID
-   * @param flowApiName Flow API name
+   * @param flowNameOrLabel Flow label (MasterLabel) or API name (DeveloperName)
    * @param targetVersionNumber Target version number to activate
    * @returns Success status and details with rollback context warnings
    */
   async activateSpecificVersion(
     orgId: string,
-    flowApiName: string,
+    flowNameOrLabel: string,
     targetVersionNumber: number
   ): Promise<{
     success: boolean;
@@ -1184,20 +1177,20 @@ export class SalesforceService {
     newActiveVersion: number;
     warnings: string[];
   }> {
+    const flowDef = await this.resolveFlowDefinition(orgId, flowNameOrLabel);
+    const definitionId = flowDef.definitionId;
+
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
-    // Step 1: Get Flow Definition with ActiveVersionId
-    const defQuery = `SELECT Id, ActiveVersionId FROM FlowDefinition WHERE DeveloperName = '${flowApiName.replace(/'/g, "''")}'`;
+    const defQuery = `SELECT ActiveVersionId FROM FlowDefinition WHERE Id = '${definitionId.replace(/'/g, "''")}'`;
     const defResult = await tooling.query<any>(defQuery);
-    
-    if (!defResult.records || defResult.records.length === 0) {
-      throw new Error(`Flow not found: ${flowApiName}`);
+    if (!defResult.records?.length) {
+      throw new Error(`Flow not found: ${flowNameOrLabel}`);
     }
-    const definitionId = defResult.records[0].Id;
     const currentActiveVersionId = defResult.records[0].ActiveVersionId;
 
-    // Step 2: Find the CURRENT Active version to get its version number
+    // Find the CURRENT Active version to get its version number
     let currentActiveVersion: number;
     if (currentActiveVersionId) {
       const activeVersionQuery = `
@@ -1211,13 +1204,13 @@ export class SalesforceService {
       if (activeResult.records && activeResult.records.length > 0) {
         currentActiveVersion = activeResult.records[0].VersionNumber;
       } else {
-        throw new Error(`Current active version not found for flow: ${flowApiName}`);
+        throw new Error(`Current active version not found for flow: ${flowNameOrLabel}`);
       }
     } else {
-      throw new Error(`No active version found for flow: ${flowApiName}`);
+      throw new Error(`No active version found for flow: ${flowNameOrLabel}`);
     }
 
-    // Step 3: Verify the TARGET version exists
+    // Verify the TARGET version exists
     const targetVersionQuery = `
       SELECT Id, VersionNumber
       FROM Flow
@@ -1228,7 +1221,7 @@ export class SalesforceService {
     const targetResult = await tooling.query<any>(targetVersionQuery);
     
     if (!targetResult.records || targetResult.records.length === 0) {
-      throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowApiName}`);
+      throw new Error(`Target version ${targetVersionNumber} not found for flow: ${flowNameOrLabel}`);
     }
 
     // If target is already active, no action needed
@@ -1278,15 +1271,15 @@ export class SalesforceService {
 
   /**
    * Batch revert: Revert all changes made today by activating the last stable version
-   * 
+   *
    * @param orgId Salesforce Organization ID
-   * @param flowApiName Flow API name
+   * @param flowNameOrLabel Flow label (MasterLabel) or API name (DeveloperName)
    * @param hours Number of hours to look back (default: 24 for "today")
    * @returns Success status and details with warnings
    */
   async batchRevertTodayChanges(
     orgId: string,
-    flowApiName: string,
+    flowNameOrLabel: string,
     hours: number = 24
   ): Promise<{
     success: boolean;
@@ -1295,21 +1288,21 @@ export class SalesforceService {
     previousActiveVersion: number;
     warnings: string[];
   }> {
-    const stableVersion = await this.findLastStableVersion(orgId, flowApiName, hours);
+    const stableVersion = await this.findLastStableVersion(orgId, flowNameOrLabel, hours);
     
     if (!stableVersion) {
-      throw new Error(`No stable version found before the last ${hours} hours for flow: ${flowApiName}`);
+      throw new Error(`No stable version found before the last ${hours} hours for flow: ${flowNameOrLabel}`);
     }
 
     // Get current active version before revert
-    const flowMetadata = await this.getFlowMetadata(orgId, flowApiName);
+    const flowMetadata = await this.getFlowMetadata(orgId, flowNameOrLabel);
     if (!flowMetadata) {
-      throw new Error(`Flow not found: ${flowApiName}`);
+      throw new Error(`Flow not found: ${flowNameOrLabel}`);
     }
     const previousActiveVersion = flowMetadata.VersionNumber;
 
     // Activate the stable version
-    const result = await this.activateSpecificVersion(orgId, flowApiName, stableVersion);
+    const result = await this.activateSpecificVersion(orgId, flowNameOrLabel, stableVersion);
 
     return {
       success: result.success,
@@ -2386,6 +2379,52 @@ export class SalesforceService {
       };
     } catch (error) {
       console.error(`Error fetching validation rule metadata for ${validationRuleName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all validation rules for an object with full audit fields.
+   * Used by analyze-validation-rules endpoint for AI analysis.
+   */
+  async getValidationRulesForObjectAudit(
+    orgId: string,
+    objectApiName: string
+  ): Promise<Array<{
+    id: string;
+    validationName: string;
+    active: boolean;
+    description: string | null;
+    errorMessage: string | null;
+    objectApiName: string;
+  }>> {
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+
+    try {
+      const sanitized = objectApiName.replace(/'/g, "''");
+      const soql = `
+        SELECT Id, ValidationName, Active, Description, ErrorMessage, EntityDefinition.DeveloperName
+        FROM ValidationRule
+        WHERE EntityDefinition.DeveloperName = '${sanitized}'
+           OR EntityDefinition.QualifiedApiName = '${sanitized}'
+      `;
+
+      const result = await tooling.query<any>(soql);
+      if (!result.records || result.records.length === 0) {
+        return [];
+      }
+
+      return result.records.map((r: any) => ({
+        id: r.Id,
+        validationName: r.ValidationName || 'Unknown',
+        active: r.Active === true || r.Active === 'true',
+        description: r.Description || null,
+        errorMessage: r.ErrorMessage || null,
+        objectApiName: r.EntityDefinition?.DeveloperName || objectApiName,
+      }));
+    } catch (error) {
+      console.error(`Error fetching validation rules for object ${objectApiName}:`, error);
       throw error;
     }
   }
