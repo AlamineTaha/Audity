@@ -1,12 +1,17 @@
 /**
  * Salesforce Authentication Service
- * Handles OAuth 2.0 Web Server Flow and token management via Redis
+ *
+ * Handles OAuth 2.0 Web Server Flow, token management, and deduplication.
+ *
+ * Persistent storage: PostgreSQL via DatabaseService (tenants table).
+ * Cache / ephemeral data: Redis (PKCE, dedup keys, tenant-context cache).
  */
 
 import * as jsforce from 'jsforce';
 import { createClient, RedisClientType } from 'redis';
 import * as crypto from 'crypto';
 import { OrgSettings } from '../types';
+import { DatabaseService } from './databaseService';
 
 export class SalesforceAuthService {
   private redisClient: RedisClientType;
@@ -14,6 +19,7 @@ export class SalesforceAuthService {
   private clientSecret: string;
   private redirectUri: string;
   private loginUrl: string;
+  private db: DatabaseService | null = null;
 
   constructor() {
     this.clientId = process.env.SF_CLIENT_ID || '';
@@ -21,8 +27,6 @@ export class SalesforceAuthService {
     this.redirectUri = process.env.SF_REDIRECT_URI || '';
     this.loginUrl = process.env.SF_LOGIN_URL || 'https://login.salesforce.com';
 
-    // Initialize Redis client
-    // Prefer REDIS_URL (Heroku Redis uses rediss:// for TLS)
     const redisUrl = process.env.REDIS_URL;
     if (redisUrl) {
       this.redisClient = createClient({
@@ -46,59 +50,63 @@ export class SalesforceAuthService {
     this.redisClient.on('error', (err) => {
       if (err.message.includes('NOAUTH') || err.message.includes('Authentication required')) {
         console.error('Redis Authentication Error: Check REDIS_PASSWORD in .env file');
-        console.error('If Redis requires authentication, set REDIS_PASSWORD in your .env file');
       } else {
         console.error('Redis Client Error:', err);
       }
     });
   }
 
-  /**
-   * Connect to Redis
-   */
+  setDatabaseService(db: DatabaseService): void {
+    this.db = db;
+  }
+
+  // --------------- Redis lifecycle ---------------
+
   async connect(): Promise<void> {
     if (!this.redisClient.isOpen) {
       await this.redisClient.connect();
-      // When using REDIS_URL, auth is included in the URL. When using REDIS_HOST/PORT,
-      // authenticate explicitly if REDIS_PASSWORD is set.
       if (!process.env.REDIS_URL && process.env.REDIS_PASSWORD) {
         try {
           await this.redisClient.sendCommand(['AUTH', process.env.REDIS_PASSWORD]);
-        } catch (error) {
-          console.warn('Redis AUTH command failed (this may be normal if auth is handled automatically):', error);
+        } catch (_error) {
+          // Auth may be handled automatically
         }
       }
     }
   }
 
-  /**
-   * Disconnect from Redis
-   */
   async disconnect(): Promise<void> {
     if (this.redisClient.isOpen) {
       await this.redisClient.disconnect();
     }
   }
 
-  /**
-   * Generate PKCE code verifier and challenge
-   */
+  // --------------- Generic Redis cache helpers (used by middleware) ---------------
+
+  async getCachedValue(key: string): Promise<string | null> {
+    await this.connect();
+    return this.redisClient.get(key);
+  }
+
+  async setCachedValue(key: string, value: string, ttlSeconds: number): Promise<void> {
+    await this.connect();
+    await this.redisClient.setEx(key, ttlSeconds, value);
+  }
+
+  // --------------- PKCE ---------------
+
   private generatePKCE(): { codeVerifier: string; codeChallenge: string } {
-    // Generate code_verifier (43-128 characters, URL-safe)
     const codeVerifier = crypto.randomBytes(32).toString('base64url');
-    
-    // Generate code_challenge (SHA256 hash, base64url encoded)
     const codeChallenge = crypto
       .createHash('sha256')
       .update(codeVerifier)
       .digest('base64url');
-    
     return { codeVerifier, codeChallenge };
   }
 
   /**
-   * Generate OAuth authorization URL
-   * PKCE is disabled by default. Enable by setting USE_PKCE=true in environment variables.
+   * Generate OAuth authorization URL.
+   * PKCE is disabled by default. Enable with USE_PKCE=true.
    */
   async getAuthorizationUrl(state?: string): Promise<string> {
     const usePKCE = process.env.USE_PKCE === 'true';
@@ -110,24 +118,17 @@ export class SalesforceAuthService {
       loginUrl: this.loginUrl,
     });
 
-    // Get base authorization URL
     let baseUrl = oauth2.getAuthorizationUrl({
       scope: 'api id web refresh_token',
       state: state || '',
     });
 
-    // Only add PKCE if explicitly enabled
     if (usePKCE) {
       await this.connect();
-      
-      // Generate PKCE parameters
       const { codeVerifier, codeChallenge } = this.generatePKCE();
-      
-      // Store code_verifier in Redis with short TTL (10 minutes)
       const pkceKey = state ? `pkce:${state}` : `pkce:${Date.now()}`;
       await this.redisClient.setEx(pkceKey, 600, codeVerifier);
 
-      // Append PKCE parameters
       const url = new URL(baseUrl);
       url.searchParams.set('code_challenge', codeChallenge);
       url.searchParams.set('code_challenge_method', 'S256');
@@ -138,40 +139,31 @@ export class SalesforceAuthService {
   }
 
   /**
-   * Exchange authorization code for access token with PKCE
+   * Exchange authorization code for tokens.
+   * Returns OrgSettings AND persists the tenant into PostgreSQL.
+   * Caller receives the raw API key (only exposed once).
    */
   async authorize(
-    code: string, 
-    billingMode: 'PERSONAL' | 'ENTERPRISE' = 'PERSONAL', 
+    code: string,
+    billingMode: 'PERSONAL' | 'ENTERPRISE' = 'PERSONAL',
     gcpProjectId?: string,
     state?: string
-  ): Promise<OrgSettings> {
+  ): Promise<{ orgSettings: OrgSettings; apiKey: string }> {
     await this.connect();
 
-    // Retrieve code_verifier from Redis
+    // Retrieve PKCE verifier
     let codeVerifier: string | null = null;
-    
     if (state) {
       const pkceKey = `pkce:${state}`;
       codeVerifier = await this.redisClient.get(pkceKey);
-      
-      // Clean up after retrieval
-      if (codeVerifier) {
-        await this.redisClient.del(pkceKey);
-      }
+      if (codeVerifier) await this.redisClient.del(pkceKey);
     }
-    
-    // If not found by state, try to find any recent PKCE (fallback)
     if (!codeVerifier) {
       const keys = await this.redisClient.keys('pkce:*');
       if (keys.length > 0) {
-        // Get the most recent one (sort by timestamp if using timestamp keys)
         const recentKey = keys.sort().reverse()[0];
         codeVerifier = await this.redisClient.get(recentKey);
-        // Clean up
-        if (codeVerifier) {
-          await this.redisClient.del(recentKey);
-        }
+        if (codeVerifier) await this.redisClient.del(recentKey);
       }
     }
 
@@ -182,93 +174,74 @@ export class SalesforceAuthService {
       loginUrl: this.loginUrl,
     });
 
-    const conn = new jsforce.Connection({ 
-      oauth2,
-      version: '58.0' // Use API version 58.0 (latest stable, well above v44.0 requirement)
-    });
-    
-    // Authorize with code_verifier if available (PKCE flow)
+    const conn = new jsforce.Connection({ oauth2, version: '58.0' });
+
     let userInfo;
     if (codeVerifier) {
-      // Use manual token exchange with PKCE
-      // Use standard login URL for token endpoint (not custom domain)
-      const tokenLoginUrl = this.loginUrl.includes('login.salesforce.com') 
-        ? this.loginUrl 
+      const tokenLoginUrl = this.loginUrl.includes('login.salesforce.com')
+        ? this.loginUrl
         : 'https://login.salesforce.com';
       const tokenUrl = `${tokenLoginUrl}/services/oauth2/token`;
-      
-      // Try without client_secret first (for Public clients with PKCE)
+
       let tokenParams = new URLSearchParams({
         grant_type: 'authorization_code',
         client_id: this.clientId,
         redirect_uri: this.redirectUri,
-        code: code,
+        code,
         code_verifier: codeVerifier,
       });
 
       let response = await fetch(tokenUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: tokenParams.toString(),
       });
 
-      // If that fails, try with client_secret (for Confidential clients)
       if (!response.ok && (response.status === 400 || response.status === 401)) {
-        console.log('[PKCE] Retrying token exchange with client_secret...');
         tokenParams = new URLSearchParams({
           grant_type: 'authorization_code',
           client_id: this.clientId,
           client_secret: this.clientSecret,
           redirect_uri: this.redirectUri,
-          code: code,
+          code,
           code_verifier: codeVerifier,
         });
-
         response = await fetch(tokenUrl, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: tokenParams.toString(),
         });
       }
 
-      // If PKCE fails, we can't fall back because the code was issued with PKCE
       if (!response.ok) {
         const errorText = await response.text();
-        const errorDetails = `Token exchange failed: ${response.status} ${errorText}`;
-        console.error(`[PKCE] ${errorDetails}`);
-        
-        // Clean up PKCE verifier
-        if (state) {
-          await this.redisClient.del(`pkce:${state}`);
-        }
-        
-        throw new Error(`PKCE token exchange failed: ${errorDetails}. If PKCE is not required, set USE_PKCE=false in environment variables.`);
-      } else {
-        // PKCE succeeded
-        const tokenData = await response.json() as {
-          access_token: string;
-          refresh_token?: string;
-          instance_url: string;
-        };
-        conn.accessToken = tokenData.access_token;
-        conn.refreshToken = tokenData.refresh_token || '';
-        conn.instanceUrl = tokenData.instance_url;
-        
-        // Get user info using jsforce identity method
-        userInfo = await conn.identity();
+        if (state) await this.redisClient.del(`pkce:${state}`);
+        throw new Error(
+          `PKCE token exchange failed: ${response.status} ${errorText}. ` +
+          'If PKCE is not required, set USE_PKCE=false in environment variables.'
+        );
       }
+
+      const tokenData = await response.json() as {
+        access_token: string;
+        refresh_token?: string;
+        instance_url: string;
+      };
+      conn.accessToken = tokenData.access_token;
+      conn.refreshToken = tokenData.refresh_token || '';
+      conn.instanceUrl = tokenData.instance_url;
+      userInfo = await conn.identity();
     } else {
-      // No PKCE verifier, use standard OAuth flow
-      console.log('[OAuth] No PKCE verifier found, using standard OAuth flow');
       userInfo = await conn.authorize(code);
     }
 
+    const orgId =
+      (userInfo as any).organizationId ||
+      (userInfo as any).id?.split('/')[0] ||
+      '';
+
     const orgSettings: OrgSettings = {
-      orgId: (userInfo as any).organizationId || (userInfo as any).id?.split('/')[0] || '',
+      orgId,
       accessToken: conn.accessToken || '',
       refreshToken: conn.refreshToken || '',
       instanceUrl: conn.instanceUrl || '',
@@ -276,51 +249,82 @@ export class SalesforceAuthService {
       gcpProjectId,
     };
 
-    // Store in Redis
+    // Generate API key and persist tenant in PostgreSQL
+    const apiKey = DatabaseService.generateApiKey();
+    const apiKeyHash = DatabaseService.hashApiKey(apiKey);
+    const apiKeyPrefix = apiKey.substring(0, 12);
+
+    if (this.db) {
+      await this.db.upsertTenant({
+        orgId: orgSettings.orgId,
+        apiKeyHash,
+        apiKeyPrefix,
+        refreshToken: orgSettings.refreshToken,
+        accessToken: orgSettings.accessToken,
+        instanceUrl: orgSettings.instanceUrl,
+        billingMode: orgSettings.billingMode,
+        gcpProjectId: orgSettings.gcpProjectId,
+      });
+    }
+
+    // Also cache in Redis for fast reads (backward compat + polling)
     await this.saveOrgSettings(orgSettings);
 
-    return orgSettings;
+    return { orgSettings, apiKey };
   }
 
-  /**
-   * Save organization settings to Redis
-   */
+  // --------------- Org Settings (Redis cache layer) ---------------
+
   async saveOrgSettings(settings: OrgSettings): Promise<void> {
     await this.connect();
     const key = `org:${settings.orgId}`;
-    await this.redisClient.setEx(key, 3600 * 24 * 7, JSON.stringify(settings)); // 7 days TTL
+    await this.redisClient.setEx(key, 3600 * 24 * 7, JSON.stringify(settings));
   }
 
   /**
-   * Get organization settings from Redis
+   * Retrieve OrgSettings for an orgId.
+   * Checks Redis first, then falls back to PostgreSQL.
    */
   async getOrgSettings(orgId: string): Promise<OrgSettings | null> {
     await this.connect();
     const key = `org:${orgId}`;
-    const data = await this.redisClient.get(key);
-    return data ? JSON.parse(data) : null;
+    const cached = await this.redisClient.get(key);
+    if (cached) return JSON.parse(cached);
+
+    // Fallback to PostgreSQL
+    if (this.db) {
+      const tenant = await this.db.getTenantByOrgId(orgId);
+      if (tenant) {
+        const settings: OrgSettings = {
+          orgId: tenant.org_id,
+          accessToken: tenant.encrypted_access_token
+            ? this.db.decryptAccessToken(tenant)
+            : '',
+          refreshToken: this.db.decryptRefreshToken(tenant),
+          instanceUrl: tenant.instance_url,
+          billingMode: tenant.billing_mode,
+          gcpProjectId: tenant.gcp_project_id || undefined,
+        };
+        // Re-cache in Redis
+        await this.saveOrgSettings(settings);
+        return settings;
+      }
+    }
+
+    return null;
   }
 
-  /** Deduplication: SetupAuditTrail.Id is the source of truth; keys expire after 25 hours
-   *  (must exceed the maximum lookback window of 24 hours to avoid reprocessing) */
+  // --------------- Deduplication (Redis only, ephemeral) ---------------
+
   private static readonly AUDIT_PROCESSED_TTL_SEC = 90000; // 25 hours
 
-  /**
-   * Check if this SetupAuditTrail record was already processed
-   * Uses record.Id (SetupAuditTrail Id) - same Id = same change = duplicate
-   */
   async isAuditRecordProcessed(orgId: string, recordId: string): Promise<boolean> {
     if (!recordId || recordId.trim() === '') return false;
     await this.connect();
     const key = `audit_processed:${orgId}:${recordId}`;
-    const exists = await this.redisClient.exists(key);
-    return exists === 1;
+    return (await this.redisClient.exists(key)) === 1;
   }
 
-  /**
-   * Mark a SetupAuditTrail record as processed by its Id
-   * recordId = SetupAuditTrail.Id (unique per audit trail entry)
-   */
   async markAuditRecordProcessed(orgId: string, recordId: string): Promise<void> {
     if (!recordId || recordId.trim() === '') return;
     await this.connect();
@@ -328,15 +332,13 @@ export class SalesforceAuthService {
     await this.redisClient.setEx(key, SalesforceAuthService.AUDIT_PROCESSED_TTL_SEC, '1');
   }
 
-  /** Validation rule deduplication: one Slack message per rule per 5 min (SF creates multiple SetupAuditTrail per change) */
-  private static readonly VALIDATION_PROCESSED_TTL_SEC = 300; // 5 minutes
+  private static readonly VALIDATION_PROCESSED_TTL_SEC = 300;
 
   async isValidationRuleRecentlyProcessed(orgId: string, ruleName: string): Promise<boolean> {
     if (!ruleName || ruleName.trim() === '') return false;
     await this.connect();
     const key = `validation_processed:${orgId}:${ruleName}`;
-    const exists = await this.redisClient.exists(key);
-    return exists === 1;
+    return (await this.redisClient.exists(key)) === 1;
   }
 
   async markValidationRuleProcessed(orgId: string, ruleName: string): Promise<void> {
@@ -346,8 +348,7 @@ export class SalesforceAuthService {
     await this.redisClient.setEx(key, SalesforceAuthService.VALIDATION_PROCESSED_TTL_SEC, '1');
   }
 
-  /** Flow thread ledger: 36h TTL (129600 seconds) */
-  private static readonly FLOW_THREAD_TTL_SEC = 129600;
+  private static readonly FLOW_THREAD_TTL_SEC = 129600; // 36 hours
 
   async getFlowThreadTs(orgId: string, flowDeveloperName: string): Promise<string | null> {
     await this.connect();
@@ -361,9 +362,6 @@ export class SalesforceAuthService {
     await this.redisClient.setEx(key, SalesforceAuthService.FLOW_THREAD_TTL_SEC, threadTs);
   }
 
-  /**
-   * Delete all audit_processed keys (run every 24h)
-   */
   async cleanupAuditProcessedKeys(): Promise<number> {
     await this.connect();
     const keys = await this.redisClient.keys('audit_processed:*');
@@ -375,28 +373,31 @@ export class SalesforceAuthService {
     return keys.length;
   }
 
-  /**
-   * Get all registered organization IDs from Redis
-   */
-  async getAllOrgIds(): Promise<string[]> {
-    await this.connect();
-    const keys = await this.redisClient.keys('org:*');
-    return keys.map(key => key.replace('org:', ''));
-  }
+  // --------------- Org enumeration ---------------
 
   /**
-   * Remove an org's settings from Redis (for cleaning up stale orgs).
+   * Get all registered org IDs.
+   * Prefers PostgreSQL (durable); falls back to Redis keys.
    */
+  async getAllOrgIds(): Promise<string[]> {
+    if (this.db) {
+      const tenants = await this.db.getAllActiveTenants();
+      return tenants.map((t) => t.org_id);
+    }
+    await this.connect();
+    const keys = await this.redisClient.keys('org:*');
+    return keys.map((key) => key.replace('org:', ''));
+  }
+
   async removeOrg(orgId: string): Promise<void> {
     await this.connect();
     await this.redisClient.del(`org:${orgId}`);
-    console.log(`[Auth] Removed stale org ${orgId} from Redis`);
+    if (this.db) {
+      await this.db.deactivateTenant(orgId);
+    }
+    console.log(`[Auth] Removed stale org ${orgId}`);
   }
 
-  /**
-   * Returns the first org whose token can be refreshed successfully.
-   * Removes stale orgs that fail refresh from Redis.
-   */
   async getFirstValidOrgId(): Promise<string | null> {
     const orgIds = await this.getAllOrgIds();
     for (const orgId of orgIds) {
@@ -411,42 +412,16 @@ export class SalesforceAuthService {
     return null;
   }
 
+  // --------------- Token refresh ---------------
 
-  /**
-   * Refresh access token for an organization
-   * This is crucial for maintaining active sessions
-   */
   async refreshSession(orgId: string): Promise<OrgSettings> {
     const settings = await this.getOrgSettings(orgId);
-    if (!settings) {
-      throw new Error(`No settings found for orgId: ${orgId}`);
-    }
+    if (!settings) throw new Error(`No settings found for orgId: ${orgId}`);
+    if (!settings.refreshToken) throw new Error(`No refresh token for orgId: ${orgId}`);
 
-    if (!settings.refreshToken) {
-      throw new Error(`No refresh token available for orgId: ${orgId}`);
-    }
-
-    const oauth2 = new jsforce.OAuth2({
-      clientId: this.clientId,
-      clientSecret: this.clientSecret,
-      redirectUri: this.redirectUri,
-      loginUrl: this.loginUrl,
-    });
-
-    const conn = new jsforce.Connection({ 
-      oauth2,
-      version: '58.0' // Use API version 58.0 (latest stable, well above v44.0 requirement)
-    });
-    conn.accessToken = settings.accessToken;
-    conn.refreshToken = settings.refreshToken;
-    conn.instanceUrl = settings.instanceUrl;
-
-    // Refresh the token using OAuth2 refresh token flow
     const refreshResponse = await fetch(`${this.loginUrl}/services/oauth2/token`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: this.clientId,
@@ -465,39 +440,34 @@ export class SalesforceAuthService {
       instance_url: string;
     };
 
-    conn.accessToken = refreshData.access_token;
-    conn.refreshToken = refreshData.refresh_token || settings.refreshToken;
-    conn.instanceUrl = refreshData.instance_url || settings.instanceUrl;
-
-    // Update settings with new token
     const updatedSettings: OrgSettings = {
       ...settings,
-      accessToken: conn.accessToken,
-      refreshToken: conn.refreshToken || settings.refreshToken,
-      instanceUrl: conn.instanceUrl,
+      accessToken: refreshData.access_token,
+      refreshToken: refreshData.refresh_token || settings.refreshToken,
+      instanceUrl: refreshData.instance_url || settings.instanceUrl,
     };
 
-    // Save updated settings
+    // Persist to both Redis cache AND PostgreSQL
     await this.saveOrgSettings(updatedSettings);
+    if (this.db) {
+      await this.db.updateTokens(
+        orgId,
+        updatedSettings.accessToken,
+        refreshData.refresh_token || undefined
+      );
+    }
 
     return updatedSettings;
   }
 
-  /**
-   * Get a valid connection for an organization (refreshes if needed)
-   */
   async getConnection(orgId: string): Promise<jsforce.Connection> {
     let settings = await this.getOrgSettings(orgId);
-    if (!settings) {
-      throw new Error(`No settings found for orgId: ${orgId}`);
-    }
+    if (!settings) throw new Error(`No settings found for orgId: ${orgId}`);
 
-    // Try to refresh the session to ensure token is valid
     try {
       settings = await this.refreshSession(orgId);
     } catch (error) {
       console.error(`Failed to refresh session for orgId ${orgId}:`, error);
-      // Continue with existing token, connection will fail if invalid
     }
 
     const oauth2 = new jsforce.OAuth2({
@@ -507,15 +477,12 @@ export class SalesforceAuthService {
       loginUrl: this.loginUrl,
     });
 
-    const conn = new jsforce.Connection({
+    return new jsforce.Connection({
       oauth2,
       accessToken: settings.accessToken,
       refreshToken: settings.refreshToken,
       instanceUrl: settings.instanceUrl,
-      version: '58.0' // Use API version 58.0 (latest stable, well above v44.0 requirement)
+      version: '58.0',
     });
-
-    return conn;
   }
 }
-

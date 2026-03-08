@@ -15,28 +15,31 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "array-flatten": "^3.0.0",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "jsforce": "^3.0.0",
-    "axios": "^1.6.0",
-    "dotenv": "^16.3.1",
-    "redis": "^4.6.0",
     "node-cron": "^3.0.3",
+    "pg": "^8.20.0",
+    "redis": "^4.6.0",
     "swagger-jsdoc": "^6.2.8",
-    "swagger-ui-express": "^5.0.0",
-    "cors": "^2.8.5"
+    "swagger-ui-express": "^5.0.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^20.10.0",
     "@types/node-cron": "^3.0.11",
+    "@types/pg": "^8.18.0",
     "@types/swagger-jsdoc": "^6.0.1",
     "@types/swagger-ui-express": "^4.1.6",
-    "@types/cors": "^2.8.17",
-    "typescript": "^5.3.3",
-    "ts-node-dev": "^2.0.0",
-    "eslint": "^8.55.0",
     "@typescript-eslint/eslint-plugin": "^6.15.0",
-    "@typescript-eslint/parser": "^6.15.0"
+    "@typescript-eslint/parser": "^6.15.0",
+    "eslint": "^8.55.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
   },
   "swaggerDoc": {
     "openapi": "3.0.0",
@@ -926,9 +929,15 @@
                         "items": {
                           "type": "object",
                           "properties": {
-                            "flowName": { "type": "string" },
-                            "complexityScore": { "type": "number" },
-                            "elementCount": { "type": "integer" }
+                            "flowName": {
+                              "type": "string"
+                            },
+                            "complexityScore": {
+                              "type": "number"
+                            },
+                            "elementCount": {
+                              "type": "integer"
+                            }
                           }
                         }
                       }
@@ -967,10 +976,14 @@
                   "schema": {
                     "type": "object",
                     "properties": {
-                      "driftDetected": { "type": "boolean" },
+                      "driftDetected": {
+                        "type": "boolean"
+                      },
                       "affectedClasses": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "items": {
+                          "type": "string"
+                        }
                       }
                     }
                   }
@@ -1093,6 +1106,5 @@
       }
     }
   },
-  
   "customOptions": {}
 }

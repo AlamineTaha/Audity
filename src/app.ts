@@ -1,29 +1,31 @@
 /**
  * Express Application Setup
- * Configures middleware, routes, and Swagger documentation
+ * Configures middleware, routes, and Swagger documentation.
+ *
+ * Protected routes go through tenantAuth middleware (X-API-Key).
+ * Public routes are whitelisted and skip authentication.
  */
 
 import dotenv from 'dotenv';
-// Load environment variables FIRST, before importing routes that use them
 dotenv.config();
 
-import express, { Express } from 'express';
+import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import swaggerJsdoc from 'swagger-jsdoc';
 import swaggerUi from 'swagger-ui-express';
 import agentforceRoutes from './routes/agentforce';
 import authRoutes from './routes/auth';
 import monitoringRoutes from './routes/monitoring';
+import { tenantAuth } from './middleware/tenantAuth';
 
 const app: Express = express();
 
-// Middleware
+// ---- Global middleware ----
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Error handling middleware for JSON parsing errors
-app.use((err: Error, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((err: Error, _req: Request, res: Response, next: NextFunction) => {
   if (err instanceof SyntaxError && 'body' in err) {
     res.status(400).json({
       error: 'Invalid JSON in request body',
@@ -35,18 +37,37 @@ app.use((err: Error, _req: express.Request, res: express.Response, next: express
   next(err);
 });
 
-// Swagger/OpenAPI configuration
+// ---- Endpoints that do NOT require tenant authentication ----
+const PUBLIC_PATHS = new Set([
+  'GET:/api/v1/health',
+  'GET:/api/v1/test-oauth-config',
+  'POST:/api/v1/test-gemini',
+  'POST:/api/v1/trigger-check',
+  'POST:/api/v1/slack-invite',
+  'POST:/api/v1/clear-audit-cache',
+]);
+
+function conditionalTenantAuth(req: Request, res: Response, next: NextFunction): void {
+  const key = `${req.method}:${req.path}`;
+  if (PUBLIC_PATHS.has(key)) {
+    next();
+    return;
+  }
+  tenantAuth(req, res, next);
+}
+
+// ---- Swagger / OpenAPI ----
 const swaggerOptions: swaggerJsdoc.Options = {
   definition: {
     openapi: '3.0.0',
     info: {
       title: 'AuditDelta API',
-      version: '1.0.0',
+      version: '2.0.0',
       description:
-        'Salesforce automation change monitoring service with AI-powered diff analysis. This API is designed for integration with Salesforce Einstein Agentforce.',
-      contact: {
-        name: 'AuditDelta Support',
-      },
+        'Multi-tenant Salesforce automation change monitoring service with AI-powered diff analysis.\n\n' +
+        '**Authentication:** All protected endpoints require an `X-API-Key` header. ' +
+        'Obtain your API key by completing the OAuth flow at `/auth/authorize`.',
+      contact: { name: 'AuditDelta Support' },
     },
     servers: [
       {
@@ -55,358 +76,51 @@ const swaggerOptions: swaggerJsdoc.Options = {
       },
     ],
     tags: [
-      {
-        name: 'Agentforce',
-        description: 'Endpoints for Salesforce Einstein Agent integration',
-      },
-      {
-        name: 'Flows',
-        description: 'Flow version management and revert endpoints',
-      },
-      {
-        name: 'Auth',
-        description: 'Authentication endpoints',
-      },
-      {
-        name: 'Monitoring',
-        description: 'Proactive monitoring and change detection endpoints',
-      },
-      {
-        name: 'Security',
-        description: 'Security and permission analysis endpoints',
-      },
+      { name: 'Agentforce', description: 'Endpoints for Salesforce Einstein Agent integration' },
+      { name: 'Flows', description: 'Flow version management and revert endpoints' },
+      { name: 'Auth', description: 'Authentication endpoints (public)' },
+      { name: 'Monitoring', description: 'Proactive monitoring and change detection endpoints' },
+      { name: 'Security', description: 'Security and permission analysis endpoints' },
     ],
     components: {
+      securitySchemes: {
+        ApiKeyAuth: {
+          type: 'apiKey',
+          in: 'header',
+          name: 'X-API-Key',
+          description: 'API key obtained from /auth/callback after OAuth handshake',
+        },
+      },
       schemas: {
         AnalyzeFlowRequest: {
           type: 'object',
-          required: ['flowName', 'orgId'],
+          required: ['flowName'],
           properties: {
-            flowName: {
-              type: 'string',
-              description: 'The API name of the Flow to analyze',
-              example: 'My_Flow',
-            },
-            orgId: {
-              type: 'string',
-              description: 'The Salesforce Organization ID',
-              example: '00D000000000000AAA',
-            },
+            flowName: { type: 'string', description: 'The API name of the Flow to analyze', example: 'My_Flow' },
           },
         },
         AnalyzeFlowResponse: {
           type: 'object',
           properties: {
-            success: {
-              type: 'boolean',
-              example: true,
-            },
-            flowName: {
-              type: 'string',
-              example: 'My_Flow',
-            },
-            summary: {
-              type: 'string',
-              example: 'The Flow was updated to include a new decision element...',
-            },
-            changes: {
-              type: 'array',
-              items: {
-                type: 'string',
-              },
-              example: ['Added new decision element', 'Modified field update logic'],
-            },
-            error: {
-              type: 'string',
-              example: 'Error message if success is false',
-            },
+            success: { type: 'boolean', example: true },
+            flowName: { type: 'string', example: 'My_Flow' },
+            summary: { type: 'string' },
+            changes: { type: 'array', items: { type: 'string' } },
+            error: { type: 'string' },
           },
         },
         AuthCallbackResponse: {
           type: 'object',
           properties: {
-            success: {
-              type: 'boolean',
-              example: true,
-            },
-            orgId: {
-              type: 'string',
-              description: 'Salesforce Organization ID',
-              example: '00D000000000000AAA',
-            },
-            message: {
-              type: 'string',
-              example: 'Organization successfully authenticated',
-            },
+            success: { type: 'boolean', example: true },
+            orgId: { type: 'string', example: '00D000000000000AAA' },
+            apiKey: { type: 'string', description: 'One-time API key. Store securely.' },
+            message: { type: 'string' },
           },
         },
         AuthErrorResponse: {
           type: 'object',
-          properties: {
-            error: {
-              type: 'string',
-              example: 'Error message',
-            },
-          },
-        },
-      },
-    },
-    paths: {
-      '/api/v1/trigger-check': {
-        post: {
-          summary: 'Force Immediate Change Check',
-          description: 'Manually triggers the polling engine to check for Salesforce changes immediately, analyze them with AI, and send Slack alerts if issues are found.',
-          operationId: 'triggerCheck',
-          tags: ['Monitoring'],
-          requestBody: {
-            required: false,
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    hours: { type: 'integer', description: 'Look back X hours instead of default time window (300 seconds).' },
-                    debug: { type: 'boolean', default: false, description: 'Skip cache check to re-test the same change.' },
-                    forceImmediate: { type: 'boolean', default: false, description: 'Bypass aggregation for on-demand triggers.' },
-                  },
-                },
-              },
-            },
-          },
-          responses: {
-            '200': {
-              description: 'Check initiated',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      success: { type: 'boolean' },
-                      message: { type: 'string', example: 'Manual check completed (300 seconds). Found 5 change(s).' },
-                      changesFound: { type: 'integer' },
-                      errors: { type: 'array', items: { type: 'string' } },
-                      timeWindow: { type: 'string', example: '300 seconds' },
-                      debug: { type: 'boolean', description: 'Whether debug mode was used (cache bypass)' },
-                      changes: { type: 'array', items: { type: 'object' } },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      '/api/v1/slack-invite': {
-        post: {
-          summary: 'Safe Slack Channel Invite',
-          description: 'Invites users to a Slack channel safely. Checks membership first to avoid already_in_channel errors. Flow calls this before posting to Slack. Body: { channelId: string, userIds: string | string[] } (comma-separated or array of Slack User IDs).',
-          operationId: 'slackInvite',
-          tags: ['Monitoring'],
-          requestBody: {
-            required: true,
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  required: ['channelId'],
-                  properties: {
-                    channelId: { type: 'string', description: 'Slack channel ID (e.g. C01234567)' },
-                    userIds: {
-                      oneOf: [
-                        { type: 'string', description: 'Comma-separated Slack User IDs' },
-                        { type: 'array', items: { type: 'string' }, description: 'Array of Slack User IDs' },
-                      ],
-                    },
-                  },
-                },
-              },
-            },
-          },
-          responses: {
-            '200': { description: 'Invitation successful or skipped (all already in channel)' },
-            '400': { description: 'channelId is required' },
-            '500': { description: 'Invitation failed (non-already_in_channel error)' },
-          },
-        },
-      },
-      '/api/v1/recent-changes': {
-        get: {
-          summary: 'Get Recent Org Activity',
-          description: 'Retrieves a list of metadata changes from the Audit Trail with AI-powered explanations for Validation Rules and Formula Fields.',
-          operationId: 'getRecentChanges',
-          tags: ['Monitoring'],
-          parameters: [
-            {
-              in: 'query',
-              name: 'orgId',
-              required: true,
-              schema: { type: 'string' },
-              description: 'Salesforce Organization ID (required)',
-              example: '00DJ6000001H7etMAC',
-            },
-            {
-              in: 'query',
-              name: 'hours',
-              required: false,
-              schema: { type: 'integer', default: 24 },
-              description: 'Lookback window in hours (optional, defaults to 24)',
-            },
-          ],
-          responses: {
-            '200': {
-              description: 'List of recent changes with AI explanations for Validation Rules and Formula Fields',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'array',
-                    items: {
-                      type: 'object',
-                      properties: {
-                        action: { type: 'string', example: 'changedValidationFormula' },
-                        user: { type: 'string', example: 'Alice Smith' },
-                        section: { type: 'string', example: 'Customize Accounts' },
-                        timestamp: { type: 'string', format: 'date-time', example: '2026-01-15T10:30:00.000Z' },
-                        display: { type: 'string', example: 'Changed validation rule In_dustry_validation_rule' },
-                        id: { type: 'string', example: '0Ya...' },
-                        explanation: { type: 'string', description: 'AI-generated explanation (only for Validation Rules and Formula Fields)', example: 'This validation rule blocks users from saving Account records where the Industry field is not set to Technology.' },
-                        metadataName: { type: 'string', example: 'In_dustry_validation_rule' },
-                        metadataType: { type: 'string', enum: ['ValidationRule', 'FormulaField'] },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-            '400': {
-              description: 'Bad request - missing orgId or invalid hours parameter',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      error: { type: 'string', example: 'orgId query parameter is required' },
-                    },
-                  },
-                },
-              },
-            },
-            '404': {
-              description: 'Organization not found or not configured',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      error: { type: 'string', example: 'Organization 00DJ6000001H7etMAC not found or not configured' },
-                    },
-                  },
-                },
-              },
-            },
-            '500': {
-              description: 'Internal server error',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      error: { type: 'string', example: 'Internal server error' },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      '/api/v1/analyze-permission': {
-        post: {
-          summary: 'Trace User Permissions',
-          description: 'Analyzes a specific user\'s System Permissions. Traces exactly which Profile or Permission Set grants a permission. Supports natural language queries (e.g., "create report", "export reports") or exact API names (e.g., "PermissionsCreateReport"). Note: Currently only supports System Permissions (not Object/Field permissions).',
-          operationId: 'analyzePermission',
-          tags: ['Security'],
-          requestBody: {
-            required: true,
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  required: ['userId', 'orgId'],
-                  properties: {
-                    userId: { 
-                      type: 'string', 
-                      description: 'Salesforce User ID (18-character) or Username (email)',
-                      example: '005J6000002RB2uIAG',
-                    },
-                    orgId: { 
-                      type: 'string', 
-                      description: 'Salesforce Organization ID',
-                      example: '00DJ6000001H7etMAC',
-                    },
-                    permissionName: { 
-                      type: 'string', 
-                      description: 'System Permission to check. Supports natural language (e.g., "create report", "export reports") or exact API name (e.g., "PermissionsCreateReport"). If not provided, returns basic user info.',
-                      example: 'create report',
-                    },
-                  },
-                },
-              },
-            },
-          },
-          responses: {
-            '200': {
-              description: 'Permission analysis result',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      username: { 
-                        type: 'string',
-                        description: 'User\'s full name',
-                        example: 'Alice Smith',
-                      },
-                      userId: { 
-                        type: 'string',
-                        description: 'Salesforce User ID',
-                        example: '005J6000002RB2uIAG',
-                      },
-                      checkingPermission: { 
-                        type: 'string',
-                        description: 'The resolved API name of the permission checked',
-                        example: 'PermissionsCreateReport',
-                      },
-                      hasAccess: { 
-                        type: 'boolean',
-                        description: 'Whether the user has the requested permission',
-                        example: true,
-                      },
-                      sources: { 
-                        type: 'array',
-                        description: 'List of Profiles/Permission Sets that grant this permission',
-                        items: { type: 'string' },
-                        example: ['Profile: System Administrator', 'Permission Set: Marketing Manager'],
-                      },
-                      explanation: { 
-                        type: 'string',
-                        description: 'Human-readable explanation of the permission analysis',
-                        example: 'User can do this because it is granted by: Profile: System Administrator, Permission Set: Marketing Manager',
-                      },
-                    },
-                  },
-                },
-              },
-            },
-            '400': {
-              description: 'Bad request - missing required fields or invalid JSON',
-            },
-            '404': {
-              description: 'User not found',
-            },
-            '500': {
-              description: 'Internal server error',
-            },
-          },
+          properties: { error: { type: 'string', example: 'Error message' } },
         },
       },
     },
@@ -418,25 +132,26 @@ const swaggerOptions: swaggerJsdoc.Options = {
 
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
 
-// Routes
+// ---- Routes ----
+
+// Auth routes are fully public
+app.use('/auth', authRoutes);
+
+// Apply conditional tenant auth before API routes
+app.use('/api/v1', conditionalTenantAuth);
 app.use('/api/v1', agentforceRoutes);
 app.use('/api/v1', monitoringRoutes);
-app.use('/auth', authRoutes);
 
 // Swagger UI
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
-
-// Expose OpenAPI JSON spec for download
 app.get('/api-docs/swagger.json', (_req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.send(swaggerSpec);
 });
-
 app.get('/openapi.json', (_req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.send(swaggerSpec);
 });
-
 app.get('/swagger.json', (_req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.send(swaggerSpec);
@@ -446,11 +161,12 @@ app.get('/swagger.json', (_req, res) => {
 app.get('/', (_req, res) => {
   res.json({
     name: 'AuditDelta API',
-    version: '1.0.0',
+    version: '2.0.0',
     documentation: '/api-docs',
     health: '/api/v1/health',
+    authenticate: '/auth/authorize',
+    note: 'All protected endpoints require an X-API-Key header.',
   });
 });
 
 export default app;
-
