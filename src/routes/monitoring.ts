@@ -636,8 +636,9 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
  */
 router.post('/analyze-validation-rules', async (req: Request, res: Response) => {
   try {
+    const { tenant } = req as AuthenticatedRequest;
     const objectApiName = String(req.query.objectApiName ?? req.body.objectApiName ?? '').trim();
-    const orgId: string = res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
+    const orgId: string = tenant?.orgId ?? res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
 
     if (!objectApiName) {
       return res.status(400).json({
