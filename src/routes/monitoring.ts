@@ -739,6 +739,8 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'flowName is required (label or API name)' });
     }
 
+    console.log(`[CompareFlow][START] orgId=${orgId} flowName=${flowName} versionA=${String(versionA)} versionB=${String(versionB)} analyzeOnly=${analyzeOnly}`);
+
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
@@ -749,12 +751,25 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
     }
 
     if (analyzeOnly) {
-      const latest = await salesforceService.getLatestFlowVersion(orgId, flowName);
-      const analysis = await aiService.analyzeFlowVersion(
-        latest.metadata, latest.developerName, latest.version, settings
-      );
+      let latest;
+      try {
+        latest = await salesforceService.getLatestFlowVersion(orgId, flowName);
+      } catch (sfError) {
+        console.error(`[CompareFlow][SF] Failed to fetch latest flow version orgId=${orgId} flowName=${flowName}:`, sfError);
+        throw sfError;
+      }
+      let analysis: string;
+      try {
+        analysis = await aiService.analyzeFlowVersion(
+          latest.metadata, latest.developerName, latest.version, settings
+        );
+      } catch (llmError) {
+        console.error(`[CompareFlow][LLM] Failed to analyze latest flow version orgId=${orgId} flowName=${flowName}:`, llmError);
+        throw llmError;
+      }
       const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${latest.definitionId}`;
       const displayText = `Flow: ${latest.label} (v${latest.version})\n\n${analysis}\n\nOpen in Flow Builder: ${flowUrl}`;
+      console.log(`[CompareFlow][SUCCESS] orgId=${orgId} flowName=${flowName} mode=analyze`);
       return res.json({ success: true, displayText });
     }
 
@@ -768,12 +783,24 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'versionA and versionB must be different' });
     }
 
-    const versions = await salesforceService.getFlowVersionsByNumber(orgId, flowName, versionA, versionB);
+    let versions;
+    try {
+      versions = await salesforceService.getFlowVersionsByNumber(orgId, flowName, versionA, versionB);
+    } catch (sfError) {
+      console.error(`[CompareFlow][SF] Failed to fetch flow versions orgId=${orgId} flowName=${flowName}:`, sfError);
+      throw sfError;
+    }
 
     const older = versions.versionA.version < versions.versionB.version ? versions.versionA : versions.versionB;
     const newer = versions.versionA.version < versions.versionB.version ? versions.versionB : versions.versionA;
 
-    const diff = await aiService.generateSummary(older.metadata, newer.metadata, versions.developerName, settings);
+    let diff;
+    try {
+      diff = await aiService.generateSummary(older.metadata, newer.metadata, versions.developerName, settings);
+    } catch (llmError) {
+      console.error(`[CompareFlow][LLM] Failed to generate diff orgId=${orgId} flowName=${flowName}:`, llmError);
+      throw llmError;
+    }
 
     const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${versions.definitionId}`;
     const changes = diff.changes || [];
@@ -782,9 +809,10 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
     const secList = findings.length > 0 ? '\nSecurity: ' + findings.join(', ') : '';
     const displayText = `Flow: ${versions.label} (v${older.version} vs v${newer.version})\n\n${diff.summary}${changesList}${secList}\n\nOpen in Flow Builder: ${flowUrl}`;
 
+    console.log(`[CompareFlow][SUCCESS] orgId=${orgId} flowName=${flowName} mode=compare`);
     return res.json({ success: true, displayText });
   } catch (error) {
-    console.error('Error in compare-flow-versions endpoint:', error);
+    console.error('[CompareFlow][UNHANDLED] Error in compare-flow-versions endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
     return res.status(500).json({ success: false, error: errorMessage });
   }

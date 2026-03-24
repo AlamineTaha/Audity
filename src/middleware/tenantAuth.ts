@@ -12,9 +12,30 @@ import { TenantContext, AuthenticatedRequest } from '../types';
 
 const CACHE_PREFIX = 'tenant_ctx:';
 const CACHE_TTL_SEC = 300; // 5 minutes
+const TENANT_LOOKUP_RETRIES = 2;
+const TENANT_LOOKUP_BACKOFF_MS = 150;
 
 let dbService: DatabaseService | null = null;
 let authServiceInstance: SalesforceAuthService | null = null;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isInfrastructureError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  return (
+    msg.includes('timeout') ||
+    msg.includes('connection terminated') ||
+    msg.includes('socket closed') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('enotfound') ||
+    msg.includes('redis') ||
+    msg.includes('pg')
+  );
+}
 
 export function initTenantAuth(db: DatabaseService, auth: SalesforceAuthService): void {
   dbService = db;
@@ -38,20 +59,54 @@ export async function tenantAuth(req: Request, res: Response, next: NextFunction
 
   try {
     const apiKeyHash = DatabaseService.hashApiKey(apiKey);
+    const requestPath = `${req.method} ${req.originalUrl}`;
 
     // Try Redis cache first
-    await authServiceInstance.connect();
     const cacheKey = `${CACHE_PREFIX}${apiKeyHash}`;
-    const cached = await authServiceInstance.getCachedValue(cacheKey);
+    let cached: string | null = null;
+    try {
+      await authServiceInstance.connect();
+      cached = await authServiceInstance.getCachedValue(cacheKey);
+    } catch (redisError) {
+      console.error(`[TenantAuth][REDIS] Cache read failed for ${requestPath}:`, redisError);
+    }
     if (cached) {
+      console.log(`[TenantAuth][CACHE_HIT] ${requestPath}`);
       (req as AuthenticatedRequest).tenant = JSON.parse(cached);
       next();
       return;
     }
 
-    // Lookup in PostgreSQL
-    const tenant = await dbService.getTenantByApiKeyHash(apiKeyHash);
+    // Lookup in PostgreSQL (with retry/backoff for transient infrastructure failures)
+    let tenant: Awaited<ReturnType<DatabaseService['getTenantByApiKeyHash']>> = null;
+    let lastLookupError: unknown = null;
+    for (let attempt = 0; attempt <= TENANT_LOOKUP_RETRIES; attempt++) {
+      try {
+        tenant = await dbService.getTenantByApiKeyHash(apiKeyHash);
+        break;
+      } catch (lookupError) {
+        lastLookupError = lookupError;
+        const retryable = isInfrastructureError(lookupError) && attempt < TENANT_LOOKUP_RETRIES;
+        console.error(
+          `[TenantAuth][DB] Tenant lookup failed (attempt ${attempt + 1}/${TENANT_LOOKUP_RETRIES + 1}) for ${requestPath}:`,
+          lookupError
+        );
+        if (retryable) {
+          await sleep(TENANT_LOOKUP_BACKOFF_MS * (attempt + 1));
+          continue;
+        }
+        throw lookupError;
+      }
+    }
+
     if (!tenant) {
+      if (lastLookupError && isInfrastructureError(lastLookupError)) {
+        res.status(503).json({
+          error: 'Authentication backend temporarily unavailable',
+          category: 'db',
+        });
+        return;
+      }
       res.status(401).json({ error: 'Invalid API key' });
       return;
     }
@@ -64,12 +119,24 @@ export async function tenantAuth(req: Request, res: Response, next: NextFunction
     };
 
     // Cache for subsequent requests
-    await authServiceInstance.setCachedValue(cacheKey, JSON.stringify(ctx), CACHE_TTL_SEC);
+    try {
+      await authServiceInstance.setCachedValue(cacheKey, JSON.stringify(ctx), CACHE_TTL_SEC);
+    } catch (redisError) {
+      console.error(`[TenantAuth][REDIS] Cache write failed for ${requestPath}:`, redisError);
+    }
 
     (req as AuthenticatedRequest).tenant = ctx;
+    console.log(`[TenantAuth][DB_HIT] ${requestPath} orgId=${ctx.orgId}`);
     next();
   } catch (error) {
-    console.error('[TenantAuth] Error resolving tenant:', error);
-    res.status(500).json({ error: 'Tenant authentication failed' });
+    const requestPath = `${req.method} ${req.originalUrl}`;
+    const backendCategory = isInfrastructureError(error) ? 'infrastructure' : 'unknown';
+    console.error(`[TenantAuth][${backendCategory.toUpperCase()}] Error resolving tenant for ${requestPath}:`, error);
+    res.status(isInfrastructureError(error) ? 503 : 500).json({
+      error: isInfrastructureError(error)
+        ? 'Authentication backend temporarily unavailable'
+        : 'Tenant authentication failed',
+      category: backendCategory,
+    });
   }
 }

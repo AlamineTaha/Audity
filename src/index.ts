@@ -18,6 +18,10 @@ import { ensureWaitingRoomStarted } from './routes/monitoring';
 import { authService as routeAuthService } from './routes/auth';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
+const POLLING_ENABLED = String(process.env.POLLING_ENABLED ?? 'true').toLowerCase() === 'true';
+const POLLING_INTERVAL_MINUTES = parseInt(process.env.POLLING_INTERVAL_MINUTES || '10', 10);
+const POLLING_CRON = process.env.POLLING_CRON ||
+  `*/${Number.isFinite(POLLING_INTERVAL_MINUTES) && POLLING_INTERVAL_MINUTES > 0 ? POLLING_INTERVAL_MINUTES : 10} * * * *`;
 
 async function startServer() {
   let server: Server | null = null;
@@ -64,8 +68,13 @@ async function startServer() {
     const salesforceService = new SalesforceService(authService);
     const aiService = new AIService();
 
-    pollingService = new PollingService(salesforceService, aiService, authService);
-    pollingService.start();
+    pollingService = new PollingService(salesforceService, aiService, authService, POLLING_CRON);
+    if (POLLING_ENABLED) {
+      pollingService.start();
+      console.log(`[Startup] Polling enabled with schedule: ${POLLING_CRON}`);
+    } else {
+      console.warn('[Startup] Polling disabled (POLLING_ENABLED=false)');
+    }
 
     await ensureWaitingRoomStarted();
 

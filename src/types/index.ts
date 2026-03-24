@@ -194,3 +194,49 @@ export interface ChangeNotification {
   riskLevel: 'Low' | 'Medium' | 'High';
   salesforceUrl: string;
 }
+
+/**
+ * Supported process types for the Audit Report endpoint
+ */
+export type AuditReportProcessType =
+  | 'Flow'
+  | 'Permission'
+  | 'Layout'
+  | 'ValidationRule'
+  | 'CustomField'
+  | 'Object'
+  | 'All';
+
+/**
+ * A single row in the generated Audit Report
+ */
+export interface AuditReportEntry {
+  timestamp: string;
+  user: string;
+  action: string;
+  display: string;
+  section: string;
+  processType: string;
+  explanation?: string;
+}
+
+/**
+ * Request payload for the generate-audit-report endpoint
+ */
+export interface GenerateAuditReportRequest {
+  processType: AuditReportProcessType;
+  hours: number;
+}
+
+/**
+ * Response payload for the generate-audit-report endpoint
+ */
+export interface GenerateAuditReportResponse {
+  success: boolean;
+  reportTitle: string;
+  processType: AuditReportProcessType;
+  timeWindowHours: number;
+  totalChanges: number;
+  generatedAt: string;
+  error?: string;
+}
