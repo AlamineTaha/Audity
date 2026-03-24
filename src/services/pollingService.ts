@@ -15,6 +15,7 @@ export class PollingService {
   private authService: SalesforceAuthService;
   private cronExpression: string;
   private isRunning: boolean = false;
+  private isPolling: boolean = false;
 
   constructor(
     salesforceService: SalesforceService,
@@ -57,18 +58,26 @@ export class PollingService {
    * Main polling logic
    */
   private async poll(): Promise<void> {
+    if (this.isPolling) {
+      console.warn('[Polling] Previous poll still running, skipping this tick');
+      return;
+    }
+    this.isPolling = true;
     try {
-      console.log('Starting audit trail poll...');
+      console.log('[Polling][START] Starting audit trail poll...');
 
       // Get all registered orgs (simplified - in production, maintain a registry)
       // For now, we'll need to track orgs separately
       const orgIds: string[] = await this.authService.getAllOrgIds();
+      console.log(`[Polling][ORGS] Found ${orgIds.length} org(s) to process`);
 
       for (const orgId of orgIds) {
         await this.processOrg(orgId);
       }
     } catch (error) {
-      console.error('Error in polling service:', error);
+      console.error('[Polling][GENERAL] Error in polling service:', error);
+    } finally {
+      this.isPolling = false;
     }
   }
 
@@ -77,7 +86,9 @@ export class PollingService {
    */
   private async processOrg(orgId: string): Promise<void> {
     try {
+      console.log(`[Polling][ORG_START] orgId=${orgId}`);
       const auditRecords = await this.salesforceService.queryAuditTrail(orgId, 10);
+      console.log(`[Polling][ORG_AUDIT] orgId=${orgId} records=${auditRecords.length}`);
 
       for (const record of auditRecords) {
         if (record.Action === 'ChangedFlow') {
@@ -89,7 +100,7 @@ export class PollingService {
         }
       }
     } catch (error) {
-      console.error(`Error processing org ${orgId}:`, error);
+      console.error(`[Polling][SF_OR_DB] Error processing org ${orgId}:`, error);
     }
   }
 

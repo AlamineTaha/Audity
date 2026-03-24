@@ -10,7 +10,14 @@ import { Router, Request, Response } from 'express';
 import { SalesforceService } from '../services/salesforceService';
 import { AIService } from '../services/aiService';
 import { SalesforceAuthService } from '../services/authService';
-import { AuthenticatedRequest, AnalyzeFlowResponse } from '../types';
+import { ReportService } from '../services/reportService';
+import {
+  AuthenticatedRequest,
+  AnalyzeFlowResponse,
+  AuditReportProcessType,
+  AuditReportEntry,
+  SetupAuditTrail,
+} from '../types';
 
 const router = Router();
 
@@ -662,6 +669,223 @@ router.get('/flows/versions', async (req: Request, res: Response) => {
     if (errorMessage.includes('not found')) {
       return res.status(404).json({ success: false, error: errorMessage });
     }
+    return res.status(500).json({ success: false, error: errorMessage });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Process-type matchers (mirrors MonitorService logic)
+// ────────────────────────────────────────────────────────────────────────────
+
+const PROCESS_MATCHERS: Record<string, (r: SetupAuditTrail) => boolean> = {
+  Flow: (r) => {
+    const a = (r.Action || '').toLowerCase();
+    const s = (r.Section || '').toLowerCase();
+    return a.includes('flow') || s.includes('flow');
+  },
+  Permission: (r) => {
+    const a = (r.Action || '').toLowerCase();
+    return (
+      a.includes('perm') ||
+      a.includes('profile') ||
+      a.includes('role') ||
+      a.includes('userrole')
+    );
+  },
+  Layout: (r) => {
+    const a = (r.Action || '').toLowerCase();
+    const s = (r.Section || '').toLowerCase();
+    return a.includes('layout') || s.includes('layout');
+  },
+  ValidationRule: (r) => {
+    const a = (r.Action || '').toLowerCase();
+    return a.includes('validation');
+  },
+  CustomField: (r) => {
+    const a = (r.Action || '').toLowerCase();
+    return a.includes('customfield') || a.includes('formula') || a.startsWith('changedcf') || a.startsWith('createdcf') || a.startsWith('deletedcf');
+  },
+  Object: (r) => {
+    const a = (r.Action || '').toLowerCase();
+    const s = (r.Section || '').toLowerCase();
+    return (
+      a.includes('entity') ||
+      a.includes('customobject') ||
+      s.startsWith('customize')
+    );
+  },
+};
+
+function classifyEntry(record: SetupAuditTrail): string {
+  for (const [type, matcher] of Object.entries(PROCESS_MATCHERS)) {
+    if (matcher(record)) return type;
+  }
+  return 'Other';
+}
+
+/**
+ * @swagger
+ * /api/v1/generate-audit-report:
+ *   post:
+ *     summary: Generate Audit Report PDF
+ *     description: |
+ *       Queries the Setup Audit Trail for a given process type and time window,
+ *       enriches each entry with an AI explanation, and returns a downloadable PDF report.
+ *       Designed for Agentforce to provide on-demand audit documentation.
+ *     tags:
+ *       - Agentforce
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - processType
+ *               - hours
+ *             properties:
+ *               processType:
+ *                 type: string
+ *                 enum: [Flow, Permission, Layout, ValidationRule, CustomField, Object, All]
+ *                 description: The category of metadata changes to include in the report
+ *                 example: "Flow"
+ *               hours:
+ *                 type: integer
+ *                 minimum: 1
+ *                 maximum: 168
+ *                 description: Lookback window in hours (1-168)
+ *                 example: 24
+ *     responses:
+ *       200:
+ *         description: PDF file download
+ *         content:
+ *           application/pdf:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       400:
+ *         description: Bad request - missing or invalid parameters
+ *       404:
+ *         description: Organization not found
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/generate-audit-report', async (req: Request, res: Response) => {
+  try {
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
+
+    const processType = (
+      req.query.processType ?? req.body.processType ?? 'All'
+    ) as AuditReportProcessType;
+    const rawHours = req.query.hours ?? req.body.hours ?? 24;
+    const hours = parseInt(String(rawHours), 10);
+
+    const validTypes: AuditReportProcessType[] = [
+      'Flow', 'Permission', 'Layout', 'ValidationRule', 'CustomField', 'Object', 'All',
+    ];
+    if (!validTypes.includes(processType)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid processType. Must be one of: ${validTypes.join(', ')}`,
+      });
+    }
+    if (isNaN(hours) || hours < 1 || hours > 168) {
+      return res.status(400).json({
+        success: false,
+        error: 'hours must be an integer between 1 and 168',
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+    const aiService = new AIService();
+    const reportService = new ReportService();
+
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({
+        success: false,
+        error: `Organization settings not found. Please re-authenticate at /auth/authorize`,
+      });
+    }
+
+    console.log(`[AuditReport] Generating report – org=${orgId} process=${processType} hours=${hours}`);
+
+    const auditRecords = await salesforceService.queryAuditTrailByHours(orgId, hours);
+
+    const filtered =
+      processType === 'All'
+        ? auditRecords
+        : auditRecords.filter((r) => {
+            const matcher = PROCESS_MATCHERS[processType];
+            return matcher ? matcher(r) : false;
+          });
+
+    console.log(`[AuditReport] ${auditRecords.length} total records, ${filtered.length} match "${processType}"`);
+
+    // Build report entries with AI explanations (batch with concurrency limit)
+    const CONCURRENCY = 5;
+    const entries: AuditReportEntry[] = [];
+
+    for (let i = 0; i < filtered.length; i += CONCURRENCY) {
+      const batch = filtered.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (record): Promise<AuditReportEntry> => {
+          let explanation: string | undefined;
+          try {
+            explanation = await aiService.interpretAuditEntry(
+              record.Action,
+              record.Display || '',
+              record.Section || '',
+              settings
+            );
+          } catch {
+            explanation = undefined;
+          }
+
+          return {
+            timestamp: record.CreatedDate,
+            user: record.CreatedBy?.Name || 'Unknown',
+            action: record.Action,
+            display: record.Display || '',
+            section: record.Section || '',
+            processType: classifyEntry(record),
+            explanation,
+          };
+        })
+      );
+      entries.push(...results);
+    }
+
+    // Generate executive summary
+    const overallSummary = await aiService.generateAuditReportSummary(
+      entries.map((e) => ({
+        action: e.action,
+        display: e.display,
+        user: e.user,
+        section: e.section,
+        processType: e.processType,
+      })),
+      processType,
+      hours,
+      settings
+    );
+
+    // Build the PDF
+    const pdfBuffer = await reportService.generatePdf(entries, processType, hours, orgId, overallSummary);
+
+    const filename = `AuditDelta_Report_${processType}_${hours}h_${new Date().toISOString().slice(0, 10)}.pdf`;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Error in generate-audit-report endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
     return res.status(500).json({ success: false, error: errorMessage });
   }
 });

@@ -483,6 +483,76 @@ Use clear, non-technical language. Keep it under 150 words.`;
   */
 
   /**
+   * Generate an executive summary and per-entry explanations for an Audit Report.
+   * Returns the overall summary string; individual entries get their explanation
+   * via interpretAuditEntry (called separately per row).
+   */
+  async generateAuditReportSummary(
+    entries: Array<{ action: string; display: string; user: string; section: string; processType: string }>,
+    processType: string,
+    hours: number,
+    settings: OrgSettings
+  ): Promise<string> {
+    const entriesList = entries
+      .slice(0, 40) // cap to avoid huge prompts
+      .map((e, i) => `${i + 1}. [${e.processType}] ${e.action} by ${e.user} — ${e.display}`)
+      .join('\n');
+
+    const prompt = `You are the AuditDelta Guardian, an expert Salesforce Auditor writing an executive summary for a PDF report.
+
+Process Type Filter: ${processType}
+Time Window: Last ${hours} hour(s)
+Total Changes: ${entries.length}
+
+Changes:
+${entriesList}
+
+Write a concise executive summary (3-5 sentences) for stakeholders:
+1. Highlight the most significant changes and their business impact.
+2. Flag any security or compliance concerns.
+3. Note patterns (e.g., bulk changes by one user, high-risk permission changes).
+4. End with an overall risk assessment (Low / Medium / High).
+
+Rules:
+- Plain text only. No markdown, no bullets, no emoji.
+- Under 200 words.`;
+
+    try {
+      return await this.callLLM(prompt, settings, 'generateAuditReportSummary');
+    } catch (error) {
+      console.error('Error generating audit report summary:', error);
+      return `${entries.length} change(s) detected in the last ${hours} hour(s) for ${processType}. Please review the details below.`;
+    }
+  }
+
+  /**
+   * Interpret a single SetupAuditTrail entry for the PDF report.
+   * Lighter-weight than full metadata analysis — works from the Display string alone.
+   */
+  async interpretAuditEntry(
+    action: string,
+    display: string,
+    section: string,
+    settings: OrgSettings
+  ): Promise<string> {
+    const prompt = `You are a Salesforce auditor explaining a Setup Audit Trail entry to a business manager.
+
+Action: ${action}
+Description: ${display}
+Section: ${section}
+
+In 1-2 sentences, explain what this change means in business terms and whether it poses any risk.
+Plain text only. No markdown, no emoji. Under 60 words.`;
+
+    try {
+      return await this.callLLM(prompt, settings, 'interpretAuditEntry');
+    } catch (error) {
+      console.error(`Error interpreting audit entry ${action}:`, error);
+      return `Change recorded: ${display}`;
+    }
+  }
+
+  /**
    * Sanitize JSON by removing visual noise elements
    * Strips locationX, locationY, connector, and processMetadataValues
    */
