@@ -2335,32 +2335,33 @@ export class SalesforceService {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
+    const cleanName = validationRuleName.replace(/^["']+|["']+$/g, '').trim();
+
     try {
-      // Use ValidationName field for exact match (more reliable than FullName)
-      // LIMIT 1 is required when querying Metadata field in Tooling API
       const soql = `
         SELECT Id, FullName, Metadata
         FROM ValidationRule
-        WHERE ValidationName = '${validationRuleName.replace(/'/g, "''")}'
+        WHERE ValidationName = '${cleanName.replace(/'/g, "''")}'
         LIMIT 1
       `;
 
       const result = await tooling.query<any>(soql);
 
       if (!result.records || result.records.length === 0) {
-        // Fallback: try FullName if ValidationName didn't work
-        const fallbackSoql = `
+        // FullName cannot be filtered in a WHERE clause for ValidationRule,
+        // so fall back to a LIKE query on ValidationName for partial matches
+        const likeSoql = `
           SELECT Id, FullName, Metadata
           FROM ValidationRule
-          WHERE FullName = '${validationRuleName.replace(/'/g, "''")}'
+          WHERE ValidationName LIKE '%${cleanName.replace(/'/g, "''").replace(/%/g, '\\%')}%'
           LIMIT 1
         `;
-        const fallbackResult = await tooling.query<any>(fallbackSoql);
-        
+        const fallbackResult = await tooling.query<any>(likeSoql);
+
         if (!fallbackResult.records || fallbackResult.records.length === 0) {
           return null;
         }
-        
+
         const metadata = fallbackResult.records[0].Metadata || {};
         return {
           id: fallbackResult.records[0].Id,
@@ -2378,7 +2379,7 @@ export class SalesforceService {
         errorMessage: metadata.errorMessage || '',
       };
     } catch (error) {
-      console.error(`Error fetching validation rule metadata for ${validationRuleName}:`, error);
+      console.error(`Error fetching validation rule metadata for "${cleanName}":`, error);
       throw error;
     }
   }

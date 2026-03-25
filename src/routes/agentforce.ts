@@ -217,6 +217,7 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
  *     description: Returns the health status of the API (no auth required)
  *     tags:
  *       - Agentforce
+ *     security: []
  *     responses:
  *       200:
  *         description: Service is healthy
@@ -236,6 +237,7 @@ router.get('/health', (_req: Request, res: Response) => {
  *     description: Validates that OAuth environment variables are configured correctly. No auth required.
  *     tags:
  *       - Agentforce
+ *     security: []
  *     responses:
  *       200:
  *         description: OAuth configuration test results
@@ -370,6 +372,7 @@ router.post('/test-connection', async (req: Request, res: Response) => {
  *     description: Tests the Gemini API directly with different configurations. No org auth required.
  *     tags:
  *       - Agentforce
+ *     security: []
  */
 router.post('/test-gemini', async (req: Request, res: Response) => {
   const { prompt = 'Say hello in one sentence', apiVersion = 'v1', model } = req.body;

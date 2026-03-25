@@ -128,6 +128,7 @@ router.post('/clear-audit-cache', async (_req: Request, res: Response) => {
  *     description: Manually triggers the polling engine to check all registered orgs for changes.
  *     tags:
  *       - Monitoring
+ *     security: []
  *     requestBody:
  *       required: false
  *       content:
@@ -240,15 +241,15 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
 
     const extractValidationRuleName = (display: string): string | null => {
       const patterns = [
+        /validation\s+["']([^"']+)["']/i,
+        /"([^"]+)"(?:\s+validation|$)/i,
         /(?:ValidationRule|Validation Rule):\s*(.+?)(?:\s|$)/i,
         /validation rule\s+(.+?)(?:\s|$)/i,
-        /validation\s+["']([^"']+)["']/i,
         /rule\s+["']?([^"'\s]+)["']?/i,
-        /"([^"]+)"(?:\s+validation|$)/i,
       ];
       for (const pattern of patterns) {
         const match = display.match(pattern);
-        if (match?.[1]) return match[1].trim();
+        if (match?.[1]) return match[1].replace(/^["']+|["']+$/g, '').trim();
       }
       return null;
     };
@@ -280,62 +281,88 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
       return null;
     };
 
-    const changes = await Promise.all(
-      auditRecords.map(async (record) => {
-        const change: any = {
-          action: record.Action,
-          user: record.CreatedBy.Name,
-          section: record.Section,
-          timestamp: record.CreatedDate,
-          display: record.Display,
-          id: record.Id,
-        };
+    const CONCURRENCY = 3;
+    const PER_RECORD_TIMEOUT_MS = 15_000;
+    const changes: any[] = [];
 
-        try {
-          if (isValidationAction(record.Action)) {
-            const ruleName = extractValidationRuleName(record.Display || '');
-            if (ruleName) {
-              try {
-                const validationMetadata = await salesforceService.getValidationRuleMetadata(orgId, ruleName);
-                if (validationMetadata) {
-                  const metadata = {
-                    errorConditionFormula: validationMetadata.errorConditionFormula,
-                    id: validationMetadata.id,
-                  };
-                  change.explanation = await aiService.interpretMetadataChange(metadata, 'ValidationRule', ruleName, settings);
-                  change.metadataName = ruleName;
-                  change.metadataType = 'ValidationRule';
-                }
-              } catch (error) {
-                console.warn(`[Recent Changes] Could not fetch explanation for validation rule ${ruleName}:`, error);
+    const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
+      Promise.race([
+        promise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+      ]);
+
+    for (let i = 0; i < auditRecords.length; i += CONCURRENCY) {
+      const batch = auditRecords.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map(async (record) => {
+          const change: any = {
+            action: record.Action,
+            user: record.CreatedBy.Name,
+            section: record.Section,
+            timestamp: record.CreatedDate,
+            display: record.Display,
+            id: record.Id,
+          };
+
+          try {
+            if (isValidationAction(record.Action)) {
+              const ruleName = extractValidationRuleName(record.Display || '');
+              if (ruleName) {
+                const enriched = await withTimeout(
+                  (async () => {
+                    const validationMetadata = await salesforceService.getValidationRuleMetadata(orgId, ruleName);
+                    if (validationMetadata) {
+                      const metadata = {
+                        errorConditionFormula: validationMetadata.errorConditionFormula,
+                        id: validationMetadata.id,
+                      };
+                      return {
+                        explanation: await aiService.interpretMetadataChange(metadata, 'ValidationRule', ruleName, settings),
+                        metadataName: ruleName,
+                        metadataType: 'ValidationRule',
+                      };
+                    }
+                    return null;
+                  })(),
+                  PER_RECORD_TIMEOUT_MS
+                );
+                if (enriched) Object.assign(change, enriched);
+              }
+            } else if (isFormulaFieldAction(record.Action)) {
+              const fieldName = extractFieldName(record.Display || '');
+              const objectName = extractObjectNameFromSection(record.Section || '') ||
+                (record.Display?.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/)?.[1]) ||
+                'Unknown';
+
+              if (fieldName && objectName !== 'Unknown') {
+                const enriched = await withTimeout(
+                  (async () => {
+                    const formulaMetadata = await salesforceService.getFormulaFieldMetadata(orgId, fieldName, objectName);
+                    if (formulaMetadata) {
+                      return {
+                        explanation: await aiService.interpretMetadataChange(formulaMetadata, 'FormulaField', `${objectName}.${fieldName}`, settings),
+                        metadataName: `${objectName}.${fieldName}`,
+                        metadataType: 'FormulaField',
+                      };
+                    }
+                    return null;
+                  })(),
+                  PER_RECORD_TIMEOUT_MS
+                );
+                if (enriched) Object.assign(change, enriched);
               }
             }
-          } else if (isFormulaFieldAction(record.Action)) {
-            const fieldName = extractFieldName(record.Display || '');
-            const objectName = extractObjectNameFromSection(record.Section || '') ||
-              (record.Display?.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/)?.[1]) ||
-              'Unknown';
-
-            if (fieldName && objectName !== 'Unknown') {
-              try {
-                const formulaMetadata = await salesforceService.getFormulaFieldMetadata(orgId, fieldName, objectName);
-                if (formulaMetadata) {
-                  change.explanation = await aiService.interpretMetadataChange(formulaMetadata, 'FormulaField', `${objectName}.${fieldName}`, settings);
-                  change.metadataName = `${objectName}.${fieldName}`;
-                  change.metadataType = 'FormulaField';
-                }
-              } catch (error) {
-                console.warn(`[Recent Changes] Could not fetch explanation for formula field ${objectName}.${fieldName}:`, error);
-              }
-            }
+          } catch (error) {
+            console.warn(`[Recent Changes] Error enriching ${record.Action}:`, error instanceof Error ? error.message : error);
           }
-        } catch (error) {
-          console.warn(`[Recent Changes] Error generating explanation for ${record.Action}:`, error);
-        }
 
-        return change;
-      })
-    );
+          return change;
+        })
+      );
+      changes.push(...batchResults);
+    }
+
+    console.log(`[Recent Changes] Finished processing ${changes.length} records`);
 
     return res.json({
       count: changes.length,
@@ -563,9 +590,11 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
  *     description: |
  *       Retrieves all validation rules for a Salesforce object and uses AI to analyze them.
  *       Returns a Validation Health summary, rules grouped by functional area, and suggestions
- *       for rules with vague error messages. Org is identified via x-sfdc-org-id header.
+ *       for rules with vague error messages.
  *     tags:
  *       - Monitoring
+ *     security:
+ *       - ApiKeyAuth: []
  *     requestBody:
  *       required: true
  *       content:
