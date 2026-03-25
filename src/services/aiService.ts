@@ -291,6 +291,125 @@ Rules:
   }
 
   /**
+   * Analyze a Permission Set's security posture: what it grants, risks, and best-practice violations.
+   */
+  async analyzePermissionSet(
+    permissionSet: {
+      name: string;
+      label: string;
+      isOwnedByProfile: boolean;
+      profileName: string | null;
+      description: string | null;
+      license: string | null;
+      objectPermissions: Array<{
+        objectName: string;
+        canCreate: boolean;
+        canRead: boolean;
+        canEdit: boolean;
+        canDelete: boolean;
+        viewAllRecords: boolean;
+        modifyAllRecords: boolean;
+      }>;
+      systemPermissions: string[];
+      assignedUserCount: number;
+    },
+    settings: OrgSettings
+  ): Promise<{
+    summary: string;
+    objectAccess: Array<{
+      objectName: string;
+      accessLevel: string;
+      permissions: string[];
+    }>;
+    systemPermissions: string[];
+    risks: Array<{
+      severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+      description: string;
+      recommendation: string;
+    }>;
+    overallRiskLevel: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+  }> {
+    const objectPermsJson = JSON.stringify(permissionSet.objectPermissions, null, 2);
+    const sysPerms = permissionSet.systemPermissions.length > 0
+      ? permissionSet.systemPermissions.join(', ')
+      : 'None';
+
+    const typeLabel = permissionSet.isOwnedByProfile
+      ? `Profile: ${permissionSet.profileName || permissionSet.name}`
+      : `Permission Set: ${permissionSet.label}`;
+
+    const prompt = `You are an expert Salesforce Security Architect performing a Permission Set audit.
+
+${typeLabel}
+${permissionSet.description ? `Description: ${permissionSet.description}` : ''}
+${permissionSet.license ? `License: ${permissionSet.license}` : ''}
+Assigned to ${permissionSet.assignedUserCount} user(s).
+
+OBJECT PERMISSIONS (${permissionSet.objectPermissions.length} objects):
+${objectPermsJson}
+
+SYSTEM PERMISSIONS:
+${sysPerms}
+
+Analyze and respond with a valid JSON object only. No markdown, no code fences, no extra text.
+
+Required structure:
+{
+  "summary": "3-5 sentences summarizing what this permission set grants, its purpose, scope, and overall security posture.",
+  "objectAccess": [
+    {
+      "objectName": "Account",
+      "accessLevel": "Full Access / Read-Write / Read Only / Limited",
+      "permissions": ["Create", "Read", "Edit", "Delete", "ViewAll", "ModifyAll"]
+    }
+  ],
+  "systemPermissions": ["list of enabled system permissions with brief explanation of each"],
+  "risks": [
+    {
+      "severity": "CRITICAL | HIGH | MEDIUM | LOW",
+      "description": "Clear description of the risk",
+      "recommendation": "Actionable recommendation to mitigate"
+    }
+  ],
+  "overallRiskLevel": "CRITICAL | HIGH | MEDIUM | LOW"
+}
+
+Rules:
+- objectAccess: list EVERY object with its effective access level and granted permissions.
+- systemPermissions: for each enabled system permission, provide a one-line explanation of what it allows.
+- risks: identify ALL security concerns. Examples of what to flag:
+  - CRITICAL: ModifyAllData, ViewAllData, ModifyAllRecords on sensitive objects (Opportunity, Contact, Lead, Account, Case), ManageUsers, CustomizeApplication, AuthorApex.
+  - HIGH: Delete on production objects, BulkApiHardDelete, ExportReport on sensitive data, ManageProfilesPermissionsets.
+  - MEDIUM: Broad Edit access across many objects, ViewAllRecords on sensitive objects.
+  - LOW: Minor best-practice deviations.
+- overallRiskLevel: the highest severity found in risks. If no risks, use LOW.
+- If this is a Profile (IsOwnedByProfile=true), note that it grants a baseline set of permissions to all users with that profile.`;
+
+    try {
+      const raw = await this.callLLM(prompt, settings, 'analyzePermissionSet');
+      const cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const parsed = JSON.parse(cleaned) as {
+        summary?: string;
+        objectAccess?: Array<{ objectName: string; accessLevel: string; permissions: string[] }>;
+        systemPermissions?: string[];
+        risks?: Array<{ severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'; description: string; recommendation: string }>;
+        overallRiskLevel?: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+      };
+
+      return {
+        summary: parsed.summary || 'No summary generated.',
+        objectAccess: parsed.objectAccess || [],
+        systemPermissions: parsed.systemPermissions || [],
+        risks: parsed.risks || [],
+        overallRiskLevel: parsed.overallRiskLevel || 'LOW',
+      };
+    } catch (error) {
+      console.error('Error analyzing permission set:', error);
+      throw new Error(`Failed to analyze permission set: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
    * Analyze a batch of permission changes from the same user.
    * All permission types (PermSetAssign, PermSetEnableUserPerm, PermSetEntityPermChanged, etc.)
    * are sent in one call. Output follows the same concise format as Flow summaries.

@@ -380,7 +380,12 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  * @swagger
  * /api/v1/analyze-permission:
  *   post:
- *     summary: Trace User Permissions
+ *     summary: Analyze Permission Set Security
+ *     description: >
+ *       Fetches a Permission Set (or Profile) by name and performs an AI-powered
+ *       security audit. Returns all object access, system permissions, risks,
+ *       and best-practice recommendations — similar to the validation-rule and
+ *       flow analysis endpoints.
  *     tags:
  *       - Security
  *     security:
@@ -392,89 +397,74 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  *           schema:
  *             type: object
  *             required:
- *               - userId
+ *               - permissionSetName
  *             properties:
- *               userId:
+ *               permissionSetName:
  *                 type: string
- *               permissionName:
- *                 type: string
+ *                 description: API Name or Label of the Permission Set (e.g. "Sales_User", "System Administrator")
+ *                 example: Sales_User
+ *     responses:
+ *       200:
+ *         description: AI-powered security analysis of the Permission Set
+ *       400:
+ *         description: Missing permissionSetName
+ *       404:
+ *         description: Permission Set not found
  */
 router.post('/analyze-permission', async (req: Request, res: Response) => {
   try {
     const { tenant } = req as AuthenticatedRequest;
     const orgId = tenant.orgId;
-    const userId = req.query.userId ?? req.body?.userId;
-    const permissionName = req.query.permissionName ?? req.body?.permissionName;
+    const permissionSetName = req.query.permissionSetName ?? req.body?.permissionSetName;
 
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
+    if (!permissionSetName) {
+      return res.status(400).json({
+        error: 'permissionSetName is required',
+        example: { permissionSetName: 'Sales_User' },
+      });
     }
 
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
 
-    if (permissionName) {
-      try {
-        const analysis = await salesforceService.analyzePermissions(orgId, userId, permissionName);
-        return res.json({
-          username: analysis.username,
-          userId: analysis.userId,
-          checkingPermission: analysis.checkingPermission,
-          resolvedLabel: analysis.resolvedLabel,
-          hasAccess: analysis.hasAccess,
-          sources: analysis.sources,
-          explanation: analysis.explanation,
-          riskAnalysis: analysis.riskAnalysis,
-        });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-        if (errorMessage.includes('not found') || errorMessage.includes('User not found')) {
-          return res.status(404).json({ error: errorMessage });
-        }
-        return res.status(500).json({ error: errorMessage });
-      }
+    console.log(`[Analyze Permission] Fetching permission set: "${permissionSetName}"`);
+    const psData = await salesforceService.getPermissionSetForAudit(orgId, String(permissionSetName));
+    console.log(`[Analyze Permission] Found "${psData.label}" with ${psData.objectPermissions.length} object permissions and ${psData.systemPermissions.length} system permissions`);
+
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(500).json({ error: 'Could not load org settings for AI analysis' });
     }
 
-    const conn = await authService.getConnection(orgId);
-    const userQuery = userId.includes('@')
-      ? `SELECT Id, Username, Name, Email FROM User WHERE Username = '${userId.replace(/'/g, "''")}' LIMIT 1`
-      : `SELECT Id, Username, Name, Email FROM User WHERE Id = '${userId.replace(/'/g, "''")}' LIMIT 1`;
-
-    const userResult = await conn.query<any>(userQuery);
-    if (!userResult.records?.length) {
-      return res.status(404).json({ error: `User not found: ${userId}` });
-    }
-
-    const user = userResult.records[0];
-    const permissionSetQuery = `
-      SELECT Id, Name, Label
-      FROM PermissionSetAssignment
-      WHERE AssigneeId = '${user.Id.replace(/'/g, "''")}'
-    `;
-    const permissionSetResult = await conn.query<any>(permissionSetQuery);
-    const permissionSetCount = permissionSetResult.totalSize || 0;
-
-    const profileQuery = `SELECT Id, Name FROM Profile WHERE Id = '${user.Id.replace(/'/g, "''")}' LIMIT 1`;
-    const profileResult = await conn.query<any>(profileQuery);
-
-    let riskAnalysis = 'Low';
-    if (permissionSetCount > 10) riskAnalysis = 'Medium';
-    if (permissionSetCount > 20) riskAnalysis = 'High';
+    const aiService = new AIService();
+    const analysis = await aiService.analyzePermissionSet(psData, settings);
 
     return res.json({
-      username: user.Username,
-      name: user.Name,
-      email: user.Email,
-      userId: user.Id,
-      permissionSets: permissionSetCount,
-      profile: profileResult.records?.[0]?.Name || 'Unknown',
-      riskAnalysis,
+      permissionSet: {
+        id: psData.id,
+        name: psData.name,
+        label: psData.label,
+        isProfile: psData.isOwnedByProfile,
+        profileName: psData.profileName,
+        description: psData.description,
+        license: psData.license,
+        assignedUsers: psData.assignedUserCount,
+      },
+      analysis: {
+        summary: analysis.summary,
+        overallRiskLevel: analysis.overallRiskLevel,
+        objectAccess: analysis.objectAccess,
+        systemPermissions: analysis.systemPermissions,
+        risks: analysis.risks,
+      },
       timestamp: new Date().toISOString(),
-      message: 'No permission specified. Provide permissionName to check specific permissions.',
     });
   } catch (error) {
     console.error('Error in analyze-permission endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    if (errorMessage.includes('not found')) {
+      return res.status(404).json({ error: errorMessage });
+    }
     return res.status(500).json({ error: errorMessage });
   }
 });

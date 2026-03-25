@@ -2385,6 +2385,139 @@ export class SalesforceService {
   }
 
   /**
+   * Fetch a Permission Set by name/label and return all its object permissions
+   * and system permissions for AI-powered security analysis.
+   */
+  async getPermissionSetForAudit(
+    orgId: string,
+    permissionSetName: string
+  ): Promise<{
+    id: string;
+    name: string;
+    label: string;
+    isOwnedByProfile: boolean;
+    profileName: string | null;
+    description: string | null;
+    license: string | null;
+    objectPermissions: Array<{
+      objectName: string;
+      canCreate: boolean;
+      canRead: boolean;
+      canEdit: boolean;
+      canDelete: boolean;
+      viewAllRecords: boolean;
+      modifyAllRecords: boolean;
+    }>;
+    systemPermissions: string[];
+    assignedUserCount: number;
+  }> {
+    const conn = await this.authService.getConnection(orgId);
+    const cleanName = permissionSetName.replace(/'/g, "''").trim();
+
+    // Find the permission set by Name or Label
+    const findSoql = `
+      SELECT Id, Name, Label, IsOwnedByProfile, Profile.Name, Description, License.Name
+      FROM PermissionSet
+      WHERE Name = '${cleanName}' OR Label = '${cleanName}'
+      LIMIT 1
+    `;
+    const findResult = await conn.query<any>(findSoql);
+
+    if (!findResult.records || findResult.records.length === 0) {
+      // Fallback: try LIKE search
+      const likeSoql = `
+        SELECT Id, Name, Label, IsOwnedByProfile, Profile.Name, Description, License.Name
+        FROM PermissionSet
+        WHERE Name LIKE '%${cleanName}%' OR Label LIKE '%${cleanName}%'
+        LIMIT 1
+      `;
+      const likeResult = await conn.query<any>(likeSoql);
+      if (!likeResult.records || likeResult.records.length === 0) {
+        throw new Error(`Permission Set "${permissionSetName}" not found`);
+      }
+      findResult.records = likeResult.records;
+    }
+
+    const ps = findResult.records[0];
+    const psId = ps.Id;
+
+    // Fetch object permissions
+    const objPermSoql = `
+      SELECT SobjectType,
+             PermissionsCreate, PermissionsRead, PermissionsEdit, PermissionsDelete,
+             PermissionsViewAllRecords, PermissionsModifyAllRecords
+      FROM ObjectPermissions
+      WHERE ParentId = '${psId}'
+    `;
+    const objPermResult = await conn.query<any>(objPermSoql);
+
+    const objectPermissions = (objPermResult.records || []).map((r: any) => ({
+      objectName: r.SobjectType,
+      canCreate: !!r.PermissionsCreate,
+      canRead: !!r.PermissionsRead,
+      canEdit: !!r.PermissionsEdit,
+      canDelete: !!r.PermissionsDelete,
+      viewAllRecords: !!r.PermissionsViewAllRecords,
+      modifyAllRecords: !!r.PermissionsModifyAllRecords,
+    }));
+
+    // Fetch system permissions (boolean fields on PermissionSet that are true)
+    const systemPermFields = [
+      'PermissionsModifyAllData', 'PermissionsViewAllData',
+      'PermissionsManageUsers', 'PermissionsCustomizeApplication',
+      'PermissionsViewSetup', 'PermissionsApiEnabled',
+      'PermissionsAuthorApex', 'PermissionsManageDataIntegrations',
+      'PermissionsManageExternalConnections',
+      'PermissionsRunReports', 'PermissionsExportReport',
+      'PermissionsEditReports', 'PermissionsManageDashboards',
+      'PermissionsRunFlow', 'PermissionsFlowUFLRequired',
+      'PermissionsInstallPackaging', 'PermissionsPublishPackaging',
+      'PermissionsBulkApiHardDelete', 'PermissionsResetPasswords',
+      'PermissionsManageProfilesPermissionsets',
+      'PermissionsManageRoles', 'PermissionsManageSharing',
+      'PermissionsManageBusinessHourHolidays',
+      'PermissionsViewAllProfiles',
+    ];
+    const fieldList = ['Id', ...systemPermFields].join(', ');
+    let systemPermissions: string[] = [];
+    try {
+      const sysSoql = `SELECT ${fieldList} FROM PermissionSet WHERE Id = '${psId}' LIMIT 1`;
+      const sysResult = await conn.query<any>(sysSoql);
+      if (sysResult.records && sysResult.records.length > 0) {
+        const rec = sysResult.records[0];
+        systemPermissions = systemPermFields
+          .filter(f => rec[f] === true)
+          .map(f => f.replace(/^Permissions/, ''));
+      }
+    } catch (error) {
+      console.warn('[PermissionSetAudit] Could not fetch system permissions:', error instanceof Error ? error.message : error);
+    }
+
+    // Count assigned users
+    let assignedUserCount = 0;
+    try {
+      const countSoql = `SELECT COUNT() FROM PermissionSetAssignment WHERE PermissionSetId = '${psId}'`;
+      const countResult = await conn.query<any>(countSoql);
+      assignedUserCount = countResult.totalSize || 0;
+    } catch {
+      // non-critical
+    }
+
+    return {
+      id: psId,
+      name: ps.Name,
+      label: ps.Label || ps.Name,
+      isOwnedByProfile: !!ps.IsOwnedByProfile,
+      profileName: ps.Profile?.Name || null,
+      description: ps.Description || null,
+      license: ps.License?.Name || null,
+      objectPermissions,
+      systemPermissions,
+      assignedUserCount,
+    };
+  }
+
+  /**
    * Get all validation rules for an object with full audit fields.
    * Used by analyze-validation-rules endpoint for AI analysis.
    */
