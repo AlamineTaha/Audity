@@ -471,6 +471,90 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
 
 /**
  * @swagger
+ * /api/v1/find-permission-sources:
+ *   post:
+ *     summary: Find Permission Sources
+ *     description: >
+ *       Reverse permission lookup — given a natural-language query like
+ *       "edit Account", "edit Account BillingStreet", or "export reports",
+ *       returns every Permission Set and Profile that grants that access.
+ *       Resolves synonyms (e.g. "Address" → BillingStreet/ShippingStreet,
+ *       "modify" → Edit, "remove" → Delete).
+ *     tags:
+ *       - Security
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - query
+ *             properties:
+ *               query:
+ *                 type: string
+ *                 description: >
+ *                   Natural-language permission query. Examples:
+ *                   "edit Account", "delete Opportunity",
+ *                   "edit Account BillingStreet", "export reports"
+ *                 example: edit Account
+ *     responses:
+ *       200:
+ *         description: List of Permission Sets and Profiles that grant the requested access
+ *       400:
+ *         description: Missing query parameter
+ */
+router.post('/find-permission-sources', async (req: Request, res: Response) => {
+  try {
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
+    const query = req.query.query ?? req.body?.query;
+
+    if (!query) {
+      return res.status(400).json({
+        error: 'query is required',
+        examples: [
+          'edit Account',
+          'delete Opportunity',
+          'edit Account BillingStreet',
+          'export reports',
+        ],
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+
+    console.log(`[Find Permission Sources] Query: "${query}"`);
+    const result = await salesforceService.findPermissionSources(orgId, String(query));
+    console.log(`[Find Permission Sources] Found ${result.sources.length} source(s) for "${result.resolvedQuery}"`);
+
+    return res.json({
+      success: true,
+      originalQuery: query,
+      resolvedQuery: result.resolvedQuery,
+      queryType: result.queryType,
+      resolvedObject: result.resolvedObject || null,
+      resolvedField: result.resolvedField || null,
+      resolvedAction: result.resolvedAction || null,
+      resolvedSystemPermission: result.resolvedSystemPermission || null,
+      sourceCount: result.sources.length,
+      sources: result.sources,
+      displayText: result.displayText,
+    });
+  } catch (error) {
+    console.error('Error in find-permission-sources endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    return res.status(errorMessage.includes('Could not understand') ? 400 : 500).json({
+      error: errorMessage,
+    });
+  }
+});
+
+/**
+ * @swagger
  * /api/v1/explain-metadata:
  *   post:
  *     summary: Explain Validation Rule or Formula Field
