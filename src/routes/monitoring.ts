@@ -128,6 +128,7 @@ router.post('/clear-audit-cache', async (_req: Request, res: Response) => {
  *     description: Manually triggers the polling engine to check all registered orgs for changes.
  *     tags:
  *       - Monitoring
+ *     security: []
  *     requestBody:
  *       required: false
  *       content:
@@ -240,15 +241,15 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
 
     const extractValidationRuleName = (display: string): string | null => {
       const patterns = [
+        /validation\s+["']([^"']+)["']/i,
+        /"([^"]+)"(?:\s+validation|$)/i,
         /(?:ValidationRule|Validation Rule):\s*(.+?)(?:\s|$)/i,
         /validation rule\s+(.+?)(?:\s|$)/i,
-        /validation\s+["']([^"']+)["']/i,
         /rule\s+["']?([^"'\s]+)["']?/i,
-        /"([^"]+)"(?:\s+validation|$)/i,
       ];
       for (const pattern of patterns) {
         const match = display.match(pattern);
-        if (match?.[1]) return match[1].trim();
+        if (match?.[1]) return match[1].replace(/^["']+|["']+$/g, '').trim();
       }
       return null;
     };
@@ -280,62 +281,88 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
       return null;
     };
 
-    const changes = await Promise.all(
-      auditRecords.map(async (record) => {
-        const change: any = {
-          action: record.Action,
-          user: record.CreatedBy.Name,
-          section: record.Section,
-          timestamp: record.CreatedDate,
-          display: record.Display,
-          id: record.Id,
-        };
+    const CONCURRENCY = 3;
+    const PER_RECORD_TIMEOUT_MS = 15_000;
+    const changes: any[] = [];
 
-        try {
-          if (isValidationAction(record.Action)) {
-            const ruleName = extractValidationRuleName(record.Display || '');
-            if (ruleName) {
-              try {
-                const validationMetadata = await salesforceService.getValidationRuleMetadata(orgId, ruleName);
-                if (validationMetadata) {
-                  const metadata = {
-                    errorConditionFormula: validationMetadata.errorConditionFormula,
-                    id: validationMetadata.id,
-                  };
-                  change.explanation = await aiService.interpretMetadataChange(metadata, 'ValidationRule', ruleName, settings);
-                  change.metadataName = ruleName;
-                  change.metadataType = 'ValidationRule';
-                }
-              } catch (error) {
-                console.warn(`[Recent Changes] Could not fetch explanation for validation rule ${ruleName}:`, error);
+    const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
+      Promise.race([
+        promise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+      ]);
+
+    for (let i = 0; i < auditRecords.length; i += CONCURRENCY) {
+      const batch = auditRecords.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map(async (record) => {
+          const change: any = {
+            action: record.Action,
+            user: record.CreatedBy.Name,
+            section: record.Section,
+            timestamp: record.CreatedDate,
+            display: record.Display,
+            id: record.Id,
+          };
+
+          try {
+            if (isValidationAction(record.Action)) {
+              const ruleName = extractValidationRuleName(record.Display || '');
+              if (ruleName) {
+                const enriched = await withTimeout(
+                  (async () => {
+                    const validationMetadata = await salesforceService.getValidationRuleMetadata(orgId, ruleName);
+                    if (validationMetadata) {
+                      const metadata = {
+                        errorConditionFormula: validationMetadata.errorConditionFormula,
+                        id: validationMetadata.id,
+                      };
+                      return {
+                        explanation: await aiService.interpretMetadataChange(metadata, 'ValidationRule', ruleName, settings),
+                        metadataName: ruleName,
+                        metadataType: 'ValidationRule',
+                      };
+                    }
+                    return null;
+                  })(),
+                  PER_RECORD_TIMEOUT_MS
+                );
+                if (enriched) Object.assign(change, enriched);
+              }
+            } else if (isFormulaFieldAction(record.Action)) {
+              const fieldName = extractFieldName(record.Display || '');
+              const objectName = extractObjectNameFromSection(record.Section || '') ||
+                (record.Display?.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/)?.[1]) ||
+                'Unknown';
+
+              if (fieldName && objectName !== 'Unknown') {
+                const enriched = await withTimeout(
+                  (async () => {
+                    const formulaMetadata = await salesforceService.getFormulaFieldMetadata(orgId, fieldName, objectName);
+                    if (formulaMetadata) {
+                      return {
+                        explanation: await aiService.interpretMetadataChange(formulaMetadata, 'FormulaField', `${objectName}.${fieldName}`, settings),
+                        metadataName: `${objectName}.${fieldName}`,
+                        metadataType: 'FormulaField',
+                      };
+                    }
+                    return null;
+                  })(),
+                  PER_RECORD_TIMEOUT_MS
+                );
+                if (enriched) Object.assign(change, enriched);
               }
             }
-          } else if (isFormulaFieldAction(record.Action)) {
-            const fieldName = extractFieldName(record.Display || '');
-            const objectName = extractObjectNameFromSection(record.Section || '') ||
-              (record.Display?.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/)?.[1]) ||
-              'Unknown';
-
-            if (fieldName && objectName !== 'Unknown') {
-              try {
-                const formulaMetadata = await salesforceService.getFormulaFieldMetadata(orgId, fieldName, objectName);
-                if (formulaMetadata) {
-                  change.explanation = await aiService.interpretMetadataChange(formulaMetadata, 'FormulaField', `${objectName}.${fieldName}`, settings);
-                  change.metadataName = `${objectName}.${fieldName}`;
-                  change.metadataType = 'FormulaField';
-                }
-              } catch (error) {
-                console.warn(`[Recent Changes] Could not fetch explanation for formula field ${objectName}.${fieldName}:`, error);
-              }
-            }
+          } catch (error) {
+            console.warn(`[Recent Changes] Error enriching ${record.Action}:`, error instanceof Error ? error.message : error);
           }
-        } catch (error) {
-          console.warn(`[Recent Changes] Error generating explanation for ${record.Action}:`, error);
-        }
 
-        return change;
-      })
-    );
+          return change;
+        })
+      );
+      changes.push(...batchResults);
+    }
+
+    console.log(`[Recent Changes] Finished processing ${changes.length} records`);
 
     return res.json({
       count: changes.length,
@@ -353,7 +380,12 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  * @swagger
  * /api/v1/analyze-permission:
  *   post:
- *     summary: Trace User Permissions
+ *     summary: Analyze Permission Set Security
+ *     description: >
+ *       Fetches a Permission Set (or Profile) by name and performs an AI-powered
+ *       security audit. Returns all object access, system permissions, risks,
+ *       and best-practice recommendations — similar to the validation-rule and
+ *       flow analysis endpoints.
  *     tags:
  *       - Security
  *     security:
@@ -365,90 +397,159 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
  *           schema:
  *             type: object
  *             required:
- *               - userId
+ *               - permissionSetName
  *             properties:
- *               userId:
+ *               permissionSetName:
  *                 type: string
- *               permissionName:
- *                 type: string
+ *                 description: API Name or Label of the Permission Set (e.g. "Sales_User", "System Administrator")
+ *                 example: Sales_User
+ *     responses:
+ *       200:
+ *         description: AI-powered security analysis of the Permission Set
+ *       400:
+ *         description: Missing permissionSetName
+ *       404:
+ *         description: Permission Set not found
  */
 router.post('/analyze-permission', async (req: Request, res: Response) => {
   try {
     const { tenant } = req as AuthenticatedRequest;
     const orgId = tenant.orgId;
-    const userId = req.query.userId ?? req.body?.userId;
-    const permissionName = req.query.permissionName ?? req.body?.permissionName;
+    const permissionSetName = req.query.permissionSetName ?? req.body?.permissionSetName;
 
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
+    if (!permissionSetName) {
+      return res.status(400).json({
+        error: 'permissionSetName is required',
+        example: { permissionSetName: 'Sales_User' },
+      });
     }
 
     const authService = new SalesforceAuthService();
     const salesforceService = new SalesforceService(authService);
 
-    if (permissionName) {
-      try {
-        const analysis = await salesforceService.analyzePermissions(orgId, userId, permissionName);
-        return res.json({
-          username: analysis.username,
-          userId: analysis.userId,
-          checkingPermission: analysis.checkingPermission,
-          resolvedLabel: analysis.resolvedLabel,
-          hasAccess: analysis.hasAccess,
-          sources: analysis.sources,
-          explanation: analysis.explanation,
-          riskAnalysis: analysis.riskAnalysis,
-        });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-        if (errorMessage.includes('not found') || errorMessage.includes('User not found')) {
-          return res.status(404).json({ error: errorMessage });
-        }
-        return res.status(500).json({ error: errorMessage });
-      }
+    console.log(`[Analyze Permission] Fetching permission set: "${permissionSetName}"`);
+    const psData = await salesforceService.getPermissionSetForAudit(orgId, String(permissionSetName));
+    console.log(`[Analyze Permission] Found "${psData.label}" with ${psData.objectPermissions.length} object permissions and ${psData.systemPermissions.length} system permissions`);
+
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(500).json({ error: 'Could not load org settings for AI analysis' });
     }
 
-    const conn = await authService.getConnection(orgId);
-    const userQuery = userId.includes('@')
-      ? `SELECT Id, Username, Name, Email FROM User WHERE Username = '${userId.replace(/'/g, "''")}' LIMIT 1`
-      : `SELECT Id, Username, Name, Email FROM User WHERE Id = '${userId.replace(/'/g, "''")}' LIMIT 1`;
-
-    const userResult = await conn.query<any>(userQuery);
-    if (!userResult.records?.length) {
-      return res.status(404).json({ error: `User not found: ${userId}` });
-    }
-
-    const user = userResult.records[0];
-    const permissionSetQuery = `
-      SELECT Id, Name, Label
-      FROM PermissionSetAssignment
-      WHERE AssigneeId = '${user.Id.replace(/'/g, "''")}'
-    `;
-    const permissionSetResult = await conn.query<any>(permissionSetQuery);
-    const permissionSetCount = permissionSetResult.totalSize || 0;
-
-    const profileQuery = `SELECT Id, Name FROM Profile WHERE Id = '${user.Id.replace(/'/g, "''")}' LIMIT 1`;
-    const profileResult = await conn.query<any>(profileQuery);
-
-    let riskAnalysis = 'Low';
-    if (permissionSetCount > 10) riskAnalysis = 'Medium';
-    if (permissionSetCount > 20) riskAnalysis = 'High';
+    const aiService = new AIService();
+    const analysis = await aiService.analyzePermissionSet(psData, settings);
 
     return res.json({
-      username: user.Username,
-      name: user.Name,
-      email: user.Email,
-      userId: user.Id,
-      permissionSets: permissionSetCount,
-      profile: profileResult.records?.[0]?.Name || 'Unknown',
-      riskAnalysis,
+      permissionSet: {
+        id: psData.id,
+        name: psData.name,
+        label: psData.label,
+        isProfile: psData.isOwnedByProfile,
+        profileName: psData.profileName,
+        description: psData.description,
+        license: psData.license,
+        assignedUsers: psData.assignedUserCount,
+      },
+      analysis: {
+        summary: analysis.summary,
+        overallRiskLevel: analysis.overallRiskLevel,
+        objectAccess: analysis.objectAccess,
+        systemPermissions: analysis.systemPermissions,
+        risks: analysis.risks,
+      },
       timestamp: new Date().toISOString(),
-      message: 'No permission specified. Provide permissionName to check specific permissions.',
     });
   } catch (error) {
     console.error('Error in analyze-permission endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    if (errorMessage.includes('not found')) {
+      return res.status(404).json({ error: errorMessage });
+    }
     return res.status(500).json({ error: errorMessage });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/find-permission-sources:
+ *   post:
+ *     summary: Find Permission Sources
+ *     description: >
+ *       Reverse permission lookup — given a natural-language query like
+ *       "edit Account", "edit Account BillingStreet", or "export reports",
+ *       returns every Permission Set and Profile that grants that access.
+ *       Resolves synonyms (e.g. "Address" → BillingStreet/ShippingStreet,
+ *       "modify" → Edit, "remove" → Delete).
+ *     tags:
+ *       - Security
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - query
+ *             properties:
+ *               query:
+ *                 type: string
+ *                 description: >
+ *                   Natural-language permission query. Examples:
+ *                   "edit Account", "delete Opportunity",
+ *                   "edit Account BillingStreet", "export reports"
+ *                 example: edit Account
+ *     responses:
+ *       200:
+ *         description: List of Permission Sets and Profiles that grant the requested access
+ *       400:
+ *         description: Missing query parameter
+ */
+router.post('/find-permission-sources', async (req: Request, res: Response) => {
+  try {
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
+    const query = req.query.query ?? req.body?.query;
+
+    if (!query) {
+      return res.status(400).json({
+        error: 'query is required',
+        examples: [
+          'edit Account',
+          'delete Opportunity',
+          'edit Account BillingStreet',
+          'export reports',
+        ],
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+
+    console.log(`[Find Permission Sources] Query: "${query}"`);
+    const result = await salesforceService.findPermissionSources(orgId, String(query));
+    console.log(`[Find Permission Sources] Found ${result.sources.length} source(s) for "${result.resolvedQuery}"`);
+
+    return res.json({
+      success: true,
+      originalQuery: query,
+      resolvedQuery: result.resolvedQuery,
+      queryType: result.queryType,
+      resolvedObject: result.resolvedObject || null,
+      resolvedField: result.resolvedField || null,
+      resolvedAction: result.resolvedAction || null,
+      resolvedSystemPermission: result.resolvedSystemPermission || null,
+      sourceCount: result.sources.length,
+      sources: result.sources,
+      displayText: result.displayText,
+    });
+  } catch (error) {
+    console.error('Error in find-permission-sources endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    return res.status(errorMessage.includes('Could not understand') ? 400 : 500).json({
+      error: errorMessage,
+    });
   }
 });
 
@@ -563,9 +664,11 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
  *     description: |
  *       Retrieves all validation rules for a Salesforce object and uses AI to analyze them.
  *       Returns a Validation Health summary, rules grouped by functional area, and suggestions
- *       for rules with vague error messages. Org is identified via x-sfdc-org-id header.
+ *       for rules with vague error messages.
  *     tags:
  *       - Monitoring
+ *     security:
+ *       - ApiKeyAuth: []
  *     requestBody:
  *       required: true
  *       content:

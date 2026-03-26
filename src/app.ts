@@ -12,7 +12,7 @@ dotenv.config();
 import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import swaggerJsdoc from 'swagger-jsdoc';
-import swaggerUi from 'swagger-ui-express';
+// swagger-ui-express replaced with self-contained HTML (fixes response rendering bug)
 import agentforceRoutes from './routes/agentforce';
 import authRoutes from './routes/auth';
 import monitoringRoutes from './routes/monitoring';
@@ -20,8 +20,17 @@ import { tenantAuth } from './middleware/tenantAuth';
 
 const app: Express = express();
 
+app.set('etag', false);
+
 // ---- Global middleware ----
 app.use(cors());
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  next();
+});
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -38,13 +47,14 @@ app.use((err: Error, _req: Request, res: Response, next: NextFunction) => {
 });
 
 // ---- Endpoints that do NOT require tenant authentication ----
+// Paths are relative to the /api/v1 mount point (req.path strips the prefix)
 const PUBLIC_PATHS = new Set([
-  'GET:/api/v1/health',
-  'GET:/api/v1/test-oauth-config',
-  'POST:/api/v1/test-gemini',
-  'POST:/api/v1/trigger-check',
-  'POST:/api/v1/slack-invite',
-  'POST:/api/v1/clear-audit-cache',
+  'GET:/health',
+  'GET:/test-oauth-config',
+  'POST:/test-gemini',
+  'POST:/trigger-check',
+  'POST:/slack-invite',
+  'POST:/clear-audit-cache',
 ]);
 
 function conditionalTenantAuth(req: Request, res: Response, next: NextFunction): void {
@@ -65,8 +75,12 @@ const swaggerOptions: swaggerJsdoc.Options = {
       version: '2.0.0',
       description:
         'Multi-tenant Salesforce automation change monitoring service with AI-powered diff analysis.\n\n' +
-        '**Authentication:** All protected endpoints require an `X-API-Key` header. ' +
-        'Obtain your API key by completing the OAuth flow at `/auth/authorize`.',
+        '## Authentication\n' +
+        '1. Open `/auth/authorize` **in a new browser tab** (not via "Try it out" — the OAuth redirect cannot work inside Swagger).\n' +
+        '2. Complete the Salesforce login and authorize the app.\n' +
+        '3. Copy the `apiKey` from the JSON response on the callback page.\n' +
+        '4. Click the **Authorize** button above, paste the key, and click **Authorize**.\n' +
+        '5. All protected endpoints will now include your `X-API-Key` header automatically.',
       contact: { name: 'AuditDelta Support' },
     },
     servers: [
@@ -82,6 +96,7 @@ const swaggerOptions: swaggerJsdoc.Options = {
       { name: 'Monitoring', description: 'Proactive monitoring and change detection endpoints' },
       { name: 'Security', description: 'Security and permission analysis endpoints' },
     ],
+    security: [{ ApiKeyAuth: [] }],
     components: {
       securitySchemes: {
         ApiKeyAuth: {
@@ -142,19 +157,49 @@ app.use('/api/v1', conditionalTenantAuth);
 app.use('/api/v1', agentforceRoutes);
 app.use('/api/v1', monitoringRoutes);
 
-// Swagger UI
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+// Swagger UI — served as self-contained HTML to avoid swagger-ui-express rendering issues
 app.get('/api-docs/swagger.json', (_req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  res.send(swaggerSpec);
+  res.json(swaggerSpec);
 });
 app.get('/openapi.json', (_req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  res.send(swaggerSpec);
+  res.json(swaggerSpec);
 });
 app.get('/swagger.json', (_req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  res.send(swaggerSpec);
+  res.json(swaggerSpec);
+});
+app.get('/api-docs', (_req, res) => {
+  const serverUrl = process.env.API_BASE_URL || `${_req.protocol}://${_req.get('host')}`;
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AuditDelta API Docs</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+  <style>html{box-sizing:border-box}*,*:before,*:after{box-sizing:inherit}body{margin:0;background:#fafafa}</style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: "${serverUrl}/api-docs/swagger.json",
+      dom_id: "#swagger-ui",
+      deepLinking: true,
+      persistAuthorization: true,
+      tryItOutEnabled: true,
+      filter: true,
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+      plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+      layout: "StandaloneLayout",
+      responseInterceptor: function(response) {
+        console.log("[Swagger] Response:", response.status, response.url);
+        return response;
+      }
+    });
+  </script>
+</body>
+</html>`);
 });
 
 // Root endpoint

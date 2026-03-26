@@ -2335,32 +2335,33 @@ export class SalesforceService {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
+    const cleanName = validationRuleName.replace(/^["']+|["']+$/g, '').trim();
+
     try {
-      // Use ValidationName field for exact match (more reliable than FullName)
-      // LIMIT 1 is required when querying Metadata field in Tooling API
       const soql = `
         SELECT Id, FullName, Metadata
         FROM ValidationRule
-        WHERE ValidationName = '${validationRuleName.replace(/'/g, "''")}'
+        WHERE ValidationName = '${cleanName.replace(/'/g, "''")}'
         LIMIT 1
       `;
 
       const result = await tooling.query<any>(soql);
 
       if (!result.records || result.records.length === 0) {
-        // Fallback: try FullName if ValidationName didn't work
-        const fallbackSoql = `
+        // FullName cannot be filtered in a WHERE clause for ValidationRule,
+        // so fall back to a LIKE query on ValidationName for partial matches
+        const likeSoql = `
           SELECT Id, FullName, Metadata
           FROM ValidationRule
-          WHERE FullName = '${validationRuleName.replace(/'/g, "''")}'
+          WHERE ValidationName LIKE '%${cleanName.replace(/'/g, "''").replace(/%/g, '\\%')}%'
           LIMIT 1
         `;
-        const fallbackResult = await tooling.query<any>(fallbackSoql);
-        
+        const fallbackResult = await tooling.query<any>(likeSoql);
+
         if (!fallbackResult.records || fallbackResult.records.length === 0) {
           return null;
         }
-        
+
         const metadata = fallbackResult.records[0].Metadata || {};
         return {
           id: fallbackResult.records[0].Id,
@@ -2378,9 +2379,355 @@ export class SalesforceService {
         errorMessage: metadata.errorMessage || '',
       };
     } catch (error) {
-      console.error(`Error fetching validation rule metadata for ${validationRuleName}:`, error);
+      console.error(`Error fetching validation rule metadata for "${cleanName}":`, error);
       throw error;
     }
+  }
+
+  /**
+   * Fetch a Permission Set by name/label and return all its object permissions
+   * and system permissions for AI-powered security analysis.
+   */
+  async getPermissionSetForAudit(
+    orgId: string,
+    permissionSetName: string
+  ): Promise<{
+    id: string;
+    name: string;
+    label: string;
+    isOwnedByProfile: boolean;
+    profileName: string | null;
+    description: string | null;
+    license: string | null;
+    objectPermissions: Array<{
+      objectName: string;
+      canCreate: boolean;
+      canRead: boolean;
+      canEdit: boolean;
+      canDelete: boolean;
+      viewAllRecords: boolean;
+      modifyAllRecords: boolean;
+    }>;
+    systemPermissions: string[];
+    assignedUserCount: number;
+  }> {
+    const conn = await this.authService.getConnection(orgId);
+    const cleanName = permissionSetName.replace(/'/g, "''").trim();
+
+    // Find the permission set by Name or Label
+    const findSoql = `
+      SELECT Id, Name, Label, IsOwnedByProfile, Profile.Name, Description, License.Name
+      FROM PermissionSet
+      WHERE Name = '${cleanName}' OR Label = '${cleanName}'
+      LIMIT 1
+    `;
+    const findResult = await conn.query<any>(findSoql);
+
+    if (!findResult.records || findResult.records.length === 0) {
+      // Fallback: try LIKE search
+      const likeSoql = `
+        SELECT Id, Name, Label, IsOwnedByProfile, Profile.Name, Description, License.Name
+        FROM PermissionSet
+        WHERE Name LIKE '%${cleanName}%' OR Label LIKE '%${cleanName}%'
+        LIMIT 1
+      `;
+      const likeResult = await conn.query<any>(likeSoql);
+      if (!likeResult.records || likeResult.records.length === 0) {
+        throw new Error(`Permission Set "${permissionSetName}" not found`);
+      }
+      findResult.records = likeResult.records;
+    }
+
+    const ps = findResult.records[0];
+    const psId = ps.Id;
+
+    // Fetch object permissions
+    const objPermSoql = `
+      SELECT SobjectType,
+             PermissionsCreate, PermissionsRead, PermissionsEdit, PermissionsDelete,
+             PermissionsViewAllRecords, PermissionsModifyAllRecords
+      FROM ObjectPermissions
+      WHERE ParentId = '${psId}'
+    `;
+    const objPermResult = await conn.query<any>(objPermSoql);
+
+    const objectPermissions = (objPermResult.records || []).map((r: any) => ({
+      objectName: r.SobjectType,
+      canCreate: !!r.PermissionsCreate,
+      canRead: !!r.PermissionsRead,
+      canEdit: !!r.PermissionsEdit,
+      canDelete: !!r.PermissionsDelete,
+      viewAllRecords: !!r.PermissionsViewAllRecords,
+      modifyAllRecords: !!r.PermissionsModifyAllRecords,
+    }));
+
+    // Fetch system permissions (boolean fields on PermissionSet that are true)
+    const systemPermFields = [
+      'PermissionsModifyAllData', 'PermissionsViewAllData',
+      'PermissionsManageUsers', 'PermissionsCustomizeApplication',
+      'PermissionsViewSetup', 'PermissionsApiEnabled',
+      'PermissionsAuthorApex', 'PermissionsManageDataIntegrations',
+      'PermissionsManageExternalConnections',
+      'PermissionsRunReports', 'PermissionsExportReport',
+      'PermissionsEditReports', 'PermissionsManageDashboards',
+      'PermissionsRunFlow', 'PermissionsFlowUFLRequired',
+      'PermissionsInstallPackaging', 'PermissionsPublishPackaging',
+      'PermissionsBulkApiHardDelete', 'PermissionsResetPasswords',
+      'PermissionsManageProfilesPermissionsets',
+      'PermissionsManageRoles', 'PermissionsManageSharing',
+      'PermissionsManageBusinessHourHolidays',
+      'PermissionsViewAllProfiles',
+    ];
+    const fieldList = ['Id', ...systemPermFields].join(', ');
+    let systemPermissions: string[] = [];
+    try {
+      const sysSoql = `SELECT ${fieldList} FROM PermissionSet WHERE Id = '${psId}' LIMIT 1`;
+      const sysResult = await conn.query<any>(sysSoql);
+      if (sysResult.records && sysResult.records.length > 0) {
+        const rec = sysResult.records[0];
+        systemPermissions = systemPermFields
+          .filter(f => rec[f] === true)
+          .map(f => f.replace(/^Permissions/, ''));
+      }
+    } catch (error) {
+      console.warn('[PermissionSetAudit] Could not fetch system permissions:', error instanceof Error ? error.message : error);
+    }
+
+    // Count assigned users
+    let assignedUserCount = 0;
+    try {
+      const countSoql = `SELECT COUNT() FROM PermissionSetAssignment WHERE PermissionSetId = '${psId}'`;
+      const countResult = await conn.query<any>(countSoql);
+      assignedUserCount = countResult.totalSize || 0;
+    } catch {
+      // non-critical
+    }
+
+    return {
+      id: psId,
+      name: ps.Name,
+      label: ps.Label || ps.Name,
+      isOwnedByProfile: !!ps.IsOwnedByProfile,
+      profileName: ps.Profile?.Name || null,
+      description: ps.Description || null,
+      license: ps.License?.Name || null,
+      objectPermissions,
+      systemPermissions,
+      assignedUserCount,
+    };
+  }
+
+  /**
+   * Reverse permission lookup: given a natural-language query like
+   * "edit accounts" or "edit account address", find every Permission Set
+   * (and Profile) that grants that access.
+   *
+   * Supports three query shapes:
+   *   - Object CRUD:  "edit Account"        → ObjectPermissions
+   *   - Field-level:  "edit Account Address" → FieldPermissions (resolves synonyms)
+   *   - System perm:  "export reports"       → PermissionSet boolean fields
+   */
+  async findPermissionSources(
+    orgId: string,
+    query: string
+  ): Promise<{
+    resolvedQuery: string;
+    queryType: 'ObjectPermission' | 'FieldPermission' | 'SystemPermission';
+    resolvedObject?: string;
+    resolvedField?: string;
+    resolvedAction?: string;
+    resolvedSystemPermission?: string;
+    sources: Array<{
+      name: string;
+      label: string;
+      isProfile: boolean;
+      profileName: string | null;
+    }>;
+    displayText: string;
+  }> {
+    const conn = await this.authService.getConnection(orgId);
+
+    let cleaned = query.trim();
+    cleaned = cleaned.replace(/^(permissions?\s+(that\s+)?(gives?|allows?|lets?|grants?)\s+(me\s+|us\s+|the\s+)?(the\s+)?(right|ability|access)\s+to\s+)/i, '');
+    cleaned = cleaned.replace(/\?+$/, '').trim();
+
+    const actionAliases: Record<string, string> = {
+      read: 'Read', view: 'Read', see: 'Read', access: 'Read',
+      create: 'Create', add: 'Create', new: 'Create', insert: 'Create',
+      edit: 'Edit', update: 'Edit', modify: 'Edit', change: 'Edit', write: 'Edit',
+      delete: 'Delete', remove: 'Delete', erase: 'Delete',
+      viewall: 'ViewAllRecords', 'view all': 'ViewAllRecords',
+      modifyall: 'ModifyAllRecords', 'modify all': 'ModifyAllRecords',
+    };
+
+    // Try three-part match: "action object field"
+    const threePartMatch = cleaned.match(/^(\w+)\s+(\w[\w\s]*?)\s+(\w+)$/i);
+    // Try two-part match: "action object"
+    const twoPartMatch = cleaned.match(/^(\w+)\s+(\w[\w\s]*)$/i);
+
+    // ── 1. Field Permission path ──
+    if (threePartMatch) {
+      const rawAction = threePartMatch[1].toLowerCase();
+      const rawObject = threePartMatch[2].trim();
+      const rawField = threePartMatch[3].trim();
+      const mappedAction = actionAliases[rawAction];
+
+      if (mappedAction) {
+        const resolvedObject = await this.resolveObjectName(conn, rawObject);
+        if (resolvedObject) {
+          const resolvedField = await this.resolveFieldName(conn, resolvedObject.apiName, rawField);
+          if (resolvedField) {
+            const permField = mappedAction === 'Read' ? 'PermissionsRead' : 'PermissionsEdit';
+            const soql = `
+              SELECT Parent.Name, Parent.Label, Parent.IsOwnedByProfile, Parent.Profile.Name
+              FROM FieldPermissions
+              WHERE SobjectType = '${resolvedObject.apiName}'
+                AND Field = '${resolvedObject.apiName}.${resolvedField.apiName}'
+                AND ${permField} = true
+            `;
+
+            const result = await conn.query<any>(soql);
+            const sources = (result.records || []).map((r: any) => ({
+              name: r.Parent?.Name || 'Unknown',
+              label: r.Parent?.Label || r.Parent?.Name || 'Unknown',
+              isProfile: !!r.Parent?.IsOwnedByProfile,
+              profileName: r.Parent?.Profile?.Name || null,
+            }));
+
+            const profiles = sources.filter(s => s.isProfile);
+            const permSets = sources.filter(s => !s.isProfile);
+
+            let displayText = `${sources.length} Permission Source(s) can ${rawAction} the "${resolvedField.label}" field on ${resolvedObject.label}.\n\n`;
+            if (profiles.length > 0) {
+              displayText += `Profiles:\n${profiles.map(p => `  - ${p.profileName || p.label}`).join('\n')}\n\n`;
+            }
+            if (permSets.length > 0) {
+              displayText += `Permission Sets:\n${permSets.map(p => `  - ${p.label}`).join('\n')}`;
+            }
+            if (sources.length === 0) {
+              displayText = `No Permission Set or Profile grants "${rawAction}" access to the "${resolvedField.label}" field on ${resolvedObject.label}.`;
+            }
+
+            return {
+              resolvedQuery: `${mappedAction} ${resolvedObject.apiName}.${resolvedField.apiName}`,
+              queryType: 'FieldPermission',
+              resolvedObject: resolvedObject.apiName,
+              resolvedField: resolvedField.apiName,
+              resolvedAction: mappedAction,
+              sources,
+              displayText,
+            };
+          }
+        }
+      }
+    }
+
+    // ── 2. Object Permission path ──
+    if (twoPartMatch) {
+      const rawAction = twoPartMatch[1].toLowerCase();
+      const rawObject = twoPartMatch[2].trim();
+      const mappedAction = actionAliases[rawAction];
+
+      if (mappedAction) {
+        const resolvedObject = await this.resolveObjectName(conn, rawObject);
+        if (resolvedObject) {
+          const permCol = `Permissions${mappedAction}`;
+          const soql = `
+            SELECT ParentId, Parent.Name, Parent.Label, Parent.IsOwnedByProfile, Parent.Profile.Name
+            FROM ObjectPermissions
+            WHERE SobjectType = '${resolvedObject.apiName}'
+              AND ${permCol} = true
+          `;
+
+          const result = await conn.query<any>(soql);
+          const sources = (result.records || []).map((r: any) => ({
+            name: r.Parent?.Name || 'Unknown',
+            label: r.Parent?.Label || r.Parent?.Name || 'Unknown',
+            isProfile: !!r.Parent?.IsOwnedByProfile,
+            profileName: r.Parent?.Profile?.Name || null,
+          }));
+
+          const profiles = sources.filter(s => s.isProfile);
+          const permSets = sources.filter(s => !s.isProfile);
+
+          let displayText = `${sources.length} Permission Source(s) can ${rawAction} ${resolvedObject.label} records.\n\n`;
+          if (profiles.length > 0) {
+            displayText += `Profiles:\n${profiles.map(p => `  - ${p.profileName || p.label}`).join('\n')}\n\n`;
+          }
+          if (permSets.length > 0) {
+            displayText += `Permission Sets:\n${permSets.map(p => `  - ${p.label}`).join('\n')}`;
+          }
+          if (sources.length === 0) {
+            displayText = `No Permission Set or Profile grants "${rawAction}" access to ${resolvedObject.label}.`;
+          }
+
+          return {
+            resolvedQuery: `${mappedAction} ${resolvedObject.apiName}`,
+            queryType: 'ObjectPermission',
+            resolvedObject: resolvedObject.apiName,
+            resolvedAction: mappedAction,
+            sources,
+            displayText,
+          };
+        }
+      }
+    }
+
+    // ── 3. System Permission path (fallback) ──
+    const resolvedPerm = await this.resolveSystemPermissionField(conn, cleaned);
+    if (resolvedPerm && !('error' in resolvedPerm)) {
+      const soql = `
+        SELECT Id, Name, Label, IsOwnedByProfile, Profile.Name
+        FROM PermissionSet
+        WHERE ${resolvedPerm.apiName} = true
+      `;
+      const result = await conn.query<any>(soql);
+      const sources = (result.records || []).map((r: any) => ({
+        name: r.Name || 'Unknown',
+        label: r.Label || r.Name || 'Unknown',
+        isProfile: !!r.IsOwnedByProfile,
+        profileName: r.Profile?.Name || null,
+      }));
+
+      const profiles = sources.filter(s => s.isProfile);
+      const permSets = sources.filter(s => !s.isProfile);
+
+      let displayText = `${sources.length} Permission Source(s) have the "${resolvedPerm.label}" system permission.\n\n`;
+      if (profiles.length > 0) {
+        displayText += `Profiles:\n${profiles.map(p => `  - ${p.profileName || p.label}`).join('\n')}\n\n`;
+      }
+      if (permSets.length > 0) {
+        displayText += `Permission Sets:\n${permSets.map(p => `  - ${p.label}`).join('\n')}`;
+      }
+      if (sources.length === 0) {
+        displayText = `No Permission Set or Profile has the "${resolvedPerm.label}" system permission enabled.`;
+      }
+
+      return {
+        resolvedQuery: resolvedPerm.apiName,
+        queryType: 'SystemPermission',
+        resolvedSystemPermission: resolvedPerm.apiName,
+        sources,
+        displayText,
+      };
+    }
+
+    // If ambiguous system permission
+    if (resolvedPerm && 'error' in resolvedPerm) {
+      const ambiguousList = resolvedPerm.ambiguousMatches
+        .map(m => `"${m.label}" (${m.apiName})`)
+        .join(', ');
+      throw new Error(
+        `${resolvedPerm.error} Found: ${ambiguousList}. Please be more specific.`
+      );
+    }
+
+    throw new Error(
+      `Could not understand "${query}". Try formats like:\n` +
+      `  - "edit Account" (object permission)\n` +
+      `  - "edit Account BillingStreet" (field permission)\n` +
+      `  - "export reports" (system permission)`
+    );
   }
 
   /**

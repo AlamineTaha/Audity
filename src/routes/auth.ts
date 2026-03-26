@@ -16,14 +16,18 @@ const authService = new SalesforceAuthService();
  *   get:
  *     summary: Initiate OAuth 2.0 authorization flow
  *     description: |
+ *       **⚠️ Open this URL in a new browser tab — "Try it out" will not work because this endpoint returns a 302 redirect to Salesforce.**
+ *
  *       Redirects to Salesforce OAuth authorization page. After the user authorizes,
  *       Salesforce redirects back to /auth/callback with an authorization code.
+ *       The callback response contains your one-time API key.
  *
  *       **Billing Modes:**
  *       - PERSONAL: Uses Gemini API with API key (default)
  *       - ENTERPRISE: Uses Vertex AI with customer billing (requires gcpProjectId)
  *     tags:
  *       - Auth
+ *     security: []
  *     parameters:
  *       - in: query
  *         name: billingMode
@@ -78,6 +82,7 @@ router.get('/authorize', async (req: Request, res: Response) => {
  *       Use it in the `X-API-Key` header for all subsequent API requests.
  *     tags:
  *       - Auth
+ *     security: []
  *     parameters:
  *       - in: query
  *         name: code
