@@ -898,20 +898,21 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
     const older = versions.versionA.version < versions.versionB.version ? versions.versionA : versions.versionB;
     const newer = versions.versionA.version < versions.versionB.version ? versions.versionB : versions.versionA;
 
-    let diff;
+    let comparison: string;
     try {
-      diff = await aiService.generateSummary(older.metadata, newer.metadata, versions.developerName, settings);
+      comparison = await aiService.compareFlowVersions(
+        older.metadata, newer.metadata,
+        versions.developerName,
+        older.version, newer.version,
+        settings
+      );
     } catch (llmError) {
-      console.error(`[CompareFlow][LLM] Failed to generate diff orgId=${orgId} flowName=${flowName}:`, llmError);
+      console.error(`[CompareFlow][LLM] Failed to compare flow versions orgId=${orgId} flowName=${flowName}:`, llmError);
       throw llmError;
     }
 
     const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${versions.definitionId}`;
-    const changes = diff.changes || [];
-    const findings = diff.securityFindings || [];
-    const changesList = changes.length > 0 ? '\n' + changes.map(c => `- ${c}`).join('\n') : '';
-    const secList = findings.length > 0 ? '\nSecurity: ' + findings.join(', ') : '';
-    const displayText = `Flow: ${versions.label} (v${older.version} vs v${newer.version})\n\n${diff.summary}${changesList}${secList}\n\nOpen in Flow Builder: ${flowUrl}`;
+    const displayText = `Flow: ${versions.label} — Version ${older.version} vs Version ${newer.version}\n\n${comparison}\n\nOpen in Flow Builder: ${flowUrl}`;
 
     console.log(`[CompareFlow][SUCCESS] orgId=${orgId} flowName=${flowName} mode=compare`);
     return res.json({ success: true, displayText });

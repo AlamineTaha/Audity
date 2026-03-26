@@ -840,9 +840,9 @@ Format your response in clear sections. Use Slack markdown formatting (*bold* fo
   }
 
   /**
-   * Build the prompt for the LLM
-   * Updated to focus on security auditing and business impact
-   * Includes parent flow information for subflow risk assessment
+   * Build the prompt for the LLM (structured format for automated pipeline).
+   * Used by trigger-check and Slack notifications where changes/security
+   * need to be parsed programmatically.
    */
   private buildPrompt(
     oldJson: unknown, 
@@ -883,6 +883,63 @@ Security:
 - [CRITICAL or MEDIUM or LOW]: [description]. Or "No issues detected."
 
 Impact: [One sentence — who or what is affected]`;
+  }
+
+  /**
+   * Compare two Flow versions and produce a human-readable narrative comparison.
+   * This is the user-facing comparison — explains what changed, why it matters,
+   * and flags bad practices, in natural language an admin can understand.
+   */
+  async compareFlowVersions(
+    oldMetadata: unknown,
+    newMetadata: unknown,
+    flowName: string,
+    olderVersion: number,
+    newerVersion: number,
+    settings: OrgSettings
+  ): Promise<string> {
+    const sanitizedOld = this.sanitizeJson(oldMetadata);
+    const sanitizedNew = this.sanitizeJson(newMetadata);
+
+    const prompt = `You are an expert Salesforce Technical Architect. A Salesforce admin asks you to compare two versions of a Flow and explain exactly what changed between them.
+
+Flow: ${flowName}
+Comparing: Version ${olderVersion} (before) to Version ${newerVersion} (after)
+
+VERSION ${olderVersion} (BEFORE):
+${JSON.stringify(sanitizedOld, null, 2)}
+
+VERSION ${newerVersion} (AFTER):
+${JSON.stringify(sanitizedNew, null, 2)}
+
+Your job is to produce a clear, human-readable comparison. Write as if you are explaining the changes to a Salesforce Admin in a meeting.
+
+Rules:
+- Plain text only. No markdown, no stars, no backticks, no code fences, no emoji, no HTML.
+- Write in full sentences, not bullet points. This should read like a spoken explanation.
+- Focus on WHAT changed (elements added, removed, or modified) and WHY it matters.
+- Compare specific elements: record lookups, loops, decisions, assignments, DML operations, subflows, scheduled paths, etc.
+- For each change, explain the business impact: does it affect data integrity, performance, user experience, or compliance?
+- Flag bad practices with severity:
+  CRITICAL: DML inside loops, SOQL inside loops, missing fault paths on DML, hardcoded Record IDs, no null checks before DML.
+  HIGH: Broad queries without filters, missing entry conditions, bypass of sharing rules.
+  MEDIUM: Unused variables, redundant assignments, overly complex decision logic.
+  LOW: Naming convention issues, minor optimizations.
+- If no issues are detected, say so.
+- Keep it under 400 words.
+
+Format your response as:
+
+What changed:
+[2-5 sentences describing the concrete changes between the two versions. Name the elements, the objects, the fields.]
+
+Business impact:
+[2-3 sentences explaining how these changes affect users, processes, or data.]
+
+Security and performance:
+[1-3 sentences. State the severity level (CRITICAL/HIGH/MEDIUM/LOW) and the specific concern. If clean, say "No issues detected."]`;
+
+    return await this.callLLM(prompt, settings, 'compareFlowVersions');
   }
 
   /**
