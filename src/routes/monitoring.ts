@@ -166,11 +166,28 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
     const result = await service.runChangeCheck(hoursNum, forceImmediate, debugMode);
 
     const timeWindow = hoursNum ? `${hoursNum} hour(s)` : '300 seconds';
+    const message = result.success
+      ? `Manual check completed (${timeWindow}). Found ${result.changesFound} change(s).`
+      : 'Manual check completed with errors.';
+
+    let displayText = message;
+    if (result.changesFound > 0 && result.changes?.length) {
+      const summaryLines = result.changes.slice(0, 10).map((c: any) =>
+        `- ${c.action}: ${c.display || 'No details'} (by ${c.user || 'Unknown'})`
+      );
+      displayText += '\n\n' + summaryLines.join('\n');
+      if (result.changesFound > 10) {
+        displayText += `\n... and ${result.changesFound - 10} more change(s).`;
+      }
+    }
+    if (result.errors?.length) {
+      displayText += '\n\nErrors: ' + result.errors.join(', ');
+    }
+
     return res.json({
       success: result.success,
-      message: result.success
-        ? `Manual check completed (${timeWindow}). Found ${result.changesFound} change(s).`
-        : 'Manual check completed with errors.',
+      displayText,
+      message,
       changesFound: result.changesFound,
       errors: result.errors,
       timeWindow: hoursNum ? `${hoursNum} hours` : '300 seconds',
@@ -364,10 +381,34 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
 
     console.log(`[Recent Changes] Finished processing ${changes.length} records`);
 
+    let displayText = `${changes.length} change(s) found in the last ${hoursNum} hour(s).\n`;
+    if (changes.length > 0) {
+      const grouped: Record<string, any[]> = {};
+      for (const c of changes) {
+        const key = c.user || 'Unknown';
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(c);
+      }
+      for (const [user, userChanges] of Object.entries(grouped)) {
+        displayText += `\n${user} (${userChanges.length} change(s)):\n`;
+        for (const c of userChanges.slice(0, 5)) {
+          displayText += `  - ${c.action}: ${c.display || 'No details'}`;
+          if (c.explanation) displayText += `\n    ${c.explanation.split('\n')[0]}`;
+          displayText += '\n';
+        }
+        if (userChanges.length > 5) {
+          displayText += `  ... and ${userChanges.length - 5} more.\n`;
+        }
+      }
+    } else {
+      displayText += 'No changes detected in this time window.';
+    }
+
     return res.json({
+      success: true,
+      displayText,
       count: changes.length,
       changes,
-      note: 'This endpoint is read-only. To trigger Slack notifications, use POST /api/v1/trigger-check',
     });
   } catch (error) {
     console.error('[Recent Changes] Error:', error);
@@ -439,7 +480,25 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
     const aiService = new AIService();
     const analysis = await aiService.analyzePermissionSet(psData, settings);
 
+    const typeLabel = psData.isOwnedByProfile
+      ? `Profile: ${psData.profileName || psData.label}`
+      : `Permission Set: ${psData.label}`;
+
+    let displayText = `${typeLabel} (assigned to ${psData.assignedUserCount} user(s))\n`;
+    displayText += `Overall Risk: ${analysis.overallRiskLevel}\n\n`;
+    displayText += analysis.summary + '\n';
+
+    if (analysis.risks.length > 0) {
+      displayText += '\nRisks:\n';
+      for (const risk of analysis.risks) {
+        displayText += `  ${risk.severity}: ${risk.description}\n`;
+        displayText += `  Recommendation: ${risk.recommendation}\n\n`;
+      }
+    }
+
     return res.json({
+      success: true,
+      displayText,
       permissionSet: {
         id: psData.id,
         name: psData.name,
@@ -640,8 +699,12 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
       explanation = await aiService.interpretMetadataChange(formulaMetadata, 'FormulaField', `${objectName}.${name}`, settings);
     }
 
+    const label = type === 'FormulaField' ? `${objectName}.${name}` : name;
+    const displayText = `${type}: ${label}\n\n${explanation}`;
+
     return res.json({
       success: true,
+      displayText,
       name,
       type,
       objectName: type === 'FormulaField' ? objectName : undefined,
@@ -782,8 +845,24 @@ router.post('/analyze-validation-rules', async (req: Request, res: Response) => 
 
     const activeCount = rules.filter(r => r.active).length;
 
+    let displayText = `Validation Rules for ${objectApiName}: ${rules.length} total, ${activeCount} active.\n\n`;
+    displayText += analysis.summary + '\n';
+
+    if (analysis.categories.length > 0) {
+      displayText += '\nCategories:\n';
+      for (const cat of analysis.categories) {
+        displayText += `  ${cat.name} (${cat.rules.length} rule(s))\n`;
+      }
+    }
+
+    if (analysis.vagueErrorSuggestions.length > 0) {
+      displayText += `\n${analysis.vagueErrorSuggestions.length} rule(s) have vague error messages that should be improved.`;
+      displayText += ' Ask me for the full list of suggestions if you want details.';
+    }
+
     return res.json({
       success: true,
+      displayText,
       count: rules.length,
       activeCount,
       summary: analysis.summary,
@@ -898,20 +977,21 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
     const older = versions.versionA.version < versions.versionB.version ? versions.versionA : versions.versionB;
     const newer = versions.versionA.version < versions.versionB.version ? versions.versionB : versions.versionA;
 
-    let diff;
+    let comparison: string;
     try {
-      diff = await aiService.generateSummary(older.metadata, newer.metadata, versions.developerName, settings);
+      comparison = await aiService.compareFlowVersions(
+        older.metadata, newer.metadata,
+        versions.developerName,
+        older.version, newer.version,
+        settings
+      );
     } catch (llmError) {
-      console.error(`[CompareFlow][LLM] Failed to generate diff orgId=${orgId} flowName=${flowName}:`, llmError);
+      console.error(`[CompareFlow][LLM] Failed to compare flow versions orgId=${orgId} flowName=${flowName}:`, llmError);
       throw llmError;
     }
 
     const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${versions.definitionId}`;
-    const changes = diff.changes || [];
-    const findings = diff.securityFindings || [];
-    const changesList = changes.length > 0 ? '\n' + changes.map(c => `- ${c}`).join('\n') : '';
-    const secList = findings.length > 0 ? '\nSecurity: ' + findings.join(', ') : '';
-    const displayText = `Flow: ${versions.label} (v${older.version} vs v${newer.version})\n\n${diff.summary}${changesList}${secList}\n\nOpen in Flow Builder: ${flowUrl}`;
+    const displayText = `Flow: ${versions.label} — Version ${older.version} vs Version ${newer.version}\n\n${comparison}\n\nOpen in Flow Builder: ${flowUrl}`;
 
     console.log(`[CompareFlow][SUCCESS] orgId=${orgId} flowName=${flowName} mode=compare`);
     return res.json({ success: true, displayText });
