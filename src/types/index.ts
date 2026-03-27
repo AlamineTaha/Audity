@@ -130,6 +130,7 @@ export interface AnalyzeFlowRequest {
  */
 export interface AnalyzeFlowResponse {
   success: boolean;
+  displayText?: string;
   flowName: string;
   summary: string;
   changes?: string[];

@@ -182,8 +182,26 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       };
     }
 
+    let displayText = `Flow: ${diff.flowName}\n\n${diff.summary}\n`;
+
+    if (diff.changes.length > 0) {
+      displayText += '\nChanges:\n';
+      for (const c of diff.changes) {
+        displayText += `  - ${c}\n`;
+      }
+    }
+
+    if (riskAnalysis) {
+      displayText += `\nRisk: ${riskAnalysis.riskLevel} - ${riskAnalysis.riskReason}\n`;
+    }
+
+    if (versionNumbersToday.length > 0) {
+      displayText += `\n${versionNumbersToday.length} change(s) detected today. ${revertPrompt}`;
+    }
+
     const response: AnalyzeFlowResponse = {
       success: true,
+      displayText,
       flowName: diff.flowName,
       summary: diff.summary,
       changes: diff.changes,
@@ -478,14 +496,23 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
 
     const impact = await salesforceService.checkRevertImpact(orgId, flowApiName, targetVersionNumber);
 
+    let displayText = impact.canRevert
+      ? `Safe to revert ${flowApiName} to version ${targetVersionNumber}.`
+      : `Reverting ${flowApiName} to version ${targetVersionNumber} is NOT recommended.`;
+
+    if (impact.warnings.length > 0) {
+      displayText += '\n\nWarnings:\n' + impact.warnings.map(w => `  - ${w}`).join('\n');
+    }
+    if (impact.activeSessions > 0) {
+      displayText += `\n\nNote: ${impact.activeSessions} active flow interview(s) currently in progress will be affected.`;
+    }
+
     return res.json({
       success: true,
+      displayText,
       warnings: impact.warnings,
       activeSessions: impact.activeSessions,
       canRevert: impact.canRevert,
-      note: impact.activeSessions > 0
-        ? `Note: Reverting will affect approximately ${impact.activeSessions} active flow interviews currently in progress.`
-        : undefined,
     });
   } catch (error) {
     console.error('Error in check-revert-impact endpoint:', error);
@@ -540,8 +567,17 @@ router.post('/flows/activate-version', async (req: Request, res: Response) => {
 
     const result = await salesforceService.activateSpecificVersion(orgId, flowApiName, targetVersionNumber);
 
+    let displayText = result.message;
+    if (result.success && result.previousActiveVersion) {
+      displayText += ` Previous active version was ${result.previousActiveVersion}.`;
+    }
+    if (result.warnings?.length) {
+      displayText += '\n\nWarnings:\n' + result.warnings.map(w => `  - ${w}`).join('\n');
+    }
+
     return res.json({
       success: result.success,
+      displayText,
       message: result.message,
       previousActiveVersion: result.previousActiveVersion,
       newActiveVersion: result.newActiveVersion,
@@ -599,8 +635,17 @@ router.post('/flows/revert-today', async (req: Request, res: Response) => {
 
     const result = await salesforceService.batchRevertTodayChanges(orgId, flowApiName, hours);
 
+    let displayText = result.message;
+    if (result.success && result.stableVersion) {
+      displayText += ` Reverted to stable version ${result.stableVersion}.`;
+    }
+    if (result.warnings?.length) {
+      displayText += '\n\nWarnings:\n' + result.warnings.map(w => `  - ${w}`).join('\n');
+    }
+
     return res.json({
       success: result.success,
+      displayText,
       message: result.message,
       stableVersion: result.stableVersion,
       previousActiveVersion: result.previousActiveVersion,
@@ -660,8 +705,18 @@ router.get('/flows/versions', async (req: Request, res: Response) => {
       hoursNum
     );
 
+    let displayText = `${versions.length} version(s) of ${flowApiName} in the last ${hoursNum} hour(s).\n`;
+    if (versions.length > 0) {
+      for (const v of versions) {
+        displayText += `  - Version ${v.versionNumber}: ${v.status || 'Unknown status'} (${v.versionId})\n`;
+      }
+    } else {
+      displayText += 'No versions found in this time window.';
+    }
+
     return res.json({
       success: true,
+      displayText,
       flowApiName,
       versions,
       timeWindow: `${hoursNum} hours`,
