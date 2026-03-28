@@ -2777,6 +2777,68 @@ export class SalesforceService {
   }
 
   /**
+   * Fetch all validation rules for an object with their formulas.
+   * The Tooling API requires LIMIT 1 when selecting Metadata, so we fetch
+   * the rule list first, then retrieve each formula individually.
+   */
+  async getValidationRulesDetailedForAudit(
+    orgId: string,
+    objectApiName: string
+  ): Promise<Array<{
+    id: string;
+    validationName: string;
+    active: boolean;
+    description: string | null;
+    errorMessage: string | null;
+    errorConditionFormula: string | null;
+    objectApiName: string;
+  }>> {
+    const rules = await this.getValidationRulesForObjectAudit(orgId, objectApiName);
+    if (rules.length === 0) return [];
+
+    const conn = await this.authService.getConnection(orgId);
+    const tooling = conn.tooling;
+    const CONCURRENCY = 3;
+
+    const detailed: Array<{
+      id: string;
+      validationName: string;
+      active: boolean;
+      description: string | null;
+      errorMessage: string | null;
+      errorConditionFormula: string | null;
+      objectApiName: string;
+    }> = [];
+
+    for (let i = 0; i < rules.length; i += CONCURRENCY) {
+      const batch = rules.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (rule) => {
+          let formula: string | null = null;
+          try {
+            const soql = `
+              SELECT Id, Metadata
+              FROM ValidationRule
+              WHERE Id = '${rule.id}'
+              LIMIT 1
+            `;
+            const result = await tooling.query<any>(soql);
+            if (result.records?.[0]?.Metadata?.errorConditionFormula) {
+              formula = result.records[0].Metadata.errorConditionFormula;
+            }
+          } catch (err) {
+            console.warn(`[ValidationRules] Could not fetch formula for ${rule.validationName}:`, err instanceof Error ? err.message : err);
+          }
+          return { ...rule, errorConditionFormula: formula };
+        })
+      );
+      detailed.push(...results);
+    }
+
+    return detailed;
+  }
+
+  /**
    * Get all validation rules on a specific object.
    * Returns rule names and active status (no Metadata to avoid LIMIT 1 restriction).
    */
