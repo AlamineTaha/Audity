@@ -7,10 +7,14 @@
  */
 
 import { Router, Request, Response } from 'express';
+import path from 'path';
+import fs from 'fs';
+import crypto from 'crypto';
 import { SalesforceService } from '../services/salesforceService';
 import { AIService } from '../services/aiService';
 import { SalesforceAuthService } from '../services/authService';
 import { ReportService } from '../services/reportService';
+import { REPORTS_DIR } from '../config/reports';
 import {
   AuthenticatedRequest,
   AnalyzeFlowResponse,
@@ -817,12 +821,18 @@ function classifyEntry(record: SetupAuditTrail): string {
  *                 example: 24
  *     responses:
  *       200:
- *         description: PDF file download
+ *         description: Report generated — returns a download link
  *         content:
- *           application/pdf:
+ *           application/json:
  *             schema:
- *               type: string
- *               format: binary
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 displayText:
+ *                   type: string
+ *                 downloadUrl:
+ *                   type: string
  *       400:
  *         description: Bad request - missing or invalid parameters
  *       404:
@@ -935,12 +945,35 @@ router.post('/generate-audit-report', async (req: Request, res: Response) => {
     // Build the PDF
     const pdfBuffer = await reportService.generatePdf(entries, processType, hours, orgId, overallSummary);
 
-    const filename = `AuditDelta_Report_${processType}_${hours}h_${new Date().toISOString().slice(0, 10)}.pdf`;
+    const reportId = crypto.randomUUID();
+    const filename = `AuditDelta_${processType}_${hours}h_${reportId}.pdf`;
+    const filePath = path.join(REPORTS_DIR, filename);
+    fs.writeFileSync(filePath, pdfBuffer);
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Length', pdfBuffer.length);
-    return res.send(pdfBuffer);
+    const baseUrl = process.env.API_BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const downloadUrl = `${baseUrl}/reports/${filename}`;
+
+    console.log(`[AuditReport] Report saved: ${filePath} (${pdfBuffer.length} bytes)`);
+
+    const displayText = `Your audit report is ready.\n\n` +
+      `Type: ${processType} changes in the last ${hours} hour(s)\n` +
+      `Records: ${filtered.length} change(s) analyzed\n\n` +
+      `Download: ${downloadUrl}`;
+
+    return res.json({
+      success: true,
+      displayText,
+      downloadUrl,
+      filename,
+      reportDetails: {
+        processType,
+        hours,
+        totalRecords: auditRecords.length,
+        filteredRecords: filtered.length,
+        entriesAnalyzed: entries.length,
+      },
+      timestamp: new Date().toISOString(),
+    });
   } catch (error) {
     console.error('Error in generate-audit-report endpoint:', error);
     const errorMessage = error instanceof Error ? error.message : 'Internal server error';

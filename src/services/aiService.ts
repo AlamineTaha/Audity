@@ -291,6 +291,93 @@ Rules:
   }
 
   /**
+   * Analyze each validation rule individually: plain-language summary + impact level.
+   */
+  async analyzeValidationRulesDetailed(
+    objectApiName: string,
+    rules: Array<{
+      validationName: string;
+      active: boolean;
+      description: string | null;
+      errorMessage: string | null;
+      errorConditionFormula: string | null;
+    }>,
+    settings: OrgSettings
+  ): Promise<Array<{
+    validationName: string;
+    active: boolean;
+    summary: string;
+    impact: 'CRITICAL' | 'NORMAL';
+    impactReason: string;
+  }>> {
+    const rulesJson = JSON.stringify(
+      rules.map(r => ({
+        validationName: r.validationName,
+        active: r.active,
+        description: r.description,
+        errorMessage: r.errorMessage,
+        formula: r.errorConditionFormula,
+      })),
+      null,
+      2
+    );
+
+    const prompt = `You are an expert Salesforce Technical Architect. Analyze each validation rule individually on the ${objectApiName} object.
+
+Validation Rules (${rules.length} total):
+${rulesJson}
+
+Respond with a valid JSON array only. No markdown, no code fences, no extra text.
+
+For each rule, return exactly:
+{
+  "validationName": "the rule API name",
+  "active": true or false,
+  "summary": "1-2 sentences explaining what this rule does in plain business language. Describe the condition it checks and what happens when it fires.",
+  "impact": "CRITICAL" or "NORMAL",
+  "impactReason": "1 sentence explaining why this impact level was assigned."
+}
+
+Impact classification:
+CRITICAL — assign when the rule:
+  - Blocks critical business processes (Opportunity close, Case creation, Lead conversion)
+  - Enforces compliance, legal, or regulatory requirements
+  - Protects PII or sensitive data (SSN, credit card, salary)
+  - Has an overly broad formula that could block many users unexpectedly
+  - Is INACTIVE but should be active (leaving a data quality gap)
+  - References fields related to revenue, billing, or financial data
+NORMAL — standard data quality, formatting, or convenience checks.
+
+Rules:
+- Return one entry per validation rule, in the same order as the input.
+- Base your analysis on the formula, error message, description, and rule name.
+- If the formula is null, analyze based on the name, description, and error message.`;
+
+    try {
+      const raw = await this.callLLM(prompt, settings, 'analyzeValidationRulesDetailed');
+      const cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      const parsed = JSON.parse(cleaned) as Array<{
+        validationName?: string;
+        active?: boolean;
+        summary?: string;
+        impact?: string;
+        impactReason?: string;
+      }>;
+
+      return parsed.map((item, idx) => ({
+        validationName: item.validationName || rules[idx]?.validationName || 'Unknown',
+        active: item.active ?? rules[idx]?.active ?? false,
+        summary: item.summary || 'No summary available.',
+        impact: item.impact === 'CRITICAL' ? 'CRITICAL' : 'NORMAL',
+        impactReason: item.impactReason || 'No reason provided.',
+      }));
+    } catch (error) {
+      console.error('Error in analyzeValidationRulesDetailed:', error);
+      throw new Error(`Failed to analyze validation rules in detail: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
    * Analyze a Permission Set's security posture: what it grants, risks, and best-practice violations.
    */
   async analyzePermissionSet(

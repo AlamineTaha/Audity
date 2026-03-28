@@ -9,9 +9,12 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+import path from 'path';
+import fs from 'fs';
 import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import swaggerJsdoc from 'swagger-jsdoc';
+import { REPORTS_DIR } from './config/reports';
 // swagger-ui-express replaced with self-contained HTML (fixes response rendering bug)
 import agentforceRoutes from './routes/agentforce';
 import authRoutes from './routes/auth';
@@ -200,6 +203,21 @@ app.get('/api-docs', (_req, res) => {
   </script>
 </body>
 </html>`);
+});
+
+// Serve generated report PDFs (UUID filename = security token)
+app.get('/reports/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename);
+  if (!/^[a-zA-Z0-9_\-]+\.pdf$/.test(filename)) {
+    return res.status(400).json({ error: 'Invalid filename' });
+  }
+  const filePath = path.join(REPORTS_DIR, filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Report not found or expired. Reports are temporary and may be deleted on server restart.' });
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  return res.sendFile(filePath);
 });
 
 // Root endpoint

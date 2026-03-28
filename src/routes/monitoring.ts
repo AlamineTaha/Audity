@@ -881,6 +881,100 @@ router.post('/analyze-validation-rules', async (req: Request, res: Response) => 
 
 /**
  * @swagger
+ * /api/v1/explain-validation-rules:
+ *   post:
+ *     summary: Explain Each Validation Rule
+ *     description: >
+ *       Fetches every validation rule on an object (including formulas) and uses AI
+ *       to produce a per-rule summary and impact level (CRITICAL / NORMAL).
+ *     tags:
+ *       - Security
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - objectApiName
+ *             properties:
+ *               objectApiName:
+ *                 type: string
+ *                 description: Object API name (e.g. Account, Opportunity)
+ *                 example: Account
+ *     responses:
+ *       200:
+ *         description: Per-rule AI analysis with impact levels
+ *       400:
+ *         description: Missing objectApiName
+ *       404:
+ *         description: No validation rules found
+ */
+router.post('/explain-validation-rules', async (req: Request, res: Response) => {
+  try {
+    const { tenant } = req as AuthenticatedRequest;
+    const orgId = tenant.orgId;
+    const objectApiName = String(req.query.objectApiName ?? req.body.objectApiName ?? '').trim();
+
+    if (!objectApiName) {
+      return res.status(400).json({
+        success: false,
+        error: 'objectApiName is required',
+        example: { objectApiName: 'Account' },
+      });
+    }
+
+    const authService = new SalesforceAuthService();
+    const salesforceService = new SalesforceService(authService);
+    const aiService = new AIService();
+
+    const settings = await authService.getOrgSettings(orgId);
+    if (!settings) {
+      return res.status(404).json({ success: false, error: `Organization ${orgId} not found or not configured` });
+    }
+
+    console.log(`[Explain Validation Rules] Fetching rules for ${objectApiName}`);
+    const rules = await salesforceService.getValidationRulesDetailedForAudit(orgId, objectApiName);
+
+    if (rules.length === 0) {
+      return res.status(404).json({ success: false, error: `No validation rules found for object ${objectApiName}` });
+    }
+
+    console.log(`[Explain Validation Rules] Analyzing ${rules.length} rule(s) with AI`);
+    const analysis = await aiService.analyzeValidationRulesDetailed(objectApiName, rules, settings);
+
+    const activeCount = rules.filter(r => r.active).length;
+    const criticalCount = analysis.filter(r => r.impact === 'CRITICAL').length;
+
+    let displayText = `Validation Rules for ${objectApiName}: ${rules.length} total, ${activeCount} active, ${criticalCount} critical.\n`;
+
+    for (const rule of analysis) {
+      const status = rule.active ? 'Active' : 'Inactive';
+      displayText += `\n${rule.validationName} (${status})\n`;
+      displayText += `  ${rule.summary}\n`;
+      displayText += `  Impact: ${rule.impact} - ${rule.impactReason}\n`;
+    }
+
+    return res.json({
+      success: true,
+      displayText,
+      objectApiName,
+      count: rules.length,
+      activeCount,
+      criticalCount,
+      rules: analysis,
+    });
+  } catch (error) {
+    console.error('Error in explain-validation-rules endpoint:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    return res.status(500).json({ success: false, error: errorMessage });
+  }
+});
+
+/**
+ * @swagger
  * /api/v1/compare-flow-versions:
  *   post:
  *     summary: Compare or analyze Flow versions
