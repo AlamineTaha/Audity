@@ -52,70 +52,56 @@ export function initTenantAuth(db: DatabaseService, auth: SalesforceAuthService)
   authServiceInstance = auth;
 }
 
-export async function tenantAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
-  if (!dbService || !authServiceInstance) {
-    res.status(500).json({ error: 'Tenant authentication not initialized' });
-    return;
-  }
+export type TenantCredential =
+  | { kind: 'apiKey'; apiKey: string }
+  | { kind: 'orgId'; orgId: string };
 
+export type TenantResolution =
+  | { ok: true; tenant: TenantContext }
+  | { ok: false; status: 401 | 500 | 503; error: string };
+
+/** Resolves a tenant from a credential the caller already authenticated (API key, or a verified org id). */
+export async function resolveTenant(credential: TenantCredential, requestPath: string): Promise<TenantResolution> {
+  if (!dbService || !authServiceInstance) {
+    return { ok: false, status: 500, error: 'Tenant authentication not initialized' };
+  }
   const db = dbService;
-  const apiKey = req.headers['x-api-key'] as string | undefined;
-  const sfOrgId = req.headers['x-sfdc-org-id'] as string | undefined;
-  const sharedSecret = req.headers['x-auditdelta-secret'] as string | undefined;
+  const auth = authServiceInstance;
 
   let cacheKey: string;
   let fetchTenant: () => Promise<TenantRow | null>;
-  if (apiKey) {
-    const apiKeyHash = DatabaseService.hashApiKey(apiKey);
+  if (credential.kind === 'apiKey') {
+    const apiKeyHash = DatabaseService.hashApiKey(credential.apiKey);
     cacheKey = `${CACHE_PREFIX}${apiKeyHash}`;
     fetchTenant = () => db.getTenantByApiKeyHash(apiKeyHash);
-  } else if (sfOrgId && sharedSecret) {
-    if (!sharedSecretMatches(sharedSecret)) {
-      res.status(401).json({ error: 'Invalid x-auditdelta-secret' });
-      return;
-    }
-    cacheKey = `${CACHE_PREFIX}org:${sfOrgId}`;
-    fetchTenant = () => db.getTenantByOrgId(sfOrgId);
   } else {
-    res.status(401).json({
-      error: 'Missing credentials',
-      hint: 'Send X-API-Key (issued after OAuth at /auth/authorize), or x-sfdc-org-id + x-auditdelta-secret via the Salesforce Named Credential.',
-    });
-    return;
+    cacheKey = `${CACHE_PREFIX}org:${credential.orgId}`;
+    fetchTenant = () => db.getTenantByOrgId(credential.orgId);
   }
 
   try {
-    const requestPath = `${req.method} ${req.originalUrl}`;
-
-    // Try Redis cache first
     let cached: string | null = null;
     try {
-      cached = await authServiceInstance.getCachedValue(cacheKey);
+      cached = await auth.getCachedValue(cacheKey);
     } catch (redisError) {
       console.error(`[TenantAuth][REDIS] Cache read failed for ${requestPath}:`, redisError);
     }
     if (cached) {
-      console.log(`[TenantAuth][CACHE_HIT] ${requestPath}`);
-      (req as AuthenticatedRequest).tenant = JSON.parse(cached);
-      next();
-      return;
+      return { ok: true, tenant: JSON.parse(cached) };
     }
 
     // Lookup in PostgreSQL (with retry/backoff for transient infrastructure failures)
     let tenant: TenantRow | null = null;
-    let lastLookupError: unknown = null;
     for (let attempt = 0; attempt <= TENANT_LOOKUP_RETRIES; attempt++) {
       try {
         tenant = await fetchTenant();
         break;
       } catch (lookupError) {
-        lastLookupError = lookupError;
-        const retryable = isInfrastructureError(lookupError) && attempt < TENANT_LOOKUP_RETRIES;
         console.error(
           `[TenantAuth][DB] Tenant lookup failed (attempt ${attempt + 1}/${TENANT_LOOKUP_RETRIES + 1}) for ${requestPath}:`,
           lookupError
         );
-        if (retryable) {
+        if (isInfrastructureError(lookupError) && attempt < TENANT_LOOKUP_RETRIES) {
           await sleep(TENANT_LOOKUP_BACKOFF_MS * (attempt + 1));
           continue;
         }
@@ -124,15 +110,11 @@ export async function tenantAuth(req: Request, res: Response, next: NextFunction
     }
 
     if (!tenant) {
-      if (lastLookupError && isInfrastructureError(lastLookupError)) {
-        res.status(503).json({
-          error: 'Authentication backend temporarily unavailable',
-          category: 'db',
-        });
-        return;
-      }
-      res.status(401).json({ error: apiKey ? 'Invalid API key' : `Org ${sfOrgId} is not registered with AuditDelta` });
-      return;
+      return {
+        ok: false,
+        status: 401,
+        error: credential.kind === 'apiKey' ? 'Invalid API key' : `Org ${credential.orgId} is not registered with AuditDelta`,
+      };
     }
 
     const ctx: TenantContext = {
@@ -142,25 +124,50 @@ export async function tenantAuth(req: Request, res: Response, next: NextFunction
       gcpProjectId: tenant.gcp_project_id || undefined,
     };
 
-    // Cache for subsequent requests
     try {
-      await authServiceInstance.setCachedValue(cacheKey, JSON.stringify(ctx), CACHE_TTL_SEC);
+      await auth.setCachedValue(cacheKey, JSON.stringify(ctx), CACHE_TTL_SEC);
     } catch (redisError) {
       console.error(`[TenantAuth][REDIS] Cache write failed for ${requestPath}:`, redisError);
     }
-
-    (req as AuthenticatedRequest).tenant = ctx;
-    console.log(`[TenantAuth][DB_HIT] ${requestPath} orgId=${ctx.orgId}`);
-    next();
+    return { ok: true, tenant: ctx };
   } catch (error) {
-    const requestPath = `${req.method} ${req.originalUrl}`;
-    const backendCategory = isInfrastructureError(error) ? 'infrastructure' : 'unknown';
-    console.error(`[TenantAuth][${backendCategory.toUpperCase()}] Error resolving tenant for ${requestPath}:`, error);
-    res.status(isInfrastructureError(error) ? 503 : 500).json({
-      error: isInfrastructureError(error)
-        ? 'Authentication backend temporarily unavailable'
-        : 'Tenant authentication failed',
-      category: backendCategory,
-    });
+    const infra = isInfrastructureError(error);
+    console.error(`[TenantAuth][${infra ? 'INFRASTRUCTURE' : 'UNKNOWN'}] Error resolving tenant for ${requestPath}:`, error);
+    return {
+      ok: false,
+      status: infra ? 503 : 500,
+      error: infra ? 'Authentication backend temporarily unavailable' : 'Tenant authentication failed',
+    };
   }
+}
+
+export async function tenantAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const apiKey = req.headers['x-api-key'] as string | undefined;
+  const sfOrgId = req.headers['x-sfdc-org-id'] as string | undefined;
+  const sharedSecret = req.headers['x-auditdelta-secret'] as string | undefined;
+
+  let credential: TenantCredential;
+  if (apiKey) {
+    credential = { kind: 'apiKey', apiKey };
+  } else if (sfOrgId && sharedSecret) {
+    if (!sharedSecretMatches(sharedSecret)) {
+      res.status(401).json({ error: 'Invalid x-auditdelta-secret' });
+      return;
+    }
+    credential = { kind: 'orgId', orgId: sfOrgId };
+  } else {
+    res.status(401).json({
+      error: 'Missing credentials',
+      hint: 'Send X-API-Key (issued after OAuth at /auth/authorize), or x-sfdc-org-id + x-auditdelta-secret via the Salesforce Named Credential.',
+    });
+    return;
+  }
+
+  const result = await resolveTenant(credential, `${req.method} ${req.originalUrl}`);
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error });
+    return;
+  }
+  (req as AuthenticatedRequest).tenant = result.tenant;
+  next();
 }

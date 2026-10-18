@@ -169,7 +169,7 @@ export class ReportService {
     L: number, W: number, y: number,
     summary: string
   ): number {
-    y = this.checkPage(doc, y, L, W, 110);
+    y = this.checkPage(doc, y, 110);
 
     // Section heading
     doc.rect(L, y, 4, 20).fill(C.accent);
@@ -201,7 +201,7 @@ export class ReportService {
     L: number, W: number, y: number,
     entries: AuditReportEntry[]
   ): void {
-    y = this.checkPage(doc, y, L, W, 60);
+    y = this.checkPage(doc, y, 60);
 
     doc.rect(L, y, 4, 20).fill(C.accent);
     doc.fillColor(C.brand).font('Helvetica-Bold').fontSize(14)
@@ -252,7 +252,7 @@ export class ReportService {
       + (explBoxH > 0 ? 12 + explBoxH : 0)
       + PAD_V;
 
-    y = this.checkPage(doc, y, L, W, cardH + 2);
+    y = this.checkPage(doc, y, cardH + 2);
 
     // Card background (alternating)
     doc.rect(L, y, W, cardH).fill(index % 2 === 0 ? C.white : C.bg);
@@ -342,7 +342,7 @@ export class ReportService {
 
   private checkPage(
     doc: PDFKit.PDFDocument,
-    y: number, L: number, W: number, needed: number
+    y: number, needed: number
   ): number {
     const limit = doc.page.height - doc.page.margins.bottom;
     if (y + needed > limit) {
