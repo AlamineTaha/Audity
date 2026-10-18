@@ -14,3 +14,8 @@ This is a Node.js (TypeScript) middleware application that acts as an "Automated
 1. **No Local State:** Do not assume we have a local copy of the Flow XML. Always fetch it fresh using `tooling.query()`.
 2. **Noise Reduction:** When diffing JSON/XML, always strip `<locationX>`, `<locationY>`, and `<processMetadataValues>` tags before sending to the LLM to save tokens.
 3. **Billing:** Always check the `X-Goog-User-Project` header logic for enterprise billing.
+
+### Slack Routing Standards
+- All Slack messages must be routed via `Slack_Channel_Mapping__mdt`.
+- Do not hardcode Channel IDs in Node.js; pass the `Category__c` picklist value instead.
+- Use `MetadataServiceHelper` for any self-healing metadata updates from Flow.

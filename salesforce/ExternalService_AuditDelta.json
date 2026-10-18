@@ -1,0 +1,747 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "AuditDelta API",
+    "version": "3.0.0",
+    "description": "AuditDelta external service for Salesforce Agentforce. All endpoints return a 'displayText' field containing a human-readable summary ready to show to the user.\n\nSECURITY: All protected endpoints require two custom headers injected by the Named Credential:\n  - x-sfdc-org-id: The calling Salesforce Org ID (18-char).\n  - x-auditdelta-secret: Shared secret matching the AUDITDELTA_SECRET server environment variable."
+  },
+  "servers": [
+    {
+      "url": "https://auditdelta-guardian-15ab56fef180.herokuapp.com",
+      "description": "Production (Heroku)"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "OrgIdHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-sfdc-org-id",
+        "description": "Salesforce Org ID injected automatically by the Named Credential."
+      },
+      "SecretHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-auditdelta-secret",
+        "description": "Shared secret matching AUDITDELTA_SECRET on the server."
+      }
+    },
+    "schemas": {
+      "AgentResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "description": "Whether the operation completed successfully." },
+          "displayText": { "type": "string", "description": "Human-readable summary ready to display to the user. Show this to the user as-is." }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "error": { "type": "string", "description": "Error message to relay to the user." }
+        }
+      }
+    }
+  },
+  "security": [
+    { "OrgIdHeader": [], "SecretHeader": [] }
+  ],
+  "paths": {
+    "/api/v1/trigger-check": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Force Immediate Change Check",
+        "description": "Triggers the polling engine to check for Salesforce changes immediately, analyze them with AI, and send Slack alerts. Use when the user asks to check for recent changes, run a scan, or trigger an audit.",
+        "operationId": "triggerCheck",
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer" },
+            "description": "Look back X hours instead of the default (everything since the last check)."
+          },
+          {
+            "name": "debug",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "boolean", "default": false },
+            "description": "Skip cache check to re-test the same change."
+          },
+          {
+            "name": "forceImmediate",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "boolean", "default": false },
+            "description": "Bypass aggregation for on-demand triggers."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Check completed. Show the displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/slack-invite": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Safe Slack Channel Invite",
+        "description": "Invites users to a Slack channel safely. Checks membership first to avoid already_in_channel errors.",
+        "operationId": "slackInvite",
+        "parameters": [
+          {
+            "name": "channelId",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Slack channel ID (e.g. C01234567)."
+          },
+          {
+            "name": "userIds",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Comma-separated Slack User IDs to invite."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invitation successful or skipped",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/slack-thread-callback": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Store Slack Thread Timestamp",
+        "description": "Stores the Slack thread_ts after posting a message. Flow calls this so future replies are threaded.",
+        "operationId": "slackThreadCallback",
+        "parameters": [
+          {
+            "name": "flowDeveloperName",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Developer name of the Flow."
+          },
+          {
+            "name": "threadTs",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Slack thread timestamp (thread_ts)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Thread timestamp stored",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/recent-changes": {
+      "get": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Get Recent Org Activity",
+        "description": "Retrieves metadata changes from the Audit Trail with AI-powered explanations. Returns a human-readable summary grouped by user. Use when the user asks about recent changes, what happened, or who changed what.",
+        "operationId": "getRecentChanges",
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "default": 24 },
+            "description": "Lookback window in hours (defaults to 24)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Summary of recent changes. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analyze-flow": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Analyze Flow Changes",
+        "description": "Fetches current and previous Flow versions, uses AI to analyze differences, and returns a summary with security findings and revert options. Use when the user asks to analyze, review, or audit a specific Flow.",
+        "operationId": "analyzeFlow",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["flowName"],
+                "properties": {
+                  "flowName": {
+                    "type": "string",
+                    "description": "The API name or label of the Flow to analyze."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Flow analysis. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing required fields",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Flow not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analyze-permission": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Analyze Permission Set Security",
+        "description": "Fetches a Permission Set or Profile by name and performs an AI-powered security audit. Returns object access, system permissions, risk levels, and recommendations. Use when the user asks to audit, review, or analyze a specific Permission Set or Profile.",
+        "operationId": "analyzePermission",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["permissionSetName"],
+                "properties": {
+                  "permissionSetName": {
+                    "type": "string",
+                    "description": "API Name or Label of the Permission Set or Profile to analyze (e.g. 'Sales_User', 'System Administrator')."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Permission Set security analysis. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing permissionSetName",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Permission Set not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/find-permission-sources": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Find Permission Sources for an Action",
+        "description": "Reverse permission lookup. Given a natural-language query, returns every Permission Set and Profile that grants that access. Use when the user asks WHO or WHAT grants a permission.\n\nExamples: 'Which permissions let me edit Accounts?', 'What gives access to delete Opportunities?', 'Who can export reports?'\n\nSupported formats: 'edit Account' (object), 'edit Account BillingStreet' (field), 'export reports' (system).",
+        "operationId": "findPermissionSources",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                  "query": {
+                    "type": "string",
+                    "description": "Natural-language permission query. Examples: 'edit Account', 'delete Opportunity', 'edit Account BillingStreet', 'export reports'."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "List of permission sources. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or unrecognized query",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explain-metadata": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Explain Metadata Change",
+        "description": "Uses AI to explain a Validation Rule or Formula Field in business terms. Use when the user asks what a specific validation rule or formula field does.",
+        "operationId": "explainMetadata",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name", "type"],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Name of the Validation Rule or Formula Field."
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["ValidationRule", "FormulaField"],
+                    "description": "Type of metadata."
+                  },
+                  "objectName": {
+                    "type": "string",
+                    "description": "Object name (required for FormulaField, e.g. Account)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "AI explanation. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing required parameters or invalid type",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Metadata item not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analyze-validation-rules": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Object Validation Audit",
+        "description": "Retrieves all validation rules for a Salesforce object and uses AI to analyze them. Returns a Validation Health summary with categories and suggestions for vague error messages. Use when the user asks to audit or review validation rules on an object.",
+        "operationId": "analyzeValidationRules",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["objectApiName"],
+                "properties": {
+                  "objectApiName": {
+                    "type": "string",
+                    "description": "Object API name (e.g. Account, Opportunity, CustomObject__c)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation rules analysis. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing objectApiName",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Object not found or no validation rules",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explain-validation-rules": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Explain Each Validation Rule",
+        "description": "Fetches every validation rule on an object (including formulas) and uses AI to explain each one individually with a summary and impact level (CRITICAL or NORMAL). Use when the user asks for details about each validation rule, wants to know what specific rules do, or asks about the impact of validation rules on an object.",
+        "operationId": "explainValidationRules",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["objectApiName"],
+                "properties": {
+                  "objectApiName": {
+                    "type": "string",
+                    "description": "Object API name (e.g. Account, Opportunity, CustomObject__c)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-rule analysis with impact levels. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing objectApiName",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "No validation rules found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/compare-flow-versions": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Compare or Analyze Flow Versions",
+        "description": "Compares two Flow versions and returns a human-readable narrative explaining what changed, the business impact, and security concerns.\n\nThree modes:\n1. flowName + versionA + versionB: compare two specific versions.\n2. flowName only: compare the latest two versions.\n3. flowName + analyze=true: explain the latest version only.\n\nUse when the user asks to compare, diff, or see what changed between Flow versions.",
+        "operationId": "compareFlowVersions",
+        "parameters": [
+          {
+            "name": "flowName",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Flow label or API name."
+          },
+          {
+            "name": "versionA",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer" },
+            "description": "First version number (defaults to latest - 1)."
+          },
+          {
+            "name": "versionB",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer" },
+            "description": "Second version number (defaults to latest)."
+          },
+          {
+            "name": "analyze",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "boolean", "default": false },
+            "description": "If true, analyze the latest version only (no comparison)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Comparison or analysis result. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or invalid parameters",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/flows/check-revert-impact": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Check Flow Revert Impact",
+        "description": "Analyzes the impact of reverting to a specific Flow version before activation. Use when the user wants to know if it is safe to revert a Flow.",
+        "operationId": "checkRevertImpact",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["flowApiName", "targetVersionNumber"],
+                "properties": {
+                  "flowApiName": {
+                    "type": "string",
+                    "description": "Flow label or API name."
+                  },
+                  "targetVersionNumber": {
+                    "type": "integer",
+                    "description": "Version number to check impact for."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Impact assessment. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/flows/activate-version": {
+      "post": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Activate a Flow Version (Safe Revert)",
+        "description": "Activates a specific Flow version, setting the current active version to Obsolete. Use when the user confirms they want to revert or activate a specific Flow version.",
+        "operationId": "activateFlowVersion",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["flowApiName", "targetVersionNumber"],
+                "properties": {
+                  "flowApiName": {
+                    "type": "string",
+                    "description": "Flow label or API name."
+                  },
+                  "targetVersionNumber": {
+                    "type": "integer",
+                    "description": "Version number to activate."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Version activated. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/flows/versions": {
+      "get": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Get Flow Versions",
+        "description": "Returns all versions for a specific Flow within a time window. Use when the user asks about Flow version history.",
+        "operationId": "getFlowVersions",
+        "parameters": [
+          {
+            "name": "flowApiName",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Flow label or API name."
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "default": 24 },
+            "description": "Lookback window in hours."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version list. Show displayText to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "x-setup-timeout": 120,
+        "summary": "Health Check",
+        "description": "Returns the health status of the API.",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/generate-audit-report": {
+      "post": {
+        "x-setup-timeout": 120,
+        "summary": "Generate Audit Report PDF",
+        "description": "Queries the Setup Audit Trail for the given process type and time window, enriches each entry with an AI explanation, generates a PDF report, and returns a download link. Use when the user asks for a report, audit document, or PDF of recent changes.\n\nThe displayText includes the download URL. Share this link with the user so they can download the report.\n\nSupported processType values: Flow, Permission, Layout, ValidationRule, CustomField, Object, All.",
+        "operationId": "generateAuditReport",
+        "tags": ["Agentforce"],
+        "security": [{ "OrgIdHeader": [], "SecretHeader": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["processType", "hours"],
+                "properties": {
+                  "processType": {
+                    "type": "string",
+                    "enum": ["Flow", "Permission", "Layout", "ValidationRule", "CustomField", "Object", "All"],
+                    "description": "Category of metadata changes to include in the report."
+                  },
+                  "hours": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 168,
+                    "description": "Lookback window in hours (1 to 168)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Report generated. Show displayText (includes download URL) to the user.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

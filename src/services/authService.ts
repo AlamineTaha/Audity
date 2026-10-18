@@ -362,15 +362,28 @@ export class SalesforceAuthService {
     await this.redisClient.setEx(key, SalesforceAuthService.FLOW_THREAD_TTL_SEC, threadTs);
   }
 
-  async cleanupAuditProcessedKeys(): Promise<number> {
+  async cleanupAuditProcessedKeys(orgId: string): Promise<number> {
     await this.connect();
-    const keys = await this.redisClient.keys('audit_processed:*');
-    if (keys.length === 0) return 0;
-    for (const key of keys) {
+    let count = 0;
+    for await (const key of this.redisClient.scanIterator({ MATCH: `audit_processed:${orgId}:*`, COUNT: 500 })) {
       await this.redisClient.del(key);
+      count++;
     }
-    console.log(`[Auth] Cleaned up ${keys.length} audit_processed key(s)`);
-    return keys.length;
+    console.log(`[Auth] Cleaned up ${count} audit_processed key(s) for ${orgId}`);
+    return count;
+  }
+
+  // --------------- Audit trail high-water mark (no TTL: survives restarts) ---------------
+
+  async getAuditHighWaterMark(orgId: string): Promise<Date | null> {
+    await this.connect();
+    const value = await this.redisClient.get(`audit_hwm:${orgId}`);
+    return value ? new Date(value) : null;
+  }
+
+  async setAuditHighWaterMark(orgId: string, createdDate: string): Promise<void> {
+    await this.connect();
+    await this.redisClient.set(`audit_hwm:${orgId}`, new Date(createdDate).toISOString());
   }
 
   // --------------- Org enumeration ---------------

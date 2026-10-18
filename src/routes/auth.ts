@@ -5,10 +5,9 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { SalesforceAuthService } from '../services/authService';
+import { authService } from '../services/container';
 
 const router = Router();
-const authService = new SalesforceAuthService();
 
 /**
  * @swagger
@@ -119,7 +118,7 @@ router.get('/authorize', async (req: Request, res: Response) => {
  */
 router.get('/callback', async (req: Request, res: Response) => {
   try {
-    console.log('[OAuth Callback] Received query params:', req.query);
+    console.log('[OAuth Callback] Received callback', { hasCode: Boolean(req.query.code), error: req.query.error });
 
     const code = req.query.code as string;
     const error = req.query.error as string | undefined;
@@ -186,4 +185,3 @@ router.get('/callback', async (req: Request, res: Response) => {
 
 export default router;
 
-export { authService };

@@ -17,8 +17,6 @@ export class MonitorService {
   private cronJob: cron.ScheduledTask | null = null;
   private isRunning: boolean = false;
   private checkIntervalMinutes: number;
-  /** Startup Lookback: true after first poll; first poll uses 10-min window, subsequent use 60s */
-  private hasCompletedFirstPoll = false;
   /** Poll lock: prevents duplicate processing when pollAuditTrail is called while already polling */
   private isPolling = false;
 
@@ -49,6 +47,19 @@ export class MonitorService {
       default:
         return 'Schema';
     }
+  }
+
+  private static readonly FIRST_RUN_LOOKBACK_MS = 10 * 60 * 1000;
+  private static readonly MAX_CATCHUP_MS = 24 * 60 * 60 * 1000;
+  // Re-read a small overlap; already-processed records are skipped by the dedup cache.
+  private static readonly HWM_OVERLAP_MS = 2 * 60 * 1000;
+
+  private computeAuditWindowStart(hwm: Date | null): Date {
+    const now = Date.now();
+    const start = hwm
+      ? hwm.getTime() - MonitorService.HWM_OVERLAP_MS
+      : now - MonitorService.FIRST_RUN_LOOKBACK_MS;
+    return new Date(Math.max(start, now - MonitorService.MAX_CATCHUP_MS));
   }
 
   /**
@@ -97,7 +108,7 @@ export class MonitorService {
    * 
    * @param hours Optional: Look back X hours instead of using checkIntervalMinutes
    */
-  async runChangeCheck(hours?: number, forceImmediate: boolean = false, debug: boolean = false): Promise<{ 
+  async runChangeCheck(hours?: number, forceImmediate: boolean = false, debug: boolean = false, onlyOrgId?: string): Promise<{ 
     success: boolean; 
     changesFound: number; 
     errors: string[];
@@ -138,10 +149,7 @@ export class MonitorService {
         : `${this.checkIntervalMinutes} minute(s)`;
       console.log(`[Monitor] Starting change check (last ${timeWindow})...`);
 
-      // Get all registered orgs from Redis
-      // Note: In production, you might want to maintain a separate org registry
-      // For now, we'll need to track orgs - this is a simplified approach
-      const orgIds = await this.getRegisteredOrgIds();
+      const orgIds = onlyOrgId ? [onlyOrgId] : await this.getRegisteredOrgIds();
 
       if (orgIds.length === 0) {
         console.log('[Monitor] No registered organizations found');
@@ -237,6 +245,8 @@ export class MonitorService {
       user: string;
     }> = [];
 
+    let advanceHwmTo: string | null = null;
+
     try {
       let auditRecords: SetupAuditTrail[];
       
@@ -244,21 +254,20 @@ export class MonitorService {
         // Use hours-based query (e.g. manual trigger with ?hours=24)
         console.log(`[POLL] Org ${orgId} - Querying audit trail (last ${hours} hour(s))`);
         auditRecords = await this.salesforceService.queryAuditTrailByHours(orgId, hours);
-      } else if (!this.hasCompletedFirstPoll) {
-        // Startup Lookback: First execution uses 10-minute window to catch changes before server start
-        console.log(`[POLL] Org ${orgId} - First poll: 10-minute startup lookback`);
-        auditRecords = await this.salesforceService.queryAuditTrail(orgId, 10);
-        this.hasCompletedFirstPoll = true;
       } else {
-        // Snapshot window: exactly 300 seconds (5 min) when endpoint is triggered
-        console.log(`[POLL] Org ${orgId} - Querying audit trail (last 300 seconds)`);
-        auditRecords = await this.salesforceService.queryAuditTrailBySecondsFiltered(orgId, 300);
+        const hwm = await this.authService.getAuditHighWaterMark(orgId);
+        const since = this.computeAuditWindowStart(hwm);
+        console.log(`[POLL] Org ${orgId} - Querying audit trail since ${since.toISOString()} (hwm=${hwm?.toISOString() ?? 'none'})`);
+        auditRecords = await this.salesforceService.queryAuditTrailSinceFiltered(orgId, since);
+        // Records come back ASC; the newest fetched one becomes the next window start.
+        if (auditRecords.length > 0) {
+          advanceHwmTo = auditRecords[auditRecords.length - 1].CreatedDate;
+        }
       }
 
       if (auditRecords.length === 0) {
-        const timeWindow = hours ? `${hours} hour(s)` : (this.hasCompletedFirstPoll ? '300 seconds' : '10 minutes');
-        console.log(`[POLL] Org ${orgId} - No audit records in last ${timeWindow}`);
-        console.log(`[Monitor] Tip: Try using /api/v1/recent-changes?orgId=${orgId}&hours=24 to see all recent changes`);
+        const timeWindow = hours ? `${hours} hour(s)` : 'since last check';
+        console.log(`[POLL] Org ${orgId} - No audit records (${timeWindow})`);
         return { count: 0, changes: [] };
       }
 
@@ -445,6 +454,10 @@ export class MonitorService {
     } catch (error) {
       console.error(`[Monitor] Error processing org ${orgId}:`, error);
       throw error;
+    }
+
+    if (advanceHwmTo) {
+      await this.authService.setAuditHighWaterMark(orgId, advanceHwmTo);
     }
 
     return { count: changesProcessed, changes };

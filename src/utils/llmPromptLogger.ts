@@ -5,6 +5,7 @@
  * 2. Writes each prompt to its own file in llm_prompts_log/{Flows|schema|security}/
  *
  * Use this to debug duplicate Slack messages or understand why certain summaries are generated.
+ * Disabled unless LLM_PROMPT_LOG=true: prompts contain customer org metadata.
  */
 
 import * as fs from 'fs';
@@ -40,6 +41,7 @@ function sanitizeForFilename(s: string): string {
  * Append a single LLM call to the log file (JSONL format) and write individual file
  */
 export function logLLMCall(entry: LLMCallLog): void {
+  if (process.env.LLM_PROMPT_LOG !== 'true') return;
   try {
     const line = JSON.stringify(entry) + '\n';
 
