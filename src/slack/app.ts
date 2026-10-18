@@ -4,9 +4,10 @@ import { resolveTenant } from '../middleware/tenantAuth';
 import { authService } from '../services/container';
 import { getTool } from '../tools';
 import { TenantContext } from '../types';
-import { loadConversation, runAgent, runTool, saveConversation, savePendingAction, takePendingAction, PendingAction } from './agent';
+import { hasConversation, loadConversation, runAgent, runTool, saveConversation, savePendingAction, takePendingAction, PendingAction } from './agent';
 import { AlertRef, confirmationBlocks, contextBlock, markdownBlock } from './blocks';
 import { botTokenForTeam, installationStore, slackDb } from './store';
+import { isAlertThread } from './alerts';
 
 type SlackClient = webApi.WebClient;
 
@@ -15,9 +16,11 @@ export const SLACK_BOT_SCOPES = [
   'app_mentions:read',
   'channels:history',
   'channels:join',
+  'channels:read',
   'chat:write',
   'commands',
   'groups:history',
+  'groups:read',
   'im:history',
   'im:write',
 ];
@@ -37,6 +40,22 @@ async function setSessionStatus(client: SlackClient, channel: string, threadTs: 
     await client.agents.sessions.setStatus({ channel_id: channel, thread_ts: threadTs, status });
   } catch {
     // Only agent-view DMs have sessions; channel threads don't.
+  }
+}
+
+export type ChannelMembership = 'member' | 'joined' | 'needs_invite' | 'unknown';
+
+/** Public channels are joined automatically; private ones need a manual /invite. */
+export async function ensureInChannel(client: SlackClient, channel: string): Promise<ChannelMembership> {
+  try {
+    const info = await client.conversations.info({ channel });
+    if (info.channel?.is_member) return 'member';
+    if (info.channel?.is_private) return 'needs_invite';
+    await client.conversations.join({ channel });
+    return 'joined';
+  } catch (error) {
+    console.warn(`[Slack] Could not ensure membership in ${channel}:`, (error as { data?: { error?: string } }).data?.error ?? error);
+    return 'unknown';
   }
 }
 
@@ -93,15 +112,25 @@ const HELP = [
 ].join('\n');
 
 function registerListeners(app: App): void {
-  // Direct messages (agent view) — every top-level message starts or continues a thread session.
+  // DMs (agent view), plus follow-ups in channel threads AuditDelta is already part of
+  // (alert threads and threads where it was mentioned) — no @mention needed there.
   app.message(async ({ message, client, context }) => {
-    if (message.channel_type !== 'im' || message.subtype !== undefined || !('text' in message) || !message.text) return;
-    if (!context.teamId) return;
+    if (message.subtype !== undefined || !('text' in message) || !message.text || !context.teamId) return;
+    const threadTs = message.thread_ts ?? message.ts;
+    if (message.channel_type !== 'im') {
+      if (!message.thread_ts) return;
+      // Mentions are handled by the app_mention listener.
+      if (context.botUserId && message.text.includes(`<@${context.botUserId}>`)) return;
+      const active =
+        (await hasConversation(context.teamId, message.channel, message.thread_ts)) ||
+        (await isAlertThread(context.teamId, message.channel, message.thread_ts));
+      if (!active) return;
+    }
     await handleUserMessage({
       client,
       teamId: context.teamId,
       channel: message.channel,
-      threadTs: message.thread_ts ?? message.ts,
+      threadTs,
       userId: message.user,
       text: message.text,
     });
@@ -152,22 +181,30 @@ function registerListeners(app: App): void {
           await respond({ response_type: 'ephemeral', text: 'Connect an org first with `/auditdelta connect`.' });
           return;
         }
-        if (command.channel_id.startsWith('C')) {
-          try {
-            await client.conversations.join({ channel: command.channel_id });
-          } catch {
-            // Private channels need a manual /invite.
-          }
-        }
+        const membership = await ensureInChannel(client, command.channel_id);
         await slackDb().setSlackAlertChannel(teamId, link.org_id, command.channel_id);
-        await respond({ response_type: 'in_channel', text: `:bell: Change alerts for org \`${link.org_id}\` will be posted in this channel.` });
+        await respond({
+          response_type: 'in_channel',
+          text:
+            `:bell: Change alerts for org \`${link.org_id}\` will be posted in this channel.` +
+            (membership === 'needs_invite' ? ' This is a private channel: run `/invite @AuditDelta` so I can post here.' : ''),
+        });
         return;
       }
       case 'status': {
         const links = await slackDb().getSlackLinksForTeam(teamId);
-        const text = links.length
-          ? links.map((l) => `• \`${l.org_id}\`${l.is_default ? ' (default)' : ''} — alerts: ${l.alert_channel_id ? `<#${l.alert_channel_id}>` : '_not set_'}`).join('\n')
-          : 'No org connected. Run `/auditdelta connect`.';
+        const lines = await Promise.all(
+          links.map(async (l) => {
+            let alerts = '_not set_';
+            if (l.alert_channel_id) {
+              const info = await client.conversations.info({ channel: l.alert_channel_id }).catch(() => null);
+              const member = info?.channel?.is_member;
+              alerts = `<#${l.alert_channel_id}>${member === false ? ' :warning: I am not in this channel — `/invite @AuditDelta`' : ''}`;
+            }
+            return `• \`${l.org_id}\`${l.is_default ? ' (default)' : ''} — alerts: ${alerts}`;
+          })
+        );
+        const text = lines.length ? lines.join('\n') : 'No org connected. Run `/auditdelta connect`.';
         await respond({ response_type: 'ephemeral', text });
         return;
       }
@@ -267,11 +304,13 @@ export async function onSalesforceConnectedFromSlack(link: { teamId: string; use
   const token = await botTokenForTeam(link.teamId);
   if (!token) return;
   const client = new webApi.WebClient(token);
+  const membership = alertChannel ? await ensureInChannel(client, alertChannel) : 'unknown';
   await client.chat.postMessage({
     channel: link.userId,
     text:
       `:white_check_mark: Salesforce org \`${orgId}\` is connected.` +
       (alertChannel ? ` Change alerts will go to <#${alertChannel}>.` : ' Run `/auditdelta alerts here` in a channel to receive change alerts.') +
+      (membership === 'needs_invite' ? ' It is a private channel, so run `/invite @AuditDelta` there first.' : '') +
       ' Ask me anything about your org’s configuration changes.',
   });
 }

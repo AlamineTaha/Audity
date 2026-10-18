@@ -101,6 +101,8 @@ export interface AuditDiff {
   summary: string;
   changes: string[];
   securityFindings?: string[];
+  /** Highest severity among findings introduced by this change; null when none. */
+  riskLevel?: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | null;
   timestamp: string;
   orgId: string;
 }

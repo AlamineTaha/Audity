@@ -9,7 +9,7 @@ import * as cron from 'node-cron';
 import { SalesforceService } from './salesforceService';
 import { AIService } from './aiService';
 import { SalesforceAuthService } from './authService';
-import { SetupAuditTrail, OrgSettings } from '../types';
+import { SetupAuditTrail, OrgSettings, AuditDiff } from '../types';
 
 export class MonitorService {
   private salesforceService: SalesforceService;
@@ -622,22 +622,15 @@ export class MonitorService {
     }
 
     const diff = await this.aiService.generateSummary(
-      delta.previous,
-      delta.current,
+      { ...(delta.previous as object), VersionNumber: delta.previousVersion },
+      { ...(delta.current as object), VersionNumber: delta.currentVersion },
       flowName,
       settings
     );
 
     const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${delta.definitionId}`;
 
-    const mainMessage = allRecords.length === 1
-      ? this.buildSingleFlowMessage(flowName, diff.summary, newest, [], settings, flowUrl)
-      : `*[FLOW] ${flowName}*\n` +
-        `v${delta.previousVersion} → v${delta.currentVersion}\n\n` +
-        `${diff.summary}\n\n` +
-        `*Changed by:* ${newest.CreatedBy?.Name || 'Unknown'}\n` +
-        `*Time:* ${new Date(newest.CreatedDate).toLocaleString()}\n` +
-        `*View in Salesforce:* ${flowUrl}`;
+    const mainMessage = this.buildFlowMessage(flowName, diff, delta.previousVersion, delta.currentVersion, newest, allRecords.length, flowUrl);
 
     const threadTs = await this.authService.getFlowThreadTs(orgId, flowName);
     const category = this.getCategoryForMetadataType('FlowDefinition');
@@ -692,30 +685,23 @@ export class MonitorService {
     console.log(`[Monitor] Published Validation Rule for ${objectName}.${ruleName}`);
   }
 
-  /**
-   * Build message for single flow change
-   */
-  private buildSingleFlowMessage(
+  private buildFlowMessage(
     flowName: string,
-    summary: string,
-    auditRecord: SetupAuditTrail,
-    parentFlows: Array<{ flowApiName: string; label?: string }>,
-    settings: OrgSettings,
-    flowUrl?: string
+    diff: AuditDiff,
+    previousVersion: number,
+    currentVersion: number,
+    newest: SetupAuditTrail,
+    auditRecordCount: number,
+    flowUrl: string
   ): string {
-    const riskLevel = this.determineRiskLevel(summary);
-    let result = `*[FLOW] ${flowName}*\n\n`;
-    if (parentFlows.length > 0) {
-      result += `*[SUBFLOW] Used by ${parentFlows.length} parent Flow(s):*\n`;
-      parentFlows.forEach(p => { result += `  • *${p.flowApiName}*${p.label ? ` (${p.label})` : ''}\n`; });
-      result += `\n*Impact:* Changes to this subflow will affect all parent flows listed above.\n\n`;
-    }
-    result += `${summary}\n\n`;
-    result += `*Risk:* ${riskLevel}\n` +
-      `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
-      `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
-      `*View in Salesforce:* ${flowUrl || `${settings.instanceUrl}/lightning/setup/Flows/home`}`;
-    return result;
+    const risk = diff.riskLevel ? `*Risk introduced:* ${diff.riskLevel}` : '*Risk introduced:* none detected';
+    return (
+      `*[FLOW] ${flowName}* · v${previousVersion} → v${currentVersion}` +
+      (auditRecordCount > 1 ? ` · ${auditRecordCount} setup events` : '') +
+      `\n${risk}\n\n${diff.summary}\n\n` +
+      `*Changed by:* ${newest.CreatedBy?.Name || 'Unknown'} · ${new Date(newest.CreatedDate).toLocaleString()}\n` +
+      `*View in Salesforce:* ${flowUrl}`
+    );
   }
 
   /**
@@ -1124,27 +1110,4 @@ export class MonitorService {
   }
   */
 
-  /**
-   * Determine risk level from AI summary
-   */
-  private determineRiskLevel(summary: string): 'Low' | 'Medium' | 'High' {
-    const lowerSummary = summary.toLowerCase();
-    
-    if (lowerSummary.includes('security') || lowerSummary.includes('permission') || 
-        lowerSummary.includes('access') || lowerSummary.includes('risk')) {
-      return 'High';
-    }
-    
-    if (lowerSummary.includes('delete') || lowerSummary.includes('remove') || 
-        lowerSummary.includes('critical')) {
-      return 'High';
-    }
-    
-    if (lowerSummary.includes('update') || lowerSummary.includes('modify') || 
-        lowerSummary.includes('change')) {
-      return 'Medium';
-    }
-    
-    return 'Low';
-  }
 }

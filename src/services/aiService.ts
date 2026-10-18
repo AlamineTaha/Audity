@@ -6,6 +6,7 @@
 import { OrgSettings, AuditDiff } from '../types';
 import { logLLMCall } from '../utils/llmPromptLogger';
 import { getLlm } from '../llm';
+import { diffFlowVersions, FlowDiff, highestSeverity, renderDiffLines, renderFindingLines } from '../analysis/flowDiff';
 
 export class AIService {
 
@@ -776,9 +777,50 @@ Plain text only. No markdown, no emoji. Under 60 words.`;
   }
 
   /**
-   * Generate a summary of changes between two Flow versions
-   * Updated to extract security findings from AI response
+   * Explains a Flow version change from a deterministic diff + rule findings.
+   * The model never sees raw metadata, so it can only describe changes that exist.
    */
+  async explainFlowChange(
+    oldMetadata: unknown,
+    newMetadata: unknown,
+    flowName: string,
+    settings: OrgSettings,
+    options: { oldVersion?: number; newVersion?: number; parentFlows?: Array<{ flowApiName: string; label?: string }> } = {}
+  ): Promise<{ text: string; diff: FlowDiff }> {
+    const diff = diffFlowVersions(oldMetadata, newMetadata, flowName, options.oldVersion, options.newVersion);
+    const versions = options.oldVersion && options.newVersion ? `v${options.oldVersion} → v${options.newVersion}` : 'previous → current version';
+
+    if (diff.propertyChanges.length === 0 && diff.elements.length === 0) {
+      return { text: `*No functional change* in \`${flowName}\` (${versions}): the versions differ only in canvas layout.`, diff };
+    }
+
+    const isNewFlow = !oldMetadata || (typeof oldMetadata === 'object' && Object.keys(oldMetadata as object).length === 0);
+    const parents = options.parentFlows?.length
+      ? `\nUsed as a subflow by: ${options.parentFlows.map((p) => p.flowApiName).join(', ')}`
+      : '';
+    const prompt = `You are a senior Salesforce security architect reviewing a Flow change for the admin team.
+The diff and findings below were computed by a program from the actual metadata — they are complete and exact. Explain them; do not invent changes that are not listed.
+
+FLOW: ${flowName} (${versions}${isNewFlow ? ', newly created flow' : ''})
+Type: ${diff.context.processType ?? 'unknown'} | Trigger: ${diff.context.trigger ?? 'n/a'} | Run mode: ${diff.context.runInMode ?? 'DefaultMode'}${parents}
+
+DIFF ("+" added, "-" removed, "~" modified; paths use [name] for list items; connector.targetReference = the next element on that path):
+${renderDiffLines(diff).join('\n').slice(0, 24000)}
+
+DETERMINISTIC FINDINGS (introduced = caused by this change):
+${renderFindingLines(diff.findings).join('\n') || 'none'}
+
+Write the review in Slack mrkdwn: *bold* section titles, "• " bullets, \`ApiNames\` in backticks. No other markdown, no tables, no emoji. Under 350 words. Sections, in this order:
+*Summary* — one or two sentences: what the flow now does differently, in business terms.
+*What changed* — one bullet per meaningful change, naming the element and quoting before → after values. Rewired paths count: say which step now leads where. Skip pure layout noise.
+*Impact* — which records/users are affected and when it fires; mention parent flows if any.
+*Security & risk* — each finding as "[SEVERITY] …", introduced ones first; confirm, correct or add to the findings based on the diff. Say "No issues introduced" only if there are none.
+*Recommendation* — concrete next steps (e.g. add a fault path to \`X\`, filter \`Y\`, or revert to the previous version).`;
+
+    const text = await this.callLLM(prompt, settings, 'explainFlowChange');
+    return { text, diff };
+  }
+
   async generateSummary(
     oldJson: unknown,
     newJson: unknown,
@@ -786,63 +828,21 @@ Plain text only. No markdown, no emoji. Under 60 words.`;
     settings: OrgSettings,
     parentFlows?: Array<{ flowApiName: string; label?: string }>
   ): Promise<AuditDiff> {
-    // Sanitize inputs to reduce token usage
-    const sanitizedOld = this.sanitizeJson(oldJson);
-    const sanitizedNew = this.sanitizeJson(newJson);
-
-    const prompt = this.buildPrompt(sanitizedOld, sanitizedNew, flowName, parentFlows);
-    const summary = await this.callLLM(prompt, settings, 'generateSummary');
-
-    // Parse the summary to extract structured information
-    const changes = this.extractChanges(summary);
-    const securityFindings = this.extractSecurityFindings(summary);
-
+    const oldVersion = (oldJson as { VersionNumber?: number })?.VersionNumber;
+    const newVersion = (newJson as { VersionNumber?: number })?.VersionNumber;
+    const { text, diff } = await this.explainFlowChange(oldJson, newJson, flowName, settings, { oldVersion, newVersion, parentFlows });
     return {
       flowName,
-      flowApiName: flowName, // Can be enhanced to extract actual API name
-      oldVersion: (sanitizedOld as { VersionNumber?: number })?.VersionNumber || 0,
-      newVersion: (sanitizedNew as { VersionNumber?: number })?.VersionNumber || 0,
-      summary,
-      changes,
-      securityFindings, // Add security findings to the response
+      flowApiName: flowName,
+      oldVersion: oldVersion || 0,
+      newVersion: newVersion || 0,
+      summary: text,
+      changes: renderDiffLines(diff),
+      securityFindings: renderFindingLines(diff.findings),
+      riskLevel: highestSeverity(diff.findings, true),
       timestamp: new Date().toISOString(),
       orgId: settings.orgId,
     };
-  }
-
-  /**
-   * Extract security findings from LLM response
-   * Looks for SECURITY & PERFORMANCE section
-   */
-  private extractSecurityFindings(summary: string): string[] {
-    const findings: string[] = [];
-    const lines = summary.split('\n');
-
-    let inSecuritySection = false;
-    for (const line of lines) {
-      if (line.trim().startsWith('SECURITY & PERFORMANCE:') || 
-          line.trim().startsWith('SECURITY AND PERFORMANCE:')) {
-        inSecuritySection = true;
-        // Extract the content after the colon
-        const content = line.split(':').slice(1).join(':').trim();
-        if (content && !content.startsWith('IMPACTS')) {
-          findings.push(content);
-        }
-        continue;
-      }
-      if (inSecuritySection && line.trim().startsWith('IMPACTS:')) {
-        break;
-      }
-      if (inSecuritySection && line.trim()) {
-        // Collect all lines in the security section
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('IMPACTS')) {
-          findings.push(trimmed);
-        }
-      }
-    }
-
-    return findings.length > 0 ? findings : [];
   }
 
   /**
@@ -908,57 +908,7 @@ Format your response in clear sections. Use Slack markdown formatting (*bold* fo
     }
   }
 
-  /**
-   * Build the prompt for the LLM (structured format for automated pipeline).
-   * Used by trigger-check and Slack notifications where changes/security
-   * need to be parsed programmatically.
-   */
-  private buildPrompt(
-    oldJson: unknown, 
-    newJson: unknown, 
-    flowName: string, 
-    parentFlows?: Array<{ flowApiName: string; label?: string }>
-  ): string {
-    let parentFlowContext = '';
-    if (parentFlows && parentFlows.length > 0) {
-      const parentList = parentFlows.map(p => `- ${p.flowApiName}${p.label ? ` (${p.label})` : ''}`).join('\n');
-      parentFlowContext = `\n\nIMPORTANT: This Flow is used as a subflow by:\n${parentList}\nChanges here affect all parent flows above.`;
-    }
-
-    return `You are an expert Salesforce Technical Architect. Compare two Flow versions and explain what changed.
-
-Flow: ${flowName}${parentFlowContext}
-
-OLD VERSION:
-${JSON.stringify(oldJson, null, 2)}
-
-NEW VERSION:
-${JSON.stringify(newJson, null, 2)}
-
-Rules:
-- Plain text only. No markdown, no stars, no backticks, no quotes, no emoji, no HTML.
-- Be concise. Under 200 words.
-- Flag: hardcoded IDs, DML inside loops, missing fault paths.
-
-Format your response EXACTLY as:
-
-Summary: [One sentence — the business reason for this change]
-
-Changes:
-- [change 1 — element name, what was added/modified/deleted]
-- [change 2]
-
-Security:
-- [CRITICAL or MEDIUM or LOW]: [description]. Or "No issues detected."
-
-Impact: [One sentence — who or what is affected]`;
-  }
-
-  /**
-   * Compare two Flow versions and produce a human-readable narrative comparison.
-   * This is the user-facing comparison — explains what changed, why it matters,
-   * and flags bad practices, in natural language an admin can understand.
-   */
+  /** Human-readable comparison of two specific Flow versions (same engine as change alerts). */
   async compareFlowVersions(
     oldMetadata: unknown,
     newMetadata: unknown,
@@ -967,48 +917,11 @@ Impact: [One sentence — who or what is affected]`;
     newerVersion: number,
     settings: OrgSettings
   ): Promise<string> {
-    const sanitizedOld = this.sanitizeJson(oldMetadata);
-    const sanitizedNew = this.sanitizeJson(newMetadata);
-
-    const prompt = `You are an expert Salesforce Technical Architect. A Salesforce admin asks you to compare two versions of a Flow and explain exactly what changed between them.
-
-Flow: ${flowName}
-Comparing: Version ${olderVersion} (before) to Version ${newerVersion} (after)
-
-VERSION ${olderVersion} (BEFORE):
-${JSON.stringify(sanitizedOld, null, 2)}
-
-VERSION ${newerVersion} (AFTER):
-${JSON.stringify(sanitizedNew, null, 2)}
-
-Your job is to produce a clear, human-readable comparison. Write as if you are explaining the changes to a Salesforce Admin in a meeting.
-
-Rules:
-- Plain text only. No markdown, no stars, no backticks, no code fences, no emoji, no HTML.
-- Write in full sentences, not bullet points. This should read like a spoken explanation.
-- Focus on WHAT changed (elements added, removed, or modified) and WHY it matters.
-- Compare specific elements: record lookups, loops, decisions, assignments, DML operations, subflows, scheduled paths, etc.
-- For each change, explain the business impact: does it affect data integrity, performance, user experience, or compliance?
-- Flag bad practices with severity:
-  CRITICAL: DML inside loops, SOQL inside loops, missing fault paths on DML, hardcoded Record IDs, no null checks before DML.
-  HIGH: Broad queries without filters, missing entry conditions, bypass of sharing rules.
-  MEDIUM: Unused variables, redundant assignments, overly complex decision logic.
-  LOW: Naming convention issues, minor optimizations.
-- If no issues are detected, say so.
-- Keep it under 400 words.
-
-Format your response as:
-
-What changed:
-[2-5 sentences describing the concrete changes between the two versions. Name the elements, the objects, the fields.]
-
-Business impact:
-[2-3 sentences explaining how these changes affect users, processes, or data.]
-
-Security and performance:
-[1-3 sentences. State the severity level (CRITICAL/HIGH/MEDIUM/LOW) and the specific concern. If clean, say "No issues detected."]`;
-
-    return await this.callLLM(prompt, settings, 'compareFlowVersions');
+    const { text } = await this.explainFlowChange(oldMetadata, newMetadata, flowName, settings, {
+      oldVersion: olderVersion,
+      newVersion: newerVersion,
+    });
+    return text;
   }
 
   /**
@@ -1093,29 +1006,4 @@ Impact: [One sentence — which users, objects, or processes are affected]`;
     result = result.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)));
     return result;
   }
-
-  /**
-   * Extract structured changes from LLM response
-   */
-  private extractChanges(summary: string): string[] {
-    const changes: string[] = [];
-    const lines = summary.split('\n');
-
-    let inChangesSection = false;
-    for (const line of lines) {
-      if (line.trim().startsWith('CHANGES:')) {
-        inChangesSection = true;
-        continue;
-      }
-      if (inChangesSection && line.trim().startsWith('IMPACTS:')) {
-        break;
-      }
-      if (inChangesSection && line.trim().startsWith('-')) {
-        changes.push(line.trim().substring(1).trim());
-      }
-    }
-
-    return changes.length > 0 ? changes : [summary]; // Fallback to full summary if parsing fails
-  }
 }
-

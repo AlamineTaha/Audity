@@ -31,6 +31,10 @@ export async function loadConversation(teamId: string, channel: string, threadTs
   return raw ? (JSON.parse(raw) as LlmMessage[]) : [];
 }
 
+export async function hasConversation(teamId: string, channel: string, threadTs: string): Promise<boolean> {
+  return (await authService.getCachedValue(conversationKey(teamId, channel, threadTs))) !== null;
+}
+
 export async function saveConversation(teamId: string, channel: string, threadTs: string, messages: LlmMessage[]): Promise<void> {
   await authService.setCachedValue(conversationKey(teamId, channel, threadTs), JSON.stringify(messages), CONVERSATION_TTL_SEC);
 }
@@ -52,6 +56,7 @@ function systemPrompt(tenant: TenantContext): string {
   return [
     `You are AuditDelta, a Salesforce configuration-governance assistant working inside Slack for the team that administers the Salesforce org ${tenant.orgId} (${tenant.instanceUrl}).`,
     'Answer from tool results, never from assumptions about the org. If no tool can answer, say so.',
+    'The audit trail only says that a Flow version was created or activated. Whenever a Flow change is involved, call analyze_flow_changes (latest change) or compare_flow_versions (specific versions) for that Flow and report the element-level diff and its security findings — never describe a Flow change from the audit trail alone.',
     'Write for Slack: lead with the answer in one or two sentences, then short bullets. Use Markdown. Mention risk explicitly when you see it (hardcoded IDs, DML in loops, broad permissions such as Modify All Data).',
     'Tools that change the org (activating or reverting a Flow version) are never run directly: when you call one, the user gets Confirm/Cancel buttons. After calling it, tell the user what will happen and that they need to confirm.',
   ].join('\n');
