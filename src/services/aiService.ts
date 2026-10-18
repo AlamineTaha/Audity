@@ -1,31 +1,13 @@
 /**
- * AI Service for analyzing Flow and CMS changes
- * Supports both Personal (Gemini API Key) and Enterprise (Vertex AI) billing modes
+ * AI Service for analyzing metadata changes.
+ * Provider-agnostic: calls go through the configured LlmProvider (LLM_PROVIDER env).
  */
 
-import axios, { AxiosInstance } from 'axios';
 import { OrgSettings, AuditDiff } from '../types';
 import { logLLMCall } from '../utils/llmPromptLogger';
+import { getLlm } from '../llm';
 
 export class AIService {
-  private geminiApiKey: string;
-  private geminiModel: string;
-  private vertexAiEndpoint: string;
-  private vertexAiRegion: string;
-  private axiosInstance: AxiosInstance;
-
-  constructor() {
-    this.geminiApiKey = process.env.GEMINI_API_KEY || '';
-    // Use gemini-2.5-flash (latest, best price-performance) or gemini-2.5-pro (powerful reasoning)
-    // gemini-1.5-flash and gemini-1.5-pro are deprecated/not available
-    this.geminiModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    this.vertexAiEndpoint = process.env.VERTEX_AI_ENDPOINT || 'https://us-central1-aiplatform.googleapis.com/v1/projects';
-    this.vertexAiRegion = process.env.VERTEX_AI_REGION || 'us-central1';
-
-    this.axiosInstance = axios.create({
-      timeout: 60000, // 60 second timeout for AI calls
-    });
-  }
 
   /**
    * Interpret a Validation Rule formula using Gemini AI
@@ -1074,11 +1056,11 @@ Impact: [One sentence — which users, objects, or processes are affected]`;
    * Logs prompt and response to llm_prompts_log.jsonl for debugging duplicate messages
    */
   private async callLLM(prompt: string, settings: OrgSettings, method: string = 'unknown'): Promise<string> {
-    const raw = settings.billingMode === 'ENTERPRISE'
-      ? await this.callVertexAI(prompt, settings)
-      : await this.callGeminiAPI(prompt);
-
-    const response = this.decodeHtmlEntities(raw);
+    const result = await getLlm().generate({ messages: [{ role: 'user', text: prompt }] });
+    if (!result.text) {
+      throw new Error(`No response text from ${getLlm().name} (${result.stopReason ?? 'unknown reason'})`);
+    }
+    const response = this.decodeHtmlEntities(result.text);
 
     logLLMCall({
       timestamp: new Date().toISOString(),
@@ -1110,113 +1092,6 @@ Impact: [One sentence — which users, objects, or processes are affected]`;
     result = result.replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
     result = result.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)));
     return result;
-  }
-
-  /**
-   * Call Google Gemini API (Personal billing mode)
-   * Made public for testing purposes
-   */
-  async callGeminiAPI(prompt: string): Promise<string> {
-    if (!this.geminiApiKey) {
-      throw new Error('GEMINI_API_KEY is not configured');
-    }
-
-    // Use gemini-2.5-flash (latest) or gemini-2.5-pro
-    // gemini-1.5-flash and gemini-1.5-pro are no longer available
-    const url = `https://generativelanguage.googleapis.com/v1/models/${this.geminiModel}:generateContent?key=${this.geminiApiKey}`;
-
-    try {
-      const response = await this.axiosInstance.post(
-        url,
-        {
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        }
-      );
-
-      const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) {
-        throw new Error('No response text from Gemini API');
-      }
-
-      return text;
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        console.error('Gemini API Error:', error.response?.data || error.message);
-        throw new Error(`Gemini API call failed: ${error.response?.status} ${error.message}`);
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Call Google Vertex AI (Enterprise billing mode)
-   * Includes X-Goog-User-Project header for customer billing
-   */
-  private async callVertexAI(prompt: string, settings: OrgSettings): Promise<string> {
-    if (!settings.gcpProjectId) {
-      throw new Error('GCP Project ID is required for Enterprise billing mode');
-    }
-
-    const projectId = settings.gcpProjectId;
-    const location = this.vertexAiRegion;
-    // Use gemini-2.5-flash (latest) or gemini-2.5-pro
-    // gemini-1.5-flash and gemini-1.5-pro are no longer available
-    const model = this.geminiModel;
-    const url = `${this.vertexAiEndpoint}/${projectId}/locations/${location}/publishers/google/models/${model}:generateContent`;
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'X-Goog-User-Project': projectId, // Critical: This header ensures customer billing
-    };
-
-    // Add Authorization header if using service account (optional enhancement)
-    // For now, assuming OAuth token is passed via environment or service account key
-
-    try {
-      const response = await this.axiosInstance.post(
-        url,
-        {
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-        },
-        {
-          headers,
-        }
-      );
-
-      const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) {
-        throw new Error('No response text from Vertex AI');
-      }
-
-      return text;
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        console.error('Vertex AI Error:', error.response?.data || error.message);
-        throw new Error(`Vertex AI call failed: ${error.response?.status} ${error.message}`);
-      }
-      throw error;
-    }
   }
 
   /**

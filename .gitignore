@@ -17,3 +17,6 @@ llm_prompts_log/
 ApexTestResult-*.csv
 cert.txt
 .local-backup/
+
+# Google Cloud service-account keys
+ehc-*.json

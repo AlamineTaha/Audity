@@ -7,18 +7,17 @@
  */
 
 import { Router, Request, Response } from 'express';
-import path from 'path';
-import fs from 'fs';
-import crypto from 'crypto';
-import { authService, salesforceService, aiService, reportService } from '../services/container';
-import { REPORTS_DIR } from '../config/reports';
+import { authService } from '../services/container';
+import { AuthenticatedRequest } from '../types';
+import { toolRoute } from '../tools/rest';
 import {
-  AuthenticatedRequest,
-  AnalyzeFlowResponse,
-  AuditReportProcessType,
-  AuditReportEntry,
-  SetupAuditTrail,
-} from '../types';
+  analyzeFlowChangesTool,
+  checkFlowRevertImpactTool,
+  activateFlowVersionTool,
+  revertFlowTodayTool,
+  listFlowVersionsTool,
+} from '../tools/flows';
+import { generateAuditReportTool } from '../tools/reports';
 
 const router = Router();
 
@@ -57,173 +56,7 @@ const router = Router();
  *       500:
  *         description: Internal server error
  */
-router.post('/analyze-flow', async (req: Request, res: Response) => {
-  try {
-    const { tenant } = req as AuthenticatedRequest;
-    const orgId = tenant.orgId;
-    const { flowName } = req.body;
-
-    if (!flowName) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required field: flowName',
-      } as AnalyzeFlowResponse);
-    }
-
-
-    const settings = await authService.getOrgSettings(orgId);
-    if (!settings) {
-      return res.status(404).json({
-        success: false,
-        error: `Organization settings not found for this tenant. Please re-authenticate at /auth/authorize`,
-      } as AnalyzeFlowResponse);
-    }
-
-    let versions;
-    try {
-      versions = await salesforceService.getFlowVersions(orgId, flowName);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      if (errorMessage.includes('not found')) {
-        return res.status(404).json({
-          success: false,
-          flowName,
-          error: `Flow not found: ${flowName}`,
-        } as AnalyzeFlowResponse);
-      }
-      throw error;
-    }
-
-    const diff = await aiService.generateSummary(
-      versions.previous,
-      versions.current,
-      flowName,
-      settings
-    );
-
-    const versionsToday = await salesforceService.getFlowVersionsInTimeWindow(orgId, flowName, 24);
-    const versionNumbersToday = versionsToday.map(v => v.versionNumber);
-    const recommendedStableVersion = await salesforceService.findLastStableVersion(orgId, flowName, 24);
-
-    let revertPrompt = '';
-    if (versionNumbersToday.length > 0) {
-      revertPrompt = recommendedStableVersion
-        ? `Would you like to activate Version ${recommendedStableVersion} (Last Stable), a specific version, or keep the current changes?`
-        : `Would you like to activate a specific version or keep the current changes?`;
-    } else {
-      revertPrompt = 'No changes detected today. No revert action needed.';
-    }
-
-    let dependencies;
-    try {
-      dependencies = await salesforceService.getFlowDependencyReport(orgId, flowName);
-    } catch (error) {
-      console.error(`Error fetching dependency report for ${flowName}:`, error);
-      dependencies = {
-        reportedDependencies: [],
-        uiDependencies: { buttons: [], quickActions: [] },
-        subflowDependencies: [],
-        securityNote: 'Dependency analysis could not be completed. Error occurred during metadata query.',
-        limitations: [
-          'Analysis limited to Metadata (Subflows/Buttons). External callers (Apex/LWC) were not scanned.',
-          'Dependency analysis could not be completed due to an error. Please verify manually.',
-        ],
-      };
-    }
-
-    let revertImpact;
-    if (recommendedStableVersion) {
-      try {
-        revertImpact = await salesforceService.checkRevertImpact(orgId, flowName, recommendedStableVersion);
-      } catch (error) {
-        console.error(`Error checking revert impact for ${flowName}:`, error);
-        revertImpact = {
-          warnings: ['Could not analyze revert impact. Please verify manually before reverting.'],
-          activeSessions: 0,
-          canRevert: false,
-        };
-      }
-    } else {
-      revertImpact = { warnings: [], activeSessions: 0, canRevert: true };
-    }
-
-    let riskAnalysis;
-    try {
-      const flowMetadata = await salesforceService.getFlowMetadata(orgId, flowName);
-      if (flowMetadata) {
-        const metadataStr = JSON.stringify(flowMetadata).toLowerCase();
-        const hasPII = /(ssn|social|credit|card|password|pin|salary|wage|compensation)/i.test(metadataStr);
-        const hasModifyAll = /modifyall|viewall/i.test(metadataStr);
-
-        if (hasModifyAll) {
-          riskAnalysis = {
-            riskLevel: 'CRITICAL' as const,
-            riskReason: 'Flow contains ModifyAll or ViewAll operations which grant access to all records regardless of sharing rules.',
-          };
-        } else if (hasPII) {
-          riskAnalysis = {
-            riskLevel: 'HIGH' as const,
-            riskReason: 'Flow accesses PII (Personally Identifiable Information) fields. Ensure proper security controls are in place.',
-          };
-        } else {
-          riskAnalysis = {
-            riskLevel: 'LOW' as const,
-            riskReason: 'No high-risk operations detected in Flow metadata.',
-          };
-        }
-      }
-    } catch (error) {
-      console.error(`Error analyzing Flow risk:`, error);
-      riskAnalysis = {
-        riskLevel: 'MEDIUM' as const,
-        riskReason: 'Could not complete risk analysis. Please verify manually.',
-      };
-    }
-
-    let displayText = `Flow: ${diff.flowName}\n\n${diff.summary}\n`;
-
-    if (diff.changes.length > 0) {
-      displayText += '\nChanges:\n';
-      for (const c of diff.changes) {
-        displayText += `  - ${c}\n`;
-      }
-    }
-
-    if (riskAnalysis) {
-      displayText += `\nRisk: ${riskAnalysis.riskLevel} - ${riskAnalysis.riskReason}\n`;
-    }
-
-    if (versionNumbersToday.length > 0) {
-      displayText += `\n${versionNumbersToday.length} change(s) detected today. ${revertPrompt}`;
-    }
-
-    const response: AnalyzeFlowResponse = {
-      success: true,
-      displayText,
-      flowName: diff.flowName,
-      summary: diff.summary,
-      changes: diff.changes,
-      revertOptions: {
-        summary: `${versionNumbersToday.length} change(s) detected today.`,
-        versionsToday: versionNumbersToday,
-        recommendedStableVersion,
-        revertPrompt,
-      },
-      dependencies,
-      riskAnalysis,
-      revertImpact,
-    };
-
-    return res.json(response);
-  } catch (error) {
-    console.error('Error in analyze-flow endpoint:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    return res.status(500).json({
-      success: false,
-      error: errorMessage,
-    } as AnalyzeFlowResponse);
-  }
-});
+router.post('/analyze-flow', toolRoute(analyzeFlowChangesTool));
 
 /**
  * @swagger
@@ -472,50 +305,7 @@ router.post('/test-gemini', async (req: Request, res: Response) => {
  *               targetVersionNumber:
  *                 type: integer
  */
-router.post('/flows/check-revert-impact', async (req: Request, res: Response) => {
-  try {
-    const { tenant } = req as AuthenticatedRequest;
-    const orgId = tenant.orgId;
-    const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
-    const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
-
-    if (!flowApiName || targetVersionNumber === undefined) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: flowApiName and targetVersionNumber are required',
-      });
-    }
-
-
-    const impact = await salesforceService.checkRevertImpact(orgId, flowApiName, targetVersionNumber);
-
-    let displayText = impact.canRevert
-      ? `Safe to revert ${flowApiName} to version ${targetVersionNumber}.`
-      : `Reverting ${flowApiName} to version ${targetVersionNumber} is NOT recommended.`;
-
-    if (impact.warnings.length > 0) {
-      displayText += '\n\nWarnings:\n' + impact.warnings.map(w => `  - ${w}`).join('\n');
-    }
-    if (impact.activeSessions > 0) {
-      displayText += `\n\nNote: ${impact.activeSessions} active flow interview(s) currently in progress will be affected.`;
-    }
-
-    return res.json({
-      success: true,
-      displayText,
-      warnings: impact.warnings,
-      activeSessions: impact.activeSessions,
-      canRevert: impact.canRevert,
-    });
-  } catch (error) {
-    console.error('Error in check-revert-impact endpoint:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    if (errorMessage.includes('not found')) {
-      return res.status(404).json({ success: false, error: errorMessage });
-    }
-    return res.status(500).json({ success: false, error: errorMessage });
-  }
-});
+router.post('/flows/check-revert-impact', toolRoute(checkFlowRevertImpactTool));
 
 /**
  * @swagger
@@ -541,48 +331,7 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
  *               targetVersionNumber:
  *                 type: integer
  */
-router.post('/flows/activate-version', async (req: Request, res: Response) => {
-  try {
-    const { tenant } = req as AuthenticatedRequest;
-    const orgId = tenant.orgId;
-    const flowApiName = req.query.flowApiName ?? req.body.flowApiName;
-    const targetVersionNumber = req.query.targetVersionNumber ?? req.body.targetVersionNumber;
-
-    if (!flowApiName || targetVersionNumber === undefined) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: flowApiName and targetVersionNumber are required',
-      });
-    }
-
-
-    const result = await salesforceService.activateSpecificVersion(orgId, flowApiName, targetVersionNumber);
-
-    let displayText = result.message;
-    if (result.success && result.previousActiveVersion) {
-      displayText += ` Previous active version was ${result.previousActiveVersion}.`;
-    }
-    if (result.warnings?.length) {
-      displayText += '\n\nWarnings:\n' + result.warnings.map(w => `  - ${w}`).join('\n');
-    }
-
-    return res.json({
-      success: result.success,
-      displayText,
-      message: result.message,
-      previousActiveVersion: result.previousActiveVersion,
-      newActiveVersion: result.newActiveVersion,
-      warnings: result.warnings,
-    });
-  } catch (error) {
-    console.error('Error in activate-version endpoint:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    if (errorMessage.includes('not found')) {
-      return res.status(404).json({ success: false, error: errorMessage });
-    }
-    return res.status(500).json({ success: false, error: errorMessage });
-  }
-});
+router.post('/flows/activate-version', toolRoute(activateFlowVersionTool));
 
 /**
  * @swagger
@@ -608,47 +357,7 @@ router.post('/flows/activate-version', async (req: Request, res: Response) => {
  *                 type: integer
  *                 default: 24
  */
-router.post('/flows/revert-today', async (req: Request, res: Response) => {
-  try {
-    const { tenant } = req as AuthenticatedRequest;
-    const orgId = tenant.orgId;
-    const { flowApiName, hours = 24 } = req.body;
-
-    if (!flowApiName) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required field: flowApiName',
-      });
-    }
-
-
-    const result = await salesforceService.batchRevertTodayChanges(orgId, flowApiName, hours);
-
-    let displayText = result.message;
-    if (result.success && result.stableVersion) {
-      displayText += ` Reverted to stable version ${result.stableVersion}.`;
-    }
-    if (result.warnings?.length) {
-      displayText += '\n\nWarnings:\n' + result.warnings.map(w => `  - ${w}`).join('\n');
-    }
-
-    return res.json({
-      success: result.success,
-      displayText,
-      message: result.message,
-      stableVersion: result.stableVersion,
-      previousActiveVersion: result.previousActiveVersion,
-      warnings: result.warnings,
-    });
-  } catch (error) {
-    console.error('Error in revert-today endpoint:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    if (errorMessage.includes('not found')) {
-      return res.status(404).json({ success: false, error: errorMessage });
-    }
-    return res.status(500).json({ success: false, error: errorMessage });
-  }
-});
+router.post('/flows/revert-today', toolRoute(revertFlowTodayTool));
 
 /**
  * @swagger
@@ -671,102 +380,7 @@ router.post('/flows/revert-today', async (req: Request, res: Response) => {
  *           type: integer
  *           default: 24
  */
-router.get('/flows/versions', async (req: Request, res: Response) => {
-  try {
-    const { tenant } = req as AuthenticatedRequest;
-    const orgId = tenant.orgId;
-    const { flowApiName, hours } = req.query;
-
-    if (!flowApiName) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required query parameter: flowApiName',
-      });
-    }
-
-
-    const hoursNum = hours ? parseInt(hours as string, 10) : 24;
-    const versions = await salesforceService.getFlowVersionsInTimeWindow(
-      orgId,
-      flowApiName as string,
-      hoursNum
-    );
-
-    let displayText = `${versions.length} version(s) of ${flowApiName} in the last ${hoursNum} hour(s).\n`;
-    if (versions.length > 0) {
-      for (const v of versions) {
-        displayText += `  - Version ${v.versionNumber}: ${v.status || 'Unknown status'} (${v.versionId})\n`;
-      }
-    } else {
-      displayText += 'No versions found in this time window.';
-    }
-
-    return res.json({
-      success: true,
-      displayText,
-      flowApiName,
-      versions,
-      timeWindow: `${hoursNum} hours`,
-    });
-  } catch (error) {
-    console.error('Error in versions endpoint:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    if (errorMessage.includes('not found')) {
-      return res.status(404).json({ success: false, error: errorMessage });
-    }
-    return res.status(500).json({ success: false, error: errorMessage });
-  }
-});
-
-// ────────────────────────────────────────────────────────────────────────────
-// Process-type matchers (mirrors MonitorService logic)
-// ────────────────────────────────────────────────────────────────────────────
-
-const PROCESS_MATCHERS: Record<string, (r: SetupAuditTrail) => boolean> = {
-  Flow: (r) => {
-    const a = (r.Action || '').toLowerCase();
-    const s = (r.Section || '').toLowerCase();
-    return a.includes('flow') || s.includes('flow');
-  },
-  Permission: (r) => {
-    const a = (r.Action || '').toLowerCase();
-    return (
-      a.includes('perm') ||
-      a.includes('profile') ||
-      a.includes('role') ||
-      a.includes('userrole')
-    );
-  },
-  Layout: (r) => {
-    const a = (r.Action || '').toLowerCase();
-    const s = (r.Section || '').toLowerCase();
-    return a.includes('layout') || s.includes('layout');
-  },
-  ValidationRule: (r) => {
-    const a = (r.Action || '').toLowerCase();
-    return a.includes('validation');
-  },
-  CustomField: (r) => {
-    const a = (r.Action || '').toLowerCase();
-    return a.includes('customfield') || a.includes('formula') || a.startsWith('changedcf') || a.startsWith('createdcf') || a.startsWith('deletedcf');
-  },
-  Object: (r) => {
-    const a = (r.Action || '').toLowerCase();
-    const s = (r.Section || '').toLowerCase();
-    return (
-      a.includes('entity') ||
-      a.includes('customobject') ||
-      s.startsWith('customize')
-    );
-  },
-};
-
-function classifyEntry(record: SetupAuditTrail): string {
-  for (const [type, matcher] of Object.entries(PROCESS_MATCHERS)) {
-    if (matcher(record)) return type;
-  }
-  return 'Other';
-}
+router.get('/flows/versions', toolRoute(listFlowVersionsTool));
 
 /**
  * @swagger
@@ -823,141 +437,6 @@ function classifyEntry(record: SetupAuditTrail): string {
  *       500:
  *         description: Internal server error
  */
-router.post('/generate-audit-report', async (req: Request, res: Response) => {
-  try {
-    const { tenant } = req as AuthenticatedRequest;
-    const orgId = tenant.orgId;
-
-    const processType = (
-      req.query.processType ?? req.body.processType ?? 'All'
-    ) as AuditReportProcessType;
-    const rawHours = req.query.hours ?? req.body.hours ?? 24;
-    const hours = parseInt(String(rawHours), 10);
-
-    const validTypes: AuditReportProcessType[] = [
-      'Flow', 'Permission', 'Layout', 'ValidationRule', 'CustomField', 'Object', 'All',
-    ];
-    if (!validTypes.includes(processType)) {
-      return res.status(400).json({
-        success: false,
-        error: `Invalid processType. Must be one of: ${validTypes.join(', ')}`,
-      });
-    }
-    if (isNaN(hours) || hours < 1 || hours > 168) {
-      return res.status(400).json({
-        success: false,
-        error: 'hours must be an integer between 1 and 168',
-      });
-    }
-
-
-    const settings = await authService.getOrgSettings(orgId);
-    if (!settings) {
-      return res.status(404).json({
-        success: false,
-        error: `Organization settings not found. Please re-authenticate at /auth/authorize`,
-      });
-    }
-
-    console.log(`[AuditReport] Generating report – org=${orgId} process=${processType} hours=${hours}`);
-
-    const auditRecords = await salesforceService.queryAuditTrailByHours(orgId, hours);
-
-    const filtered =
-      processType === 'All'
-        ? auditRecords
-        : auditRecords.filter((r) => {
-            const matcher = PROCESS_MATCHERS[processType];
-            return matcher ? matcher(r) : false;
-          });
-
-    console.log(`[AuditReport] ${auditRecords.length} total records, ${filtered.length} match "${processType}"`);
-
-    // Build report entries with AI explanations (batch with concurrency limit)
-    const CONCURRENCY = 5;
-    const entries: AuditReportEntry[] = [];
-
-    for (let i = 0; i < filtered.length; i += CONCURRENCY) {
-      const batch = filtered.slice(i, i + CONCURRENCY);
-      const results = await Promise.all(
-        batch.map(async (record): Promise<AuditReportEntry> => {
-          let explanation: string | undefined;
-          try {
-            explanation = await aiService.interpretAuditEntry(
-              record.Action,
-              record.Display || '',
-              record.Section || '',
-              settings
-            );
-          } catch {
-            explanation = undefined;
-          }
-
-          return {
-            timestamp: record.CreatedDate,
-            user: record.CreatedBy?.Name || 'Unknown',
-            action: record.Action,
-            display: record.Display || '',
-            section: record.Section || '',
-            processType: classifyEntry(record),
-            explanation,
-          };
-        })
-      );
-      entries.push(...results);
-    }
-
-    // Generate executive summary
-    const overallSummary = await aiService.generateAuditReportSummary(
-      entries.map((e) => ({
-        action: e.action,
-        display: e.display,
-        user: e.user,
-        section: e.section,
-        processType: e.processType,
-      })),
-      processType,
-      hours,
-      settings
-    );
-
-    // Build the PDF
-    const pdfBuffer = await reportService.generatePdf(entries, processType, hours, orgId, overallSummary);
-
-    const reportId = crypto.randomUUID();
-    const filename = `AuditDelta_${processType}_${hours}h_${reportId}.pdf`;
-    const filePath = path.join(REPORTS_DIR, filename);
-    fs.writeFileSync(filePath, pdfBuffer);
-
-    const baseUrl = process.env.API_BASE_URL || `${req.protocol}://${req.get('host')}`;
-    const downloadUrl = `${baseUrl}/reports/${filename}`;
-
-    console.log(`[AuditReport] Report saved: ${filePath} (${pdfBuffer.length} bytes)`);
-
-    const displayText = `Your audit report is ready.\n\n` +
-      `Type: ${processType} changes in the last ${hours} hour(s)\n` +
-      `Records: ${filtered.length} change(s) analyzed\n\n` +
-      `Download: ${downloadUrl}`;
-
-    return res.json({
-      success: true,
-      displayText,
-      downloadUrl,
-      filename,
-      reportDetails: {
-        processType,
-        hours,
-        totalRecords: auditRecords.length,
-        filteredRecords: filtered.length,
-        entriesAnalyzed: entries.length,
-      },
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error('Error in generate-audit-report endpoint:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
-    return res.status(500).json({ success: false, error: errorMessage });
-  }
-});
+router.post('/generate-audit-report', toolRoute(generateAuditReportTool));
 
 export default router;

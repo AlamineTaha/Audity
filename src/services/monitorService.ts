@@ -4,6 +4,7 @@
  * Runs scheduled checks and can be triggered manually
  */
 
+import { publishChangeToSlack } from '../slack/alerts';
 import * as cron from 'node-cron';
 import { SalesforceService } from './salesforceService';
 import { AIService } from './aiService';
@@ -47,6 +48,22 @@ export class MonitorService {
       default:
         return 'Schema';
     }
+  }
+
+  /** Slack is the primary channel; orgs without a subscribed Slack channel keep the Salesforce Flow bridge. */
+  private async publishChange(
+    orgId: string,
+    summaryText: string,
+    component: string,
+    category: 'Security' | 'Automation' | 'Schema' = 'Schema',
+    threadTs?: string
+  ): Promise<void> {
+    try {
+      if (await publishChangeToSlack(orgId, summaryText, component, category)) return;
+    } catch (error) {
+      console.error(`[Monitor] Slack delivery failed for ${orgId}:${component}, falling back to Salesforce:`, error);
+    }
+    await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, component, category, threadTs);
   }
 
   private static readonly FIRST_RUN_LOOKBACK_MS = 10 * 60 * 1000;
@@ -624,7 +641,7 @@ export class MonitorService {
 
     const threadTs = await this.authService.getFlowThreadTs(orgId, flowName);
     const category = this.getCategoryForMetadataType('FlowDefinition');
-    await this.salesforceService.publishAuditToSalesforce(orgId, mainMessage, flowName, category, threadTs ?? undefined);
+    await this.publishChange(orgId, mainMessage, flowName, category, threadTs ?? undefined);
     console.log(`[Monitor] Published Flow activation for ${flowName}${threadTs ? ' (threaded)' : ' (new thread)'}`);
   }
 
@@ -670,7 +687,7 @@ export class MonitorService {
       `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/${objectName}/ValidationRules/view`;
 
     const category = this.getCategoryForMetadataType('ValidationRule');
-    await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, ruleName, category);
+    await this.publishChange(orgId, summaryText, ruleName, category);
     await this.authService.markValidationRuleProcessed(orgId, ruleName);
     console.log(`[Monitor] Published Validation Rule for ${objectName}.${ruleName}`);
   }
@@ -833,7 +850,7 @@ export class MonitorService {
         `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/PermSets/home`;
 
       const category = this.getCategoryForMetadataType('PermissionSet');
-      await this.salesforceService.publishAuditToSalesforce(
+      await this.publishChange(
         orgId,
         summaryText,
         `Permission batch (${userName})`,
@@ -864,7 +881,7 @@ export class MonitorService {
 
       // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
       const category = 'Schema';
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, display, category);
+      await this.publishChange(orgId, summaryText, display, category);
 
       console.log(`[Monitor] Published Object change notification to Salesforce for: ${display}`);
     } catch (error) {
@@ -912,7 +929,7 @@ export class MonitorService {
         `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/${objectName}/ValidationRules/view`;
 
       const category = this.getCategoryForMetadataType('ValidationRule');
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, ruleName, category);
+      await this.publishChange(orgId, summaryText, ruleName, category);
       await this.authService.markValidationRuleProcessed(orgId, ruleName);
       console.log(`[Monitor] Published Validation Rule for ${objectName}.${ruleName}`);
     } catch (error) {
@@ -987,7 +1004,7 @@ export class MonitorService {
         `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/${objectName}/FieldsAndRelationships/view`;
 
       const category = this.getCategoryForMetadataType('CustomField');
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, `${objectName}.${fieldName}`, category);
+      await this.publishChange(orgId, summaryText, `${objectName}.${fieldName}`, category);
       console.log(`[Monitor] Published Formula Field for ${objectName}.${fieldName}`);
     } catch (error) {
       console.error(`[Monitor] Error processing formula field change:`, error);
@@ -1019,7 +1036,7 @@ export class MonitorService {
 
       // Publish to Salesforce custom object (triggers Flow → Slack via native integration)
       const category = 'Schema';
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, display, category);
+      await this.publishChange(orgId, summaryText, display, category);
 
       console.log(`[Monitor] Published ${changeType} notification to Salesforce for: ${display}`);
     } catch (error) {
@@ -1046,7 +1063,7 @@ export class MonitorService {
       `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}`;
 
     const category = 'Schema';
-    await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, changeType, category);
+    await this.publishChange(orgId, summaryText, changeType, category);
     console.log(`[Monitor] Published fallback notification for: ${changeType}`);
   }
 
@@ -1091,7 +1108,7 @@ export class MonitorService {
         `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
         `*Note:* This action type is not specifically mapped. Review manually if needed.`;
 
-      await this.salesforceService.publishAuditToSalesforce(orgId, summaryText, action);
+      await this.publishChange(orgId, summaryText, action);
       console.log(`[Monitor] Published unmapped action notification for: ${action}`);
     } catch (error) {
       console.error(`[Monitor] Error processing unmapped action ${auditRecord.Action}:`, error);

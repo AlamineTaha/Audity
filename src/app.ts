@@ -20,6 +20,9 @@ import agentforceRoutes from './routes/agentforce';
 import authRoutes from './routes/auth';
 import monitoringRoutes from './routes/monitoring';
 import { tenantAuth } from './middleware/tenantAuth';
+import mcpOAuthRoutes from './mcp/oauth';
+import mcpRoutes from './mcp/server';
+import { createSlackReceiver } from './slack/app';
 
 const app: Express = express();
 
@@ -34,6 +37,10 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   res.set('Surrogate-Control', 'no-store');
   next();
 });
+// Slack verifies request signatures against the raw body, so mount it before the JSON parser.
+const slackReceiver = createSlackReceiver();
+if (slackReceiver) app.use(slackReceiver.router);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -153,6 +160,10 @@ const swaggerSpec = swaggerJsdoc(swaggerOptions);
 // Auth routes are fully public
 app.use('/auth', authRoutes);
 
+// MCP (bearer auth handled inside) + its OAuth client-credentials token endpoint
+app.use(mcpOAuthRoutes);
+app.use(mcpRoutes);
+
 // Apply conditional tenant auth before API routes
 app.use('/api/v1', conditionalTenantAuth);
 app.use('/api/v1', agentforceRoutes);
@@ -206,7 +217,7 @@ app.get('/api-docs', (_req, res) => {
 // Serve generated report PDFs (UUID filename = security token)
 app.get('/reports/:filename', (req, res) => {
   const filename = path.basename(req.params.filename);
-  if (!/^[a-zA-Z0-9_\-]+\.pdf$/.test(filename)) {
+  if (!/^[a-zA-Z0-9_-]+\.pdf$/.test(filename)) {
     return res.status(400).json({ error: 'Invalid filename' });
   }
   const filePath = path.join(REPORTS_DIR, filename);

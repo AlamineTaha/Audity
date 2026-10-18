@@ -25,6 +25,15 @@ export interface TenantRow {
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 16;
 
+export interface SlackOrgLinkRow {
+  team_id: string;
+  org_id: string;
+  alert_channel_id: string | null;
+  is_default: boolean;
+  linked_by: string | null;
+  created_at: Date;
+}
+
 export class DatabaseService {
   private pool: Pool;
   private encryptionKey: Buffer;
@@ -84,6 +93,28 @@ export class DatabaseService {
       `);
       await client.query(`
         CREATE INDEX IF NOT EXISTS idx_tenants_org_id ON tenants(org_id)
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS slack_installations (
+          install_key            VARCHAR(64) PRIMARY KEY,
+          team_id                VARCHAR(32),
+          enterprise_id          VARCHAR(32),
+          encrypted_installation TEXT NOT NULL,
+          created_at             TIMESTAMPTZ DEFAULT NOW(),
+          updated_at             TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS slack_org_links (
+          team_id          VARCHAR(32) NOT NULL,
+          org_id           VARCHAR(18) NOT NULL REFERENCES tenants(org_id) ON DELETE CASCADE,
+          alert_channel_id VARCHAR(32),
+          is_default       BOOLEAN NOT NULL DEFAULT TRUE,
+          linked_by        VARCHAR(32),
+          created_at       TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (team_id, org_id)
+        )
       `);
 
       console.log('[Database] Schema initialized');
@@ -236,5 +267,78 @@ export class DatabaseService {
       throw new Error(`No access token stored for org ${tenant.org_id}`);
     }
     return this.decrypt(tenant.encrypted_access_token);
+  }
+
+  // --------------- Slack ---------------
+
+  async saveSlackInstallation(installKey: string, teamId: string | undefined, enterpriseId: string | undefined, installation: unknown): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO slack_installations (install_key, team_id, enterprise_id, encrypted_installation)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (install_key) DO UPDATE SET
+         team_id = EXCLUDED.team_id, enterprise_id = EXCLUDED.enterprise_id,
+         encrypted_installation = EXCLUDED.encrypted_installation, updated_at = NOW()`,
+      [installKey, teamId ?? null, enterpriseId ?? null, this.encrypt(JSON.stringify(installation))]
+    );
+  }
+
+  async getSlackInstallation<T>(installKey: string): Promise<T | null> {
+    const result = await this.pool.query<{ encrypted_installation: string }>(
+      'SELECT encrypted_installation FROM slack_installations WHERE install_key = $1',
+      [installKey]
+    );
+    const row = result.rows[0];
+    return row ? (JSON.parse(this.decrypt(row.encrypted_installation)) as T) : null;
+  }
+
+  async deleteSlackInstallation(installKey: string): Promise<void> {
+    await this.pool.query('DELETE FROM slack_installations WHERE install_key = $1', [installKey]);
+  }
+
+  /** Links an org to a Slack workspace and makes it the workspace default. */
+  async linkSlackOrg(teamId: string, orgId: string, userId: string, alertChannelId?: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('UPDATE slack_org_links SET is_default = FALSE WHERE team_id = $1', [teamId]);
+      await client.query(
+        `INSERT INTO slack_org_links (team_id, org_id, alert_channel_id, is_default, linked_by)
+         VALUES ($1, $2, $3, TRUE, $4)
+         ON CONFLICT (team_id, org_id) DO UPDATE SET
+           is_default = TRUE, linked_by = EXCLUDED.linked_by,
+           alert_channel_id = COALESCE(EXCLUDED.alert_channel_id, slack_org_links.alert_channel_id)`,
+        [teamId, orgId, alertChannelId ?? null, userId]
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async unlinkSlackOrg(teamId: string, orgId: string): Promise<void> {
+    await this.pool.query('DELETE FROM slack_org_links WHERE team_id = $1 AND org_id = $2', [teamId, orgId]);
+  }
+
+  async getSlackLinksForTeam(teamId: string): Promise<SlackOrgLinkRow[]> {
+    const result = await this.pool.query<SlackOrgLinkRow>(
+      'SELECT * FROM slack_org_links WHERE team_id = $1 ORDER BY is_default DESC, created_at',
+      [teamId]
+    );
+    return result.rows;
+  }
+
+  async getSlackLinksForOrg(orgId: string): Promise<SlackOrgLinkRow[]> {
+    const result = await this.pool.query<SlackOrgLinkRow>('SELECT * FROM slack_org_links WHERE org_id = $1', [orgId]);
+    return result.rows;
+  }
+
+  async setSlackAlertChannel(teamId: string, orgId: string, channelId: string): Promise<void> {
+    await this.pool.query(
+      'UPDATE slack_org_links SET alert_channel_id = $3 WHERE team_id = $1 AND org_id = $2',
+      [teamId, orgId, channelId]
+    );
   }
 }

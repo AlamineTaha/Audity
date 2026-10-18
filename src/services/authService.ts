@@ -13,6 +13,25 @@ import * as crypto from 'crypto';
 import { OrgSettings } from '../types';
 import { DatabaseService } from './databaseService';
 
+export const SF_API_VERSION = process.env.SF_API_VERSION || '68.0';
+const OAUTH_STATE_TTL_SEC = 600;
+
+export interface SlackLinkIntent {
+  teamId: string;
+  userId: string;
+  channelId?: string;
+}
+
+interface PendingAuthorization {
+  codeVerifier: string;
+  loginUrl: string;
+  billingMode: 'PERSONAL' | 'ENTERPRISE';
+  gcpProjectId?: string;
+  slackLink?: SlackLinkIntent;
+}
+
+export class OAuthStateError extends Error {}
+
 export class SalesforceAuthService {
   private redisClient: RedisClientType;
   private clientId: string;
@@ -93,172 +112,114 @@ export class SalesforceAuthService {
     await this.redisClient.setEx(key, ttlSeconds, value);
   }
 
-  // --------------- PKCE ---------------
-
-  private generatePKCE(): { codeVerifier: string; codeChallenge: string } {
-    const codeVerifier = crypto.randomBytes(32).toString('base64url');
-    const codeChallenge = crypto
-      .createHash('sha256')
-      .update(codeVerifier)
-      .digest('base64url');
-    return { codeVerifier, codeChallenge };
-  }
-
-  /**
-   * Generate OAuth authorization URL.
-   * PKCE is disabled by default. Enable with USE_PKCE=true.
-   */
-  async getAuthorizationUrl(state?: string): Promise<string> {
-    const usePKCE = process.env.USE_PKCE === 'true';
-
-    const oauth2 = new jsforce.OAuth2({
-      clientId: this.clientId,
-      clientSecret: this.clientSecret,
-      redirectUri: this.redirectUri,
-      loginUrl: this.loginUrl,
-    });
-
-    let baseUrl = oauth2.getAuthorizationUrl({
-      scope: 'api id web refresh_token',
-      state: state || '',
-    });
-
-    if (usePKCE) {
-      await this.connect();
-      const { codeVerifier, codeChallenge } = this.generatePKCE();
-      const pkceKey = state ? `pkce:${state}` : `pkce:${Date.now()}`;
-      await this.redisClient.setEx(pkceKey, 600, codeVerifier);
-
-      const url = new URL(baseUrl);
-      url.searchParams.set('code_challenge', codeChallenge);
-      url.searchParams.set('code_challenge_method', 'S256');
-      baseUrl = url.toString();
-    }
-
-    return baseUrl;
-  }
-
-  /**
-   * Exchange authorization code for tokens.
-   * Returns OrgSettings AND persists the tenant into PostgreSQL.
-   * Caller receives the raw API key (only exposed once).
-   */
-  async authorize(
-    code: string,
-    billingMode: 'PERSONAL' | 'ENTERPRISE' = 'PERSONAL',
-    gcpProjectId?: string,
-    state?: string
-  ): Promise<{ orgSettings: OrgSettings; apiKey: string }> {
+  async deleteCachedValue(key: string): Promise<void> {
     await this.connect();
+    await this.redisClient.del(key);
+  }
 
-    // Retrieve PKCE verifier
-    let codeVerifier: string | null = null;
-    if (state) {
-      const pkceKey = `pkce:${state}`;
-      codeVerifier = await this.redisClient.get(pkceKey);
-      if (codeVerifier) await this.redisClient.del(pkceKey);
-    }
-    if (!codeVerifier) {
-      const keys = await this.redisClient.keys('pkce:*');
-      if (keys.length > 0) {
-        const recentKey = keys.sort().reverse()[0];
-        codeVerifier = await this.redisClient.get(recentKey);
-        if (codeVerifier) await this.redisClient.del(recentKey);
-      }
-    }
+  // --------------- OAuth (Web Server flow + PKCE) ---------------
 
-    const oauth2 = new jsforce.OAuth2({
-      clientId: this.clientId,
-      clientSecret: this.clientSecret,
-      redirectUri: this.redirectUri,
-      loginUrl: this.loginUrl,
+  /** Salesforce login host for the OAuth dance: production, sandbox, or a My Domain URL. */
+  static resolveLoginUrl(input: string | undefined, fallback: string): string {
+    if (!input) return fallback;
+    if (input === 'sandbox') return 'https://test.salesforce.com';
+    if (input === 'production') return 'https://login.salesforce.com';
+    const url = new URL(input);
+    if (url.protocol !== 'https:' || !/(^|\.)salesforce\.com$/.test(url.hostname)) {
+      throw new Error('loginUrl must be an https://*.salesforce.com URL, "sandbox" or "production"');
+    }
+    return url.origin;
+  }
+
+  async startAuthorization(options: {
+    loginUrl?: string;
+    billingMode?: 'PERSONAL' | 'ENTERPRISE';
+    gcpProjectId?: string;
+    slackLink?: SlackLinkIntent;
+  }): Promise<string> {
+    await this.connect();
+    const loginUrl = SalesforceAuthService.resolveLoginUrl(options.loginUrl, this.loginUrl);
+    const state = crypto.randomBytes(24).toString('base64url');
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+
+    const pending: PendingAuthorization = {
+      codeVerifier,
+      loginUrl,
+      billingMode: options.billingMode ?? 'PERSONAL',
+      gcpProjectId: options.gcpProjectId,
+      slackLink: options.slackLink,
+    };
+    await this.redisClient.setEx(`oauth_state:${state}`, OAUTH_STATE_TTL_SEC, JSON.stringify(pending));
+
+    const url = new URL(`${loginUrl}/services/oauth2/authorize`);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', this.clientId);
+    url.searchParams.set('redirect_uri', this.redirectUri);
+    url.searchParams.set('scope', 'api refresh_token');
+    url.searchParams.set('state', state);
+    url.searchParams.set('code_challenge', codeChallenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+    return url.toString();
+  }
+
+  /**
+   * Exchange the authorization code for tokens and persist the tenant.
+   * The raw API key is returned once; it is only stored hashed.
+   */
+  async completeAuthorization(code: string, state: string): Promise<{
+    orgSettings: OrgSettings;
+    apiKey: string;
+    slackLink?: SlackLinkIntent;
+  }> {
+    await this.connect();
+    const stateKey = `oauth_state:${state}`;
+    const raw = await this.redisClient.get(stateKey);
+    if (!raw) {
+      throw new OAuthStateError('This sign-in link has expired or was already used. Please start again.');
+    }
+    await this.redisClient.del(stateKey);
+    const pending = JSON.parse(raw) as PendingAuthorization;
+
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: this.clientId,
+      redirect_uri: this.redirectUri,
+      code,
+      code_verifier: pending.codeVerifier,
     });
+    if (this.clientSecret) body.set('client_secret', this.clientSecret);
 
-    const conn = new jsforce.Connection({ oauth2, version: '58.0' });
-
-    let userInfo;
-    if (codeVerifier) {
-      const tokenLoginUrl = this.loginUrl.includes('login.salesforce.com')
-        ? this.loginUrl
-        : 'https://login.salesforce.com';
-      const tokenUrl = `${tokenLoginUrl}/services/oauth2/token`;
-
-      let tokenParams = new URLSearchParams({
-        grant_type: 'authorization_code',
-        client_id: this.clientId,
-        redirect_uri: this.redirectUri,
-        code,
-        code_verifier: codeVerifier,
-      });
-
-      let response = await fetch(tokenUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: tokenParams.toString(),
-      });
-
-      if (!response.ok && (response.status === 400 || response.status === 401)) {
-        tokenParams = new URLSearchParams({
-          grant_type: 'authorization_code',
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-          redirect_uri: this.redirectUri,
-          code,
-          code_verifier: codeVerifier,
-        });
-        response = await fetch(tokenUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: tokenParams.toString(),
-        });
-      }
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        if (state) await this.redisClient.del(`pkce:${state}`);
-        throw new Error(
-          `PKCE token exchange failed: ${response.status} ${errorText}. ` +
-          'If PKCE is not required, set USE_PKCE=false in environment variables.'
-        );
-      }
-
-      const tokenData = await response.json() as {
-        access_token: string;
-        refresh_token?: string;
-        instance_url: string;
-      };
-      conn.accessToken = tokenData.access_token;
-      conn.refreshToken = tokenData.refresh_token || '';
-      conn.instanceUrl = tokenData.instance_url;
-      userInfo = await conn.identity();
-    } else {
-      userInfo = await conn.authorize(code);
+    const response = await fetch(`${pending.loginUrl}/services/oauth2/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    if (!response.ok) {
+      throw new Error(`Salesforce token exchange failed: ${response.status} ${await response.text()}`);
+    }
+    const tokenData = await response.json() as { access_token: string; refresh_token?: string; instance_url: string; id: string };
+    if (!tokenData.refresh_token) {
+      throw new Error('Salesforce did not return a refresh token. Ensure the app has the refresh_token scope.');
     }
 
-    const orgId =
-      (userInfo as any).organizationId ||
-      (userInfo as any).id?.split('/')[0] ||
-      '';
-
+    // Identity URL format: https://login.salesforce.com/id/{orgId}/{userId}
+    const orgId = new URL(tokenData.id).pathname.split('/')[2];
     const orgSettings: OrgSettings = {
       orgId,
-      accessToken: conn.accessToken || '',
-      refreshToken: conn.refreshToken || '',
-      instanceUrl: conn.instanceUrl || '',
-      billingMode,
-      gcpProjectId,
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token,
+      instanceUrl: tokenData.instance_url,
+      billingMode: pending.billingMode,
+      gcpProjectId: pending.gcpProjectId,
     };
 
-    // Generate API key and persist tenant in PostgreSQL
     const apiKey = DatabaseService.generateApiKey();
-    const apiKeyHash = DatabaseService.hashApiKey(apiKey);
-    const apiKeyPrefix = apiKey.substring(0, 12);
-
     if (this.db) {
       await this.db.upsertTenant({
-        orgId: orgSettings.orgId,
-        apiKeyHash,
-        apiKeyPrefix,
+        orgId,
+        apiKeyHash: DatabaseService.hashApiKey(apiKey),
+        apiKeyPrefix: apiKey.substring(0, 12),
         refreshToken: orgSettings.refreshToken,
         accessToken: orgSettings.accessToken,
         instanceUrl: orgSettings.instanceUrl,
@@ -266,11 +227,9 @@ export class SalesforceAuthService {
         gcpProjectId: orgSettings.gcpProjectId,
       });
     }
-
-    // Also cache in Redis for fast reads (backward compat + polling)
     await this.saveOrgSettings(orgSettings);
 
-    return { orgSettings, apiKey };
+    return { orgSettings, apiKey, slackLink: pending.slackLink };
   }
 
   // --------------- Org Settings (Redis cache layer) ---------------
@@ -432,15 +391,17 @@ export class SalesforceAuthService {
     if (!settings) throw new Error(`No settings found for orgId: ${orgId}`);
     if (!settings.refreshToken) throw new Error(`No refresh token for orgId: ${orgId}`);
 
-    const refreshResponse = await fetch(`${this.loginUrl}/services/oauth2/token`, {
+    // The org's own instance accepts token requests, which also covers sandboxes and My Domains.
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: this.clientId,
+      refresh_token: settings.refreshToken,
+    });
+    if (this.clientSecret) body.set('client_secret', this.clientSecret);
+    const refreshResponse = await fetch(`${settings.instanceUrl}/services/oauth2/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        client_id: this.clientId,
-        client_secret: this.clientSecret,
-        refresh_token: settings.refreshToken,
-      }).toString(),
+      body: body.toString(),
     });
 
     if (!refreshResponse.ok) {
@@ -460,42 +421,36 @@ export class SalesforceAuthService {
       instanceUrl: refreshData.instance_url || settings.instanceUrl,
     };
 
-    // Persist to both Redis cache AND PostgreSQL
     await this.saveOrgSettings(updatedSettings);
     if (this.db) {
-      await this.db.updateTokens(
-        orgId,
-        updatedSettings.accessToken,
-        refreshData.refresh_token || undefined
-      );
+      await this.db.updateTokens(orgId, updatedSettings.accessToken, refreshData.refresh_token || undefined);
     }
 
     return updatedSettings;
   }
 
+  /** jsforce refreshes on INVALID_SESSION_ID itself; the 'refresh' hook persists the new token. */
   async getConnection(orgId: string): Promise<jsforce.Connection> {
-    let settings = await this.getOrgSettings(orgId);
+    const settings = await this.getOrgSettings(orgId);
     if (!settings) throw new Error(`No settings found for orgId: ${orgId}`);
-
-    try {
-      settings = await this.refreshSession(orgId);
-    } catch (error) {
-      console.error(`Failed to refresh session for orgId ${orgId}:`, error);
-    }
-
-    const oauth2 = new jsforce.OAuth2({
-      clientId: this.clientId,
-      clientSecret: this.clientSecret,
-      redirectUri: this.redirectUri,
-      loginUrl: this.loginUrl,
-    });
-
-    return new jsforce.Connection({
-      oauth2,
+    const conn = new jsforce.Connection({
+      oauth2: new jsforce.OAuth2({
+        clientId: this.clientId,
+        clientSecret: this.clientSecret || undefined,
+        redirectUri: this.redirectUri,
+        loginUrl: settings.instanceUrl,
+      }),
       accessToken: settings.accessToken,
       refreshToken: settings.refreshToken,
       instanceUrl: settings.instanceUrl,
-      version: '58.0',
+      version: SF_API_VERSION,
     });
+    conn.on('refresh', (accessToken: string) => {
+      const updated = { ...settings, accessToken };
+      this.saveOrgSettings(updated)
+        .then(() => this.db?.updateTokens(orgId, accessToken))
+        .catch((err) => console.error(`[Auth] Failed to persist refreshed token for ${orgId}:`, err));
+    });
+    return conn;
   }
 }

@@ -11,6 +11,7 @@ import app from './app';
 import { DatabaseService } from './services/databaseService';
 import { authService, monitorService } from './services/container';
 import { initTenantAuth } from './middleware/tenantAuth';
+import { initSlackStore } from './slack/store';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const POLLING_ENABLED = String(process.env.POLLING_ENABLED ?? 'true').toLowerCase() === 'true';
@@ -48,6 +49,7 @@ async function startServer() {
 
     // 3. Initialize tenant auth middleware
     initTenantAuth(dbService, authService);
+    initSlackStore(dbService);
     console.log('[Startup] Tenant auth middleware initialized');
 
     // 4. Start change monitoring
