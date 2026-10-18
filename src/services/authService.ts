@@ -50,6 +50,8 @@ export class SalesforceAuthService {
     if (redisUrl) {
       this.redisClient = createClient({
         url: redisUrl,
+        // Heroku Redis closes connections idle for 300s; a ping keeps ours alive.
+        pingInterval: 60_000,
         socket: {
           tls: redisUrl.startsWith('rediss://'),
           rejectUnauthorized: false,
@@ -58,6 +60,7 @@ export class SalesforceAuthService {
       });
     } else {
       this.redisClient = createClient({
+        pingInterval: 60_000,
         socket: {
           host: process.env.REDIS_HOST || 'localhost',
           port: parseInt(process.env.REDIS_PORT || '6379'),

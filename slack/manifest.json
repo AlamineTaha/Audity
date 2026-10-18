@@ -1,18 +1,32 @@
 {
-  "_metadata": { "major_version": 2 },
+  "_metadata": {
+    "major_version": 2
+  },
   "display_information": {
     "name": "AuditDelta",
     "description": "Salesforce configuration-change governance in Slack",
     "background_color": "#1a4f8c"
   },
   "features": {
-    "bot_user": { "display_name": "AuditDelta", "always_online": true },
+    "bot_user": {
+      "display_name": "AuditDelta",
+      "always_online": true
+    },
     "agent_view": {
       "agent_description": "Ask about Salesforce configuration changes: what changed, who changed it, the risk, who has access, and safe rollbacks.",
       "suggested_prompts": [
-        { "title": "Recent changes", "message": "What changed in my Salesforce org in the last 24 hours?" },
-        { "title": "Permission check", "message": "Who can export reports, and through which permission sets?" },
-        { "title": "Flow diff", "message": "Compare the last two versions of my most recently changed Flow." }
+        {
+          "title": "Recent changes",
+          "message": "What changed in my Salesforce org in the last 24 hours?"
+        },
+        {
+          "title": "Permission check",
+          "message": "Who can export reports, and through which permission sets?"
+        },
+        {
+          "title": "Flow diff",
+          "message": "Compare the last two versions of my most recently changed Flow."
+        }
       ]
     },
     "slash_commands": [
@@ -26,16 +40,20 @@
     ]
   },
   "oauth_config": {
-    "redirect_urls": ["https://auditdelta-guardian-15ab56fef180.herokuapp.com/slack/oauth_redirect"],
+    "redirect_urls": [
+      "https://auditdelta-guardian-15ab56fef180.herokuapp.com/slack/oauth_redirect"
+    ],
     "scopes": {
       "bot": [
-        "assistant:write",
         "app_mentions:read",
+        "assistant:write",
         "channels:history",
         "channels:join",
+        "channels:read",
         "chat:write",
         "commands",
         "groups:history",
+        "groups:read",
         "im:history",
         "im:write"
       ]
@@ -44,9 +62,17 @@
   "settings": {
     "event_subscriptions": {
       "request_url": "https://auditdelta-guardian-15ab56fef180.herokuapp.com/slack/events",
-      "bot_events": ["app_mention", "message.im"]
+      "bot_events": [
+        "app_mention",
+        "message.im",
+        "message.channels",
+        "message.groups"
+      ]
     },
-    "interactivity": { "is_enabled": true, "request_url": "https://auditdelta-guardian-15ab56fef180.herokuapp.com/slack/events" },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://auditdelta-guardian-15ab56fef180.herokuapp.com/slack/events"
+    },
     "org_deploy_enabled": false,
     "socket_mode_enabled": false,
     "token_rotation_enabled": false
