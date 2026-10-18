@@ -1,12 +1,14 @@
 /**
  * Tenant Authentication Middleware
  *
- * Validates the X-API-Key header, resolves the tenant from the database
- * (with a Redis cache layer), and attaches TenantContext to the request.
+ * Resolves the tenant from either the X-API-Key header, or the Named Credential
+ * headers (x-sfdc-org-id + x-auditdelta-secret), with a Redis cache layer,
+ * and attaches TenantContext to the request.
  */
 
+import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
-import { DatabaseService } from '../services/databaseService';
+import { DatabaseService, TenantRow } from '../services/databaseService';
 import { SalesforceAuthService } from '../services/authService';
 import { TenantContext, AuthenticatedRequest } from '../types';
 
@@ -37,6 +39,14 @@ function isInfrastructureError(error: unknown): boolean {
   );
 }
 
+function sharedSecretMatches(provided: string): boolean {
+  const expected = process.env.AUDITDELTA_SECRET;
+  if (!expected) return false;
+  const a = crypto.createHash('sha256').update(provided).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 export function initTenantAuth(db: DatabaseService, auth: SalesforceAuthService): void {
   dbService = db;
   authServiceInstance = auth;
@@ -48,24 +58,38 @@ export async function tenantAuth(req: Request, res: Response, next: NextFunction
     return;
   }
 
+  const db = dbService;
   const apiKey = req.headers['x-api-key'] as string | undefined;
-  if (!apiKey) {
+  const sfOrgId = req.headers['x-sfdc-org-id'] as string | undefined;
+  const sharedSecret = req.headers['x-auditdelta-secret'] as string | undefined;
+
+  let cacheKey: string;
+  let fetchTenant: () => Promise<TenantRow | null>;
+  if (apiKey) {
+    const apiKeyHash = DatabaseService.hashApiKey(apiKey);
+    cacheKey = `${CACHE_PREFIX}${apiKeyHash}`;
+    fetchTenant = () => db.getTenantByApiKeyHash(apiKeyHash);
+  } else if (sfOrgId && sharedSecret) {
+    if (!sharedSecretMatches(sharedSecret)) {
+      res.status(401).json({ error: 'Invalid x-auditdelta-secret' });
+      return;
+    }
+    cacheKey = `${CACHE_PREFIX}org:${sfOrgId}`;
+    fetchTenant = () => db.getTenantByOrgId(sfOrgId);
+  } else {
     res.status(401).json({
-      error: 'Missing X-API-Key header',
-      hint: 'Include your API key in the X-API-Key header. You receive an API key after completing OAuth at /auth/authorize.',
+      error: 'Missing credentials',
+      hint: 'Send X-API-Key (issued after OAuth at /auth/authorize), or x-sfdc-org-id + x-auditdelta-secret via the Salesforce Named Credential.',
     });
     return;
   }
 
   try {
-    const apiKeyHash = DatabaseService.hashApiKey(apiKey);
     const requestPath = `${req.method} ${req.originalUrl}`;
 
     // Try Redis cache first
-    const cacheKey = `${CACHE_PREFIX}${apiKeyHash}`;
     let cached: string | null = null;
     try {
-      await authServiceInstance.connect();
       cached = await authServiceInstance.getCachedValue(cacheKey);
     } catch (redisError) {
       console.error(`[TenantAuth][REDIS] Cache read failed for ${requestPath}:`, redisError);
@@ -78,11 +102,11 @@ export async function tenantAuth(req: Request, res: Response, next: NextFunction
     }
 
     // Lookup in PostgreSQL (with retry/backoff for transient infrastructure failures)
-    let tenant: Awaited<ReturnType<DatabaseService['getTenantByApiKeyHash']>> = null;
+    let tenant: TenantRow | null = null;
     let lastLookupError: unknown = null;
     for (let attempt = 0; attempt <= TENANT_LOOKUP_RETRIES; attempt++) {
       try {
-        tenant = await dbService.getTenantByApiKeyHash(apiKeyHash);
+        tenant = await fetchTenant();
         break;
       } catch (lookupError) {
         lastLookupError = lookupError;
@@ -107,7 +131,7 @@ export async function tenantAuth(req: Request, res: Response, next: NextFunction
         });
         return;
       }
-      res.status(401).json({ error: 'Invalid API key' });
+      res.status(401).json({ error: apiKey ? 'Invalid API key' : `Org ${sfOrgId} is not registered with AuditDelta` });
       return;
     }
 

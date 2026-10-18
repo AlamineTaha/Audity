@@ -9,3 +9,11 @@ coverage/
 *.swo
 *~
 
+
+# Local artifacts that may contain org data
+llm_prompts_log.jsonl
+llm_prompts_log*.jsonl.bak
+llm_prompts_log/
+ApexTestResult-*.csv
+cert.txt
+.local-backup/

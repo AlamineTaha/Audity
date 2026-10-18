@@ -682,14 +682,11 @@ export class SalesforceService {
   }
 
   /**
-   * Query Setup Audit Trail for exactly N seconds (filtered by relevant actions)
-   * Used for snapshot aggregation with a precise 300-second window
+   * Query Setup Audit Trail since a timestamp (filtered by relevant actions), oldest first
    */
-  async queryAuditTrailBySecondsFiltered(orgId: string, seconds: number = 300): Promise<SetupAuditTrail[]> {
+  async queryAuditTrailSinceFiltered(orgId: string, since: Date): Promise<SetupAuditTrail[]> {
     const conn = await this.authService.getConnection(orgId);
-    const cutoffTime = new Date();
-    cutoffTime.setSeconds(cutoffTime.getSeconds() - seconds);
-    const cutoffTimeStr = cutoffTime.toISOString();
+    const cutoffTimeStr = since.toISOString();
 
     const soql = `
       SELECT Id, Action, Display, CreatedDate, CreatedBy.Id, CreatedBy.Name, Section

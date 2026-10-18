@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: auditdelta-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: auditdelta
+    ports:
+      - "5432:5432"
+    volumes:
+      - auditdelta_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: auditdelta-redis
+    restart: unless-stopped
+    command: redis-server --requirepass octopus
+    ports:
+      - "6379:6379"
+    volumes:
+      - auditdelta_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "octopus", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  auditdelta_pg_data:
+  auditdelta_redis_data:

@@ -1,34 +1,40 @@
-/**
- * Report Service
- * Generates PDF audit reports from SetupAuditTrail data with LLM explanations.
- * Used by the generate-audit-report Agentforce endpoint.
- */
-
 import PDFDocument from 'pdfkit';
 import { AuditReportEntry, AuditReportProcessType } from '../types';
 
-const COLORS = {
-  primary: '#1B5E94',
-  accent: '#0D9DDB',
-  headerBg: '#F0F7FC',
-  rowAlt: '#F8FAFB',
-  border: '#D0D5DD',
-  text: '#1A1A1A',
-  muted: '#667085',
-  white: '#FFFFFF',
-  risk: {
-    low: '#12B76A',
-    medium: '#F79009',
-    high: '#F04438',
-    critical: '#B42318',
-  },
+const C = {
+  brand:        '#1A4F8C',
+  brandDark:    '#0F2D52',
+  accent:       '#0EA5E9',
+  accentLight:  '#E0F2FE',
+  success:      '#059669',
+  successBg:    '#D1FAE5',
+  warning:      '#D97706',
+  warningBg:    '#FEF3C7',
+  danger:       '#DC2626',
+  dangerBg:     '#FEE2E2',
+  critical:     '#7C3AED',
+  criticalBg:   '#EDE9FE',
+  text:         '#111827',
+  sub:          '#374151',
+  muted:        '#6B7280',
+  faint:        '#9CA3AF',
+  border:       '#E5E7EB',
+  bg:           '#F9FAFB',
+  bgAlt:        '#F3F4F6',
+  white:        '#FFFFFF',
+};
+
+const PROCESS_ACCENT: Record<string, string> = {
+  Flow:           '#0EA5E9',
+  Permission:     '#8B5CF6',
+  Layout:         '#10B981',
+  ValidationRule: '#F59E0B',
+  CustomField:    '#EC4899',
+  Object:         '#F97316',
+  All:            '#1A4F8C',
 };
 
 export class ReportService {
-  /**
-   * Build a PDF buffer from audit report data.
-   * Returns a Buffer containing the complete PDF.
-   */
   async generatePdf(
     entries: AuditReportEntry[],
     processType: AuditReportProcessType,
@@ -39,7 +45,7 @@ export class ReportService {
     return new Promise((resolve, reject) => {
       const doc = new PDFDocument({
         size: 'A4',
-        margins: { top: 50, bottom: 50, left: 50, right: 50 },
+        margins: { top: 50, bottom: 60, left: 48, right: 48 },
         bufferPages: true,
         info: {
           Title: `AuditDelta Report – ${processType}`,
@@ -53,192 +59,308 @@ export class ReportService {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      this.renderCoverSection(doc, processType, hours, orgId, entries.length);
-      this.renderSummarySection(doc, overallSummary);
-      this.renderEntriesSection(doc, entries);
-      this.renderFooter(doc);
+      const L = doc.page.margins.left;
+      const W = doc.page.width - L - doc.page.margins.right;
+
+      let y = doc.page.margins.top;
+      y = this.drawCover(doc, L, W, y, processType, hours, orgId, entries.length);
+      y = this.drawSummary(doc, L, W, y, overallSummary);
+      this.drawEntries(doc, L, W, y, entries);
+      this.drawFooters(doc);
 
       doc.end();
     });
   }
 
-  private renderCoverSection(
+  // ─── Cover ────────────────────────────────────────────────────────────────
+
+  private drawCover(
     doc: PDFKit.PDFDocument,
-    processType: AuditReportProcessType,
-    hours: number,
-    orgId: string,
-    totalChanges: number
+    L: number, W: number, startY: number,
+    processType: string, hours: number, orgId: string, total: number
+  ): number {
+    const BAND_H = 120;
+    const bandY = startY;
+
+    // Brand header band
+    doc.rect(L, bandY, W, BAND_H).fill(C.brand);
+    // Accent stripe at top of band
+    doc.rect(L, bandY, W, 5).fill(C.accent);
+
+    // Title
+    doc.fillColor(C.white).font('Helvetica-Bold').fontSize(30)
+      .text('AuditDelta', L + 20, bandY + 24, { lineBreak: false });
+    doc.fillColor(C.accent).font('Helvetica').fontSize(14)
+      .text('Audit Report', L + 20, bandY + 62, { lineBreak: false });
+    doc.fillColor('#B3D9F0').font('Helvetica').fontSize(9.5)
+      .text('AI-Powered Salesforce Setup Audit Trail Analysis', L + 20, bandY + 83, { lineBreak: false });
+
+    // Process type pill (top-right of band)
+    doc.font('Helvetica-Bold').fontSize(8.5);
+    const ptLabel = processType.toUpperCase() + ' REPORT';
+    const ptLabelW = doc.widthOfString(ptLabel);
+    const pillW = ptLabelW + 18;
+    const pillH = 22;
+    const pillX = L + W - pillW - 14;
+    const pillY = bandY + 22;
+    doc.rect(pillX, pillY, pillW, pillH).fill(C.accent);
+    doc.fillColor(C.white).font('Helvetica-Bold').fontSize(8.5)
+      .text(ptLabel, pillX + 9, pillY + 7, { lineBreak: false });
+
+    let y = bandY + BAND_H + 22;
+
+    // 2×2 stat card grid
+    const CARD_W = (W - 12) / 2;
+    const CARD_H = 64;
+    const GAP = 12;
+    const displayOrgId = orgId.length > 22 ? orgId.slice(0, 22) + '…' : orgId;
+    const stats = [
+      { label: 'ORGANIZATION', value: displayOrgId },
+      { label: 'TIME WINDOW',  value: `Last ${hours} hour${hours !== 1 ? 's' : ''}` },
+      { label: 'TOTAL CHANGES', value: String(total) },
+      {
+        label: 'GENERATED',
+        value: new Date().toLocaleString('en-US', {
+          month: 'short', day: 'numeric', year: 'numeric',
+          hour: '2-digit', minute: '2-digit',
+        }),
+      },
+    ];
+
+    for (let i = 0; i < stats.length; i++) {
+      const col = i % 2;
+      const row = Math.floor(i / 2);
+      this.drawStatCard(
+        doc,
+        L + col * (CARD_W + GAP),
+        y + row * (CARD_H + GAP),
+        CARD_W, CARD_H,
+        stats[i].label, stats[i].value
+      );
+    }
+
+    y += 2 * (CARD_H + GAP) + 20;
+
+    // Horizontal divider
+    doc.rect(L, y, W, 1).fill(C.border);
+    y += 22;
+
+    return y;
+  }
+
+  private drawStatCard(
+    doc: PDFKit.PDFDocument,
+    x: number, y: number, w: number, h: number,
+    label: string, value: string
   ): void {
-    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-
-    doc.rect(doc.page.margins.left, doc.y, pageWidth, 90)
-      .fill(COLORS.primary);
-
-    doc.fillColor(COLORS.white)
-      .font('Helvetica-Bold')
-      .fontSize(24)
-      .text('AuditDelta', doc.page.margins.left + 20, doc.y - 75, { continued: true })
-      .font('Helvetica')
-      .text(' Audit Report');
-
-    doc.fillColor(COLORS.white)
-      .font('Helvetica')
-      .fontSize(11)
-      .text('AI-Powered Setup Audit Trail Analysis', doc.page.margins.left + 20);
-
-    doc.moveDown(2);
-
-    const metaY = doc.y + 10;
-    const col1X = doc.page.margins.left;
-    const col2X = doc.page.margins.left + pageWidth / 2;
-    const labelOpts = { width: pageWidth / 2 - 10 };
-
-    doc.fillColor(COLORS.muted).font('Helvetica').fontSize(9);
-    doc.text('Process Type', col1X, metaY, labelOpts);
-    doc.text('Time Window', col2X, metaY, labelOpts);
-    doc.fillColor(COLORS.text).font('Helvetica-Bold').fontSize(11);
-    doc.text(processType, col1X, metaY + 13, labelOpts);
-    doc.text(`Last ${hours} hour(s)`, col2X, metaY + 13, labelOpts);
-
-    doc.fillColor(COLORS.muted).font('Helvetica').fontSize(9);
-    doc.text('Organization', col1X, metaY + 35, labelOpts);
-    doc.text('Total Changes', col2X, metaY + 35, labelOpts);
-    doc.fillColor(COLORS.text).font('Helvetica-Bold').fontSize(11);
-    doc.text(orgId, col1X, metaY + 48, labelOpts);
-    doc.text(String(totalChanges), col2X, metaY + 48, labelOpts);
-
-    doc.fillColor(COLORS.muted).font('Helvetica').fontSize(9);
-    doc.text('Generated', col1X, metaY + 70, labelOpts);
-    doc.fillColor(COLORS.text).font('Helvetica').fontSize(10);
-    doc.text(new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'long' }), col1X, metaY + 83, labelOpts);
-
-    doc.y = metaY + 110;
-
-    doc.moveTo(col1X, doc.y)
-      .lineTo(col1X + pageWidth, doc.y)
-      .strokeColor(COLORS.border)
-      .lineWidth(0.5)
-      .stroke();
-
-    doc.moveDown(1);
+    doc.rect(x, y, w, h).fill(C.bg);
+    doc.rect(x, y, 3, h).fill(C.accent);
+    doc.fillColor(C.muted).font('Helvetica').fontSize(7.5)
+      .text(label, x + 13, y + 11, { width: w - 18, lineBreak: false });
+    const fontSize = value.length > 28 ? 9.5 : 12;
+    doc.fillColor(C.text).font('Helvetica-Bold').fontSize(fontSize)
+      .text(value, x + 13, y + 27, { width: w - 18 });
   }
 
-  private renderSummarySection(doc: PDFKit.PDFDocument, summary: string): void {
-    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-    const x = doc.page.margins.left;
+  // ─── Executive Summary ────────────────────────────────────────────────────
 
-    doc.fillColor(COLORS.primary).font('Helvetica-Bold').fontSize(14)
-      .text('Executive Summary', x);
-    doc.moveDown(0.5);
+  private drawSummary(
+    doc: PDFKit.PDFDocument,
+    L: number, W: number, y: number,
+    summary: string
+  ): number {
+    y = this.checkPage(doc, y, L, W, 110);
 
-    const boxY = doc.y;
-    const summaryHeight = doc.heightOfString(summary, { width: pageWidth - 30 }) + 20;
-    doc.rect(x, boxY, pageWidth, summaryHeight + 10)
-      .fill(COLORS.headerBg);
+    // Section heading
+    doc.rect(L, y, 4, 20).fill(C.accent);
+    doc.fillColor(C.brand).font('Helvetica-Bold').fontSize(14)
+      .text('Executive Summary', L + 13, y + 2);
+    y += 32;
 
-    doc.fillColor(COLORS.text).font('Helvetica').fontSize(10)
-      .text(summary, x + 15, boxY + 10, { width: pageWidth - 30 });
+    // Measure callout box height
+    doc.font('Helvetica').fontSize(10);
+    const textH = doc.heightOfString(summary, { width: W - 34 });
+    const boxH = textH + 36;
 
-    doc.y = boxY + summaryHeight + 20;
-    doc.moveDown(0.5);
+    doc.rect(L, y, W, boxH).fill(C.accentLight);
+    doc.rect(L, y, 3, boxH).fill(C.accent);
+
+    doc.fillColor(C.accent).font('Helvetica-Bold').fontSize(7.5)
+      .text('AI ANALYSIS', L + 13, y + 11);
+    doc.fillColor(C.sub).font('Helvetica').fontSize(10)
+      .text(summary, L + 13, y + 23, { width: W - 30 });
+
+    y += boxH + 26;
+    return y;
   }
 
-  private renderEntriesSection(doc: PDFKit.PDFDocument, entries: AuditReportEntry[]): void {
-    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-    const x = doc.page.margins.left;
+  // ─── Change Entries ───────────────────────────────────────────────────────
 
-    doc.fillColor(COLORS.primary).font('Helvetica-Bold').fontSize(14)
-      .text('Change Details', x);
-    doc.moveDown(0.5);
+  private drawEntries(
+    doc: PDFKit.PDFDocument,
+    L: number, W: number, y: number,
+    entries: AuditReportEntry[]
+  ): void {
+    y = this.checkPage(doc, y, L, W, 60);
+
+    doc.rect(L, y, 4, 20).fill(C.accent);
+    doc.fillColor(C.brand).font('Helvetica-Bold').fontSize(14)
+      .text(`Change Details  (${entries.length} entr${entries.length === 1 ? 'y' : 'ies'})`, L + 13, y + 2);
+    y += 32;
 
     if (entries.length === 0) {
-      doc.fillColor(COLORS.muted).font('Helvetica-Oblique').fontSize(10)
-        .text('No changes found for the selected process type and time window.', x);
+      doc.fillColor(C.muted).font('Helvetica-Oblique').fontSize(10)
+        .text('No changes found for the selected criteria.', L, y);
       return;
     }
 
     for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
-      this.renderEntryCard(doc, entry, i, pageWidth, x);
+      y = this.drawCard(doc, L, W, y, entries[i], i);
     }
   }
 
-  private renderEntryCard(
+  private drawCard(
     doc: PDFKit.PDFDocument,
-    entry: AuditReportEntry,
-    index: number,
-    pageWidth: number,
-    x: number
-  ): void {
-    doc.font('Helvetica').fontSize(9.5);
-    const explanationHeight = entry.explanation
-      ? doc.heightOfString(entry.explanation, { width: pageWidth - 30 })
-      : 0;
-    const cardHeight = 70 + (entry.explanation ? explanationHeight + 30 : 0);
+    L: number, W: number, y: number,
+    entry: AuditReportEntry, index: number
+  ): number {
+    const STRIP  = 4;
+    const PAD_H  = 14;
+    const PAD_V  = 12;
+    const META_H = 16;
+    const innerW = W - STRIP - PAD_H * 2;
 
-    if (doc.y + cardHeight > doc.page.height - doc.page.margins.bottom - 30) {
-      doc.addPage();
-    }
+    // Measure all text blocks first (font must be set before measuring)
+    doc.font('Helvetica-Bold').fontSize(10.5);
+    const actionH = doc.heightOfString(entry.action, { width: innerW });
 
-    const cardY = doc.y;
-    const bgColor = index % 2 === 0 ? COLORS.white : COLORS.rowAlt;
-    doc.rect(x, cardY, pageWidth, cardHeight).fill(bgColor);
+    doc.font('Helvetica').fontSize(9);
+    const displayH = doc.heightOfString(entry.display, { width: innerW });
 
-    doc.rect(x, cardY, 3, cardHeight).fill(COLORS.accent);
-
-    const innerX = x + 12;
-    const innerWidth = pageWidth - 22;
-
-    doc.fillColor(COLORS.muted).font('Helvetica').fontSize(8)
-      .text(
-        `#${index + 1}  |  ${this.formatTimestamp(entry.timestamp)}  |  ${entry.user}  |  ${entry.processType}`,
-        innerX, cardY + 8, { width: innerWidth }
-      );
-
-    doc.fillColor(COLORS.text).font('Helvetica-Bold').fontSize(10)
-      .text(entry.action, innerX, cardY + 22, { width: innerWidth });
-
-    doc.fillColor(COLORS.text).font('Helvetica').fontSize(9)
-      .text(entry.display, innerX, cardY + 38, { width: innerWidth });
-
+    let explBoxH = 0;
     if (entry.explanation) {
-      const explY = cardY + 58;
-
-      doc.rect(innerX, explY, innerWidth, explanationHeight + 16)
-        .fill(COLORS.headerBg);
-
-      doc.fillColor(COLORS.primary).font('Helvetica-Bold').fontSize(8)
-        .text('AI Explanation', innerX + 8, explY + 4);
-
-      doc.fillColor(COLORS.text).font('Helvetica').fontSize(9.5)
-        .text(entry.explanation, innerX + 8, explY + 16, { width: innerWidth - 16 });
+      doc.font('Helvetica').fontSize(9.5);
+      const textH = doc.heightOfString(entry.explanation, { width: innerW - 16 });
+      explBoxH = textH + 30; // padding above + label row + padding below
     }
 
-    doc.y = cardY + cardHeight + 4;
+    const cardH =
+      PAD_V
+      + META_H + 6
+      + actionH + 5
+      + displayH
+      + (explBoxH > 0 ? 12 + explBoxH : 0)
+      + PAD_V;
+
+    y = this.checkPage(doc, y, L, W, cardH + 2);
+
+    // Card background (alternating)
+    doc.rect(L, y, W, cardH).fill(index % 2 === 0 ? C.white : C.bg);
+
+    // Left accent strip colored by process type
+    const accentCol = PROCESS_ACCENT[entry.processType] ?? C.accent;
+    doc.rect(L, y, STRIP, cardH).fill(accentCol);
+
+    // Bottom separator
+    doc.rect(L, y + cardH, W, 0.5).fill(C.border);
+
+    const ix = L + STRIP + PAD_H;
+    let ty = y + PAD_V;
+
+    // ── Meta row ──────────────────────────────────────────────────────────
+    const metaText = `#${index + 1}  ·  ${this.formatTimestamp(entry.timestamp)}  ·  ${entry.user}`;
+    doc.fillColor(C.faint).font('Helvetica').fontSize(8)
+      .text(metaText, ix, ty, { width: innerW - 90, lineBreak: false });
+
+    // Process type badge (right-aligned, light gray bg)
+    doc.font('Helvetica-Bold').fontSize(7.5);
+    const badgeText = entry.processType;
+    const badgeTW = doc.widthOfString(badgeText);
+    const badgeW  = badgeTW + 12;
+    const badgeX  = L + W - badgeW - 8;
+    const badgeY  = ty - 3;
+    doc.rect(badgeX, badgeY, badgeW, 14).fill(C.bgAlt);
+    doc.fillColor(accentCol).font('Helvetica-Bold').fontSize(7.5)
+      .text(badgeText, badgeX + 6, ty, { lineBreak: false });
+
+    ty += META_H + 4;
+
+    // ── Action title ──────────────────────────────────────────────────────
+    doc.fillColor(C.text).font('Helvetica-Bold').fontSize(10.5)
+      .text(entry.action, ix, ty, { width: innerW });
+    ty += actionH + 5;
+
+    // ── Display name ──────────────────────────────────────────────────────
+    doc.fillColor(C.sub).font('Helvetica').fontSize(9)
+      .text(entry.display, ix, ty, { width: innerW });
+    ty += displayH;
+
+    // ── AI Explanation callout ────────────────────────────────────────────
+    if (entry.explanation) {
+      ty += 12;
+      doc.rect(ix, ty, innerW, explBoxH).fill(C.accentLight);
+      doc.rect(ix, ty, 2, explBoxH).fill(C.accent);
+
+      doc.fillColor(C.accent).font('Helvetica-Bold').fontSize(7.5)
+        .text('AI EXPLANATION', ix + 10, ty + 9);
+      doc.fillColor(C.sub).font('Helvetica').fontSize(9.5)
+        .text(entry.explanation, ix + 10, ty + 20, { width: innerW - 18 });
+      ty += explBoxH;
+    }
+
+    return y + cardH + 1;
   }
 
-  private renderFooter(doc: PDFKit.PDFDocument): void {
-    const pages = doc.bufferedPageRange();
-    for (let i = 0; i < pages.count; i++) {
+  // ─── Footers (all pages) ──────────────────────────────────────────────────
+
+  private drawFooters(doc: PDFKit.PDFDocument): void {
+    const range = doc.bufferedPageRange();
+    const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+
+    for (let i = 0; i < range.count; i++) {
       doc.switchToPage(i);
-      const bottom = doc.page.height - 30;
-      doc.fillColor(COLORS.muted).font('Helvetica').fontSize(8)
-        .text(
-          `AuditDelta Report  •  Page ${i + 1} of ${pages.count}  •  Generated ${new Date().toISOString()}`,
-          doc.page.margins.left,
-          bottom,
-          { width: doc.page.width - doc.page.margins.left - doc.page.margins.right, align: 'center' }
-        );
+      const L = doc.page.margins.left;
+      const W = doc.page.width - L - doc.page.margins.right;
+      const fy = doc.page.height - 38;
+
+      doc.rect(L, fy, W, 0.5).fill(C.border);
+
+      doc.fillColor(C.faint).font('Helvetica').fontSize(7.5)
+        .text('AuditDelta Guardian', L, fy + 10, { lineBreak: false });
+
+      doc.fillColor(C.faint).font('Helvetica').fontSize(7.5)
+        .text(`Page ${i + 1} of ${range.count}`, L, fy + 10, {
+          width: W, align: 'center', lineBreak: false,
+        });
+
+      doc.fillColor(C.faint).font('Helvetica').fontSize(7.5)
+        .text(ts, L, fy + 10, { width: W, align: 'right', lineBreak: false });
     }
+  }
+
+  // ─── Helpers ──────────────────────────────────────────────────────────────
+
+  private checkPage(
+    doc: PDFKit.PDFDocument,
+    y: number, L: number, W: number, needed: number
+  ): number {
+    const limit = doc.page.height - doc.page.margins.bottom;
+    if (y + needed > limit) {
+      doc.addPage();
+      const nL = doc.page.margins.left;
+      const nW = doc.page.width - nL - doc.page.margins.right;
+      // Thin accent stripe at top of continuation pages
+      doc.rect(nL, doc.page.margins.top, nW, 3).fill(C.accent);
+      return doc.page.margins.top + 16;
+    }
+    return y;
   }
 
   private formatTimestamp(iso: string): string {
     try {
       return new Date(iso).toLocaleString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
         hour12: true,
       });
     } catch {

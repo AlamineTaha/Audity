@@ -7,34 +7,10 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { MonitorService } from '../services/monitorService';
-import { SalesforceService } from '../services/salesforceService';
-import { AIService } from '../services/aiService';
-import { SalesforceAuthService } from '../services/authService';
+import { authService, salesforceService, aiService, monitorService } from '../services/container';
 import { AuthenticatedRequest } from '../types';
 
 const router = Router();
-
-let monitorService: MonitorService | null = null;
-
-function getMonitorService(): MonitorService {
-  if (!monitorService) {
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
-    monitorService = new MonitorService(
-      salesforceService,
-      aiService,
-      authService,
-      10
-    );
-  }
-  return monitorService;
-}
-
-export async function ensureWaitingRoomStarted(): Promise<void> {
-  getMonitorService();
-}
 
 /**
  * Safe Slack invite — no org context needed, just channelId and userIds
@@ -84,7 +60,6 @@ router.post('/slack-thread-callback', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
     await authService.setFlowThreadTs(orgId, flowDeveloperName, threadTs);
     console.log(`[Slack] Stored thread_ts for ${orgId}:${flowDeveloperName}`);
     return res.json({ success: true });
@@ -98,14 +73,12 @@ router.post('/slack-thread-callback', async (req: Request, res: Response) => {
 });
 
 /**
- * Clear audit_processed Redis cache (for re-testing).
- * No org context needed — clears all keys.
+ * Clear the calling tenant's audit_processed dedup cache (for re-testing).
  */
-router.post('/clear-audit-cache', async (_req: Request, res: Response) => {
+router.post('/clear-audit-cache', async (req: Request, res: Response) => {
   try {
-    const authService = new SalesforceAuthService();
-    await authService.connect();
-    const count = await authService.cleanupAuditProcessedKeys();
+    const { tenant } = req as AuthenticatedRequest;
+    const count = await authService.cleanupAuditProcessedKeys(tenant.orgId);
     return res.json({
       success: true,
       message: `Cleared ${count} audit_processed key(s). You can re-test now.`,
@@ -125,10 +98,9 @@ router.post('/clear-audit-cache', async (_req: Request, res: Response) => {
  * /api/v1/trigger-check:
  *   post:
  *     summary: Force Immediate Change Check
- *     description: Manually triggers the polling engine to check all registered orgs for changes.
+ *     description: Manually triggers the polling engine to check the calling tenant's org for changes.
  *     tags:
  *       - Monitoring
- *     security: []
  *     requestBody:
  *       required: false
  *       content:
@@ -158,14 +130,15 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
       });
     }
 
-    const service = getMonitorService();
+    const service = monitorService;
     const forceImmediate =
       String(req.query.forceImmediate ?? req.body.forceImmediate ?? '') === 'true' ||
       String(req.query.immediate ?? req.body.immediate ?? '') === 'true';
     const debugMode = String(debug) === 'true';
-    const result = await service.runChangeCheck(hoursNum, forceImmediate, debugMode);
+    const { tenant } = req as AuthenticatedRequest;
+    const result = await service.runChangeCheck(hoursNum, forceImmediate, debugMode, tenant.orgId);
 
-    const timeWindow = hoursNum ? `${hoursNum} hour(s)` : '300 seconds';
+    const timeWindow = hoursNum ? `${hoursNum} hour(s)` : 'since last check';
     const message = result.success
       ? `Manual check completed (${timeWindow}). Found ${result.changesFound} change(s).`
       : 'Manual check completed with errors.';
@@ -190,7 +163,7 @@ router.post('/trigger-check', async (req: Request, res: Response) => {
       message,
       changesFound: result.changesFound,
       errors: result.errors,
-      timeWindow: hoursNum ? `${hoursNum} hours` : '300 seconds',
+      timeWindow: hoursNum ? `${hoursNum} hours` : 'since last check',
       debug: debugMode,
       changes: result.changes || [],
     });
@@ -237,9 +210,6 @@ router.get('/recent-changes', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'hours must be a positive integer' });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
 
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
@@ -465,8 +435,6 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
 
     console.log(`[Analyze Permission] Fetching permission set: "${permissionSetName}"`);
     const psData = await salesforceService.getPermissionSetForAudit(orgId, String(permissionSetName));
@@ -477,7 +445,6 @@ router.post('/analyze-permission', async (req: Request, res: Response) => {
       return res.status(500).json({ error: 'Could not load org settings for AI analysis' });
     }
 
-    const aiService = new AIService();
     const analysis = await aiService.analyzePermissionSet(psData, settings);
 
     const typeLabel = psData.isOwnedByProfile
@@ -583,8 +550,6 @@ router.post('/find-permission-sources', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
 
     console.log(`[Find Permission Sources] Query: "${query}"`);
     const result = await salesforceService.findPermissionSources(orgId, String(query));
@@ -668,9 +633,6 @@ router.post('/explain-metadata', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
 
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
@@ -804,7 +766,7 @@ router.post('/analyze-validation-rules', async (req: Request, res: Response) => 
   try {
     const { tenant } = req as AuthenticatedRequest;
     const objectApiName = String(req.query.objectApiName ?? req.body.objectApiName ?? '').trim();
-    const orgId: string = tenant?.orgId ?? res.locals.orgId ?? req.query.orgId ?? req.body.orgId;
+    const orgId: string = tenant.orgId;
 
     if (!objectApiName) {
       return res.status(400).json({
@@ -813,16 +775,6 @@ router.post('/analyze-validation-rules', async (req: Request, res: Response) => 
       });
     }
 
-    if (!orgId) {
-      return res.status(400).json({
-        success: false,
-        error: 'orgId is required (send via x-sfdc-org-id header)',
-      });
-    }
-
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
 
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
@@ -926,9 +878,6 @@ router.post('/explain-validation-rules', async (req: Request, res: Response) => 
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
 
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
@@ -1018,9 +967,6 @@ router.post('/compare-flow-versions', async (req: Request, res: Response) => {
 
     console.log(`[CompareFlow][START] orgId=${orgId} flowName=${flowName} versionA=${String(versionA)} versionB=${String(versionB)} analyzeOnly=${analyzeOnly}`);
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
 
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {

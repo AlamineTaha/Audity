@@ -10,10 +10,7 @@ import { Router, Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { SalesforceService } from '../services/salesforceService';
-import { AIService } from '../services/aiService';
-import { SalesforceAuthService } from '../services/authService';
-import { ReportService } from '../services/reportService';
+import { authService, salesforceService, aiService, reportService } from '../services/container';
 import { REPORTS_DIR } from '../config/reports';
 import {
   AuthenticatedRequest,
@@ -73,9 +70,6 @@ router.post('/analyze-flow', async (req: Request, res: Response) => {
       } as AnalyzeFlowResponse);
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
 
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {
@@ -256,10 +250,9 @@ router.get('/health', (_req: Request, res: Response) => {
  * /api/v1/test-oauth-config:
  *   get:
  *     summary: Test OAuth configuration
- *     description: Validates that OAuth environment variables are configured correctly. No auth required.
+ *     description: Validates that OAuth environment variables are configured correctly. Requires ENABLE_DEBUG_ROUTES=true.
  *     tags:
  *       - Agentforce
- *     security: []
  *     responses:
  *       200:
  *         description: OAuth configuration test results
@@ -325,7 +318,6 @@ router.post('/test-connection', async (req: Request, res: Response) => {
   };
 
   try {
-    const authService = new SalesforceAuthService();
     await authService.connect();
 
     try {
@@ -391,10 +383,9 @@ router.post('/test-connection', async (req: Request, res: Response) => {
  * /api/v1/test-gemini:
  *   post:
  *     summary: Test Gemini API call
- *     description: Tests the Gemini API directly with different configurations. No org auth required.
+ *     description: Tests the Gemini API directly with different configurations. Requires ENABLE_DEBUG_ROUTES=true.
  *     tags:
  *       - Agentforce
- *     security: []
  */
 router.post('/test-gemini', async (req: Request, res: Response) => {
   const { prompt = 'Say hello in one sentence', apiVersion = 'v1', model } = req.body;
@@ -495,8 +486,6 @@ router.post('/flows/check-revert-impact', async (req: Request, res: Response) =>
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
 
     const impact = await salesforceService.checkRevertImpact(orgId, flowApiName, targetVersionNumber);
 
@@ -566,8 +555,6 @@ router.post('/flows/activate-version', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
 
     const result = await salesforceService.activateSpecificVersion(orgId, flowApiName, targetVersionNumber);
 
@@ -634,8 +621,6 @@ router.post('/flows/revert-today', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
 
     const result = await salesforceService.batchRevertTodayChanges(orgId, flowApiName, hours);
 
@@ -699,8 +684,6 @@ router.get('/flows/versions', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
 
     const hoursNum = hours ? parseInt(hours as string, 10) : 24;
     const versions = await salesforceService.getFlowVersionsInTimeWindow(
@@ -867,10 +850,6 @@ router.post('/generate-audit-report', async (req: Request, res: Response) => {
       });
     }
 
-    const authService = new SalesforceAuthService();
-    const salesforceService = new SalesforceService(authService);
-    const aiService = new AIService();
-    const reportService = new ReportService();
 
     const settings = await authService.getOrgSettings(orgId);
     if (!settings) {

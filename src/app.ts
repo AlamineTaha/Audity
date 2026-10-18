@@ -51,16 +51,14 @@ app.use((err: Error, _req: Request, res: Response, next: NextFunction) => {
 
 // ---- Endpoints that do NOT require tenant authentication ----
 // Paths are relative to the /api/v1 mount point (req.path strips the prefix)
-const PUBLIC_PATHS = new Set([
-  'GET:/health',
-  'GET:/test-oauth-config',
-  'POST:/test-gemini',
-  'POST:/trigger-check',
-  'POST:/slack-invite',
-  'POST:/clear-audit-cache',
-]);
+const PUBLIC_PATHS = new Set(['GET:/health']);
+const DEBUG_ROUTES_ENABLED = process.env.ENABLE_DEBUG_ROUTES === 'true';
 
 function conditionalTenantAuth(req: Request, res: Response, next: NextFunction): void {
+  if (!DEBUG_ROUTES_ENABLED && req.path.startsWith('/test-')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
   const key = `${req.method}:${req.path}`;
   if (PUBLIC_PATHS.has(key)) {
     next();
