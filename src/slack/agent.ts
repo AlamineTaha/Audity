@@ -31,10 +31,6 @@ export async function loadConversation(teamId: string, channel: string, threadTs
   return raw ? (JSON.parse(raw) as LlmMessage[]) : [];
 }
 
-export async function hasConversation(teamId: string, channel: string, threadTs: string): Promise<boolean> {
-  return (await authService.getCachedValue(conversationKey(teamId, channel, threadTs))) !== null;
-}
-
 export async function saveConversation(teamId: string, channel: string, threadTs: string, messages: LlmMessage[]): Promise<void> {
   await authService.setCachedValue(conversationKey(teamId, channel, threadTs), JSON.stringify(messages), CONVERSATION_TTL_SEC);
 }

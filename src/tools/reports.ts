@@ -9,10 +9,11 @@ import { defineTool, fail, ok } from './types';
 
 // Process-type matchers (mirrors MonitorService logic)
 const PROCESS_MATCHERS: Record<string, (r: SetupAuditTrail) => boolean> = {
+  // Flow versions are logged as "...interactiondefversion" actions, without the word "flow".
   Flow: (r) => {
     const a = (r.Action || '').toLowerCase();
     const s = (r.Section || '').toLowerCase();
-    return a.includes('flow') || s.includes('flow');
+    return a.includes('flow') || a.includes('interactiondef') || s.includes('flow');
   },
   Permission: (r) => {
     const a = (r.Action || '').toLowerCase();
@@ -46,6 +47,20 @@ const PROCESS_MATCHERS: Record<string, (r: SetupAuditTrail) => boolean> = {
     );
   },
 };
+
+// Same categories as PROCESS_MATCHERS, evaluated by Salesforce (SOQL LIKE is case-insensitive).
+const SOQL_CONDITIONS: Record<string, string> = {
+  Flow: "Action LIKE '%flow%' OR Action LIKE '%interactiondef%' OR Section LIKE '%flow%'",
+  Permission: "Action LIKE '%perm%' OR Action LIKE '%profile%' OR Action LIKE '%role%'",
+  Layout: "Action LIKE '%layout%' OR Section LIKE '%layout%'",
+  ValidationRule: "Action LIKE '%validation%'",
+  CustomField: "Action LIKE '%customfield%' OR Action LIKE '%formula%' OR Action LIKE 'changedCF%' OR Action LIKE 'createdCF%' OR Action LIKE 'deletedCF%'",
+  Object: "Action LIKE '%entity%' OR Action LIKE '%customobject%' OR Section LIKE 'Customize%'",
+};
+
+const MAX_REPORT_RECORDS = 2000;
+/** One LLM call per entry; beyond this the report lists entries without per-entry explanations. */
+const MAX_EXPLAINED_ENTRIES = 60;
 
 function classifyEntry(record: SetupAuditTrail): string {
   for (const [type, matcher] of Object.entries(PROCESS_MATCHERS)) {
@@ -91,7 +106,10 @@ export const generateAuditReportTool = defineTool({
 
       console.log(`[AuditReport] Generating report – org=${orgId} process=${processType} hours=${hours}`);
 
-      const auditRecords = await salesforceService.queryAuditTrailByHours(orgId, hours);
+      const auditRecords = await salesforceService.queryAuditTrailByHours(orgId, hours, {
+        condition: SOQL_CONDITIONS[processType],
+        maxRecords: MAX_REPORT_RECORDS,
+      });
 
       const filtered =
         processType === 'All'
@@ -110,17 +128,19 @@ export const generateAuditReportTool = defineTool({
       for (let i = 0; i < filtered.length; i += CONCURRENCY) {
         const batch = filtered.slice(i, i + CONCURRENCY);
         const results = await Promise.all(
-          batch.map(async (record): Promise<AuditReportEntry> => {
+          batch.map(async (record, j): Promise<AuditReportEntry> => {
             let explanation: string | undefined;
-            try {
-              explanation = await aiService.interpretAuditEntry(
-                record.Action,
-                record.Display || '',
-                record.Section || '',
-                settings
-              );
-            } catch {
-              explanation = undefined;
+            if (i + j < MAX_EXPLAINED_ENTRIES) {
+              try {
+                explanation = await aiService.interpretAuditEntry(
+                  record.Action,
+                  record.Display || '',
+                  record.Section || '',
+                  settings
+                );
+              } catch {
+                explanation = undefined;
+              }
             }
 
             return {

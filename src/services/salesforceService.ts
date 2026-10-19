@@ -796,21 +796,30 @@ export class SalesforceService {
    * @param hours Number of hours to look back (default: 24)
    * @returns Array of SetupAuditTrail records
    */
-  async queryAuditTrailByHours(orgId: string, hours: number = 24): Promise<SetupAuditTrail[]> {
+  /**
+   * @param condition Extra SOQL condition (e.g. type filter) applied server-side, so noisy
+   *   entries such as permission-set-group recalculations can't crowd out the ones we want.
+   */
+  async queryAuditTrailByHours(
+    orgId: string,
+    hours: number = 24,
+    options: { condition?: string; maxRecords?: number } = {}
+  ): Promise<SetupAuditTrail[]> {
     const cutoffTime = new Date();
     cutoffTime.setHours(cutoffTime.getHours() - hours);
     const cutoffTimeStr = cutoffTime.toISOString();
+    const maxRecords = options.maxRecords ?? 500;
 
     const soql = `
       SELECT Id, Action, Display, CreatedDate, CreatedBy.Id, CreatedBy.Name, Section
       FROM SetupAuditTrail
-      WHERE CreatedDate >= ${cutoffTimeStr}
+      WHERE CreatedDate >= ${cutoffTimeStr}${options.condition ? ` AND (${options.condition})` : ''}
       ORDER BY CreatedDate DESC
-      LIMIT 500
+      LIMIT ${maxRecords}
     `;
 
     return this.executeWithTokenRefresh<SetupAuditTrail[]>(orgId, async (conn) => {
-      const result = await conn.query(soql);
+      const result = await conn.query(soql, { autoFetch: true, maxFetch: maxRecords });
       return result.records.map((record: any) => ({
         Id: record.Id,
         Action: record.Action,
