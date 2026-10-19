@@ -9,7 +9,7 @@ dotenv.config();
 import { Server } from 'http';
 import app from './app';
 import { DatabaseService } from './services/databaseService';
-import { authService, monitorService } from './services/container';
+import { auditArchiveService, authService, monitorService, privilegeService, setDatabase } from './services/container';
 import { initTenantAuth } from './middleware/tenantAuth';
 import { initSlackStore } from './slack/store';
 
@@ -50,6 +50,9 @@ async function startServer() {
     // 3. Initialize tenant auth middleware
     initTenantAuth(dbService, authService);
     initSlackStore(dbService);
+    setDatabase(dbService);
+    monitorService.addOrgCycleHook('audit-archive', (orgId) => auditArchiveService.sync(orgId));
+    monitorService.addOrgCycleHook('privileged-access', (orgId) => privilegeService.check(orgId));
     console.log('[Startup] Tenant auth middleware initialized');
 
     // 4. Start change monitoring
