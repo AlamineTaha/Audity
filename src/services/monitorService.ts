@@ -20,6 +20,7 @@ export class MonitorService {
   private checkIntervalMinutes: number;
   /** Poll lock: prevents duplicate processing when pollAuditTrail is called while already polling */
   private isPolling = false;
+  private orgCycleHooks: Array<{ name: string; run: (orgId: string) => Promise<void> }> = [];
 
   constructor(
     salesforceService: SalesforceService,
@@ -96,9 +97,29 @@ export class MonitorService {
     
     this.cronJob = cron.schedule(cronExpression, async () => {
       await this.runChangeCheck();
+      await this.runOrgCycleHooks();
     });
 
     this.isRunning = true;
+  }
+
+  /** Extra per-org jobs (audit archive, privilege checks) run after each scheduled change check. */
+  addOrgCycleHook(name: string, run: (orgId: string) => Promise<void>): void {
+    this.orgCycleHooks.push({ name, run });
+  }
+
+  private async runOrgCycleHooks(): Promise<void> {
+    if (this.orgCycleHooks.length === 0) return;
+    const orgIds = await this.getRegisteredOrgIds();
+    for (const orgId of orgIds) {
+      for (const hook of this.orgCycleHooks) {
+        try {
+          await hook.run(orgId);
+        } catch (error) {
+          console.error(`[Monitor] Cycle hook ${hook.name} failed for org ${orgId}:`, error);
+        }
+      }
+    }
   }
 
   /**

@@ -7,6 +7,7 @@ import { flowCompareTools } from './flowCompare';
 import { metadataTools } from './metadata';
 import { permissionTools } from './permissions';
 import { reportTools } from './reports';
+import { governanceTools } from './governance';
 
 export const allTools: ToolDefinition[] = [
   ...changeTools,
@@ -15,6 +16,7 @@ export const allTools: ToolDefinition[] = [
   ...permissionTools,
   ...metadataTools,
   ...reportTools,
+  ...governanceTools,
 ] as ToolDefinition[];
 
 export function getTool(name: string): ToolDefinition | undefined {

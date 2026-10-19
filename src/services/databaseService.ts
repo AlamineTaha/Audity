@@ -22,6 +22,79 @@ export interface TenantRow {
   updated_at: Date;
 }
 
+export interface PrivilegedGrantInput {
+  userId: string;
+  userName: string;
+  username: string;
+  permission: string;
+  sourceType: 'Profile' | 'PermissionSet' | 'PermissionSetGroup';
+  sourceName: string;
+}
+
+export interface PrivilegedGrantRow {
+  org_id: string;
+  user_id: string;
+  permission: string;
+  source_type: PrivilegedGrantInput['sourceType'];
+  source_name: string;
+  user_name: string | null;
+  username: string | null;
+  first_seen_at: Date;
+}
+
+export interface AuditEventInput {
+  id: string;
+  action: string | null;
+  section: string | null;
+  display: string | null;
+  createdDate: string;
+  createdById: string | null;
+  createdByName: string | null;
+  delegateUser: string | null;
+}
+
+export interface AuditEventRow {
+  org_id: string;
+  id: string;
+  action: string | null;
+  section: string | null;
+  display: string | null;
+  created_date: Date;
+  created_by_id: string | null;
+  created_by_name: string | null;
+  delegate_user: string | null;
+}
+
+export interface AuditSearchParams {
+  orgId: string;
+  query?: string;
+  user?: string;
+  section?: string;
+  from?: Date;
+  to?: Date;
+  limit?: number;
+}
+
+const escapeLike = (value: string) => value.replace(/[\\%_]/g, (c) => `\\${c}`);
+
+/** Parameterized WHERE clause; every free-text word must match action, section or display. */
+export function buildAuditSearchWhere(params: AuditSearchParams): { where: string; values: unknown[] } {
+  const values: unknown[] = [params.orgId];
+  const clauses = ['org_id = $1'];
+  const add = (sqlFor: (placeholder: string) => string, value: unknown) => {
+    values.push(value);
+    clauses.push(sqlFor(`$${values.length}`));
+  };
+  for (const word of (params.query ?? '').split(/\s+/).filter(Boolean).slice(0, 8)) {
+    add((p) => `(display ILIKE ${p} OR action ILIKE ${p} OR section ILIKE ${p})`, `%${escapeLike(word)}%`);
+  }
+  if (params.user) add((p) => `created_by_name ILIKE ${p}`, `%${escapeLike(params.user)}%`);
+  if (params.section) add((p) => `section ILIKE ${p}`, `%${escapeLike(params.section)}%`);
+  if (params.from) add((p) => `created_date >= ${p}`, params.from);
+  if (params.to) add((p) => `created_date <= ${p}`, params.to);
+  return { where: clauses.join(' AND '), values };
+}
+
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 16;
 
@@ -115,6 +188,46 @@ export class DatabaseService {
           created_at       TIMESTAMPTZ DEFAULT NOW(),
           PRIMARY KEY (team_id, org_id)
         )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS org_job_state (
+          org_id     VARCHAR(18) NOT NULL,
+          job        VARCHAR(64) NOT NULL,
+          value      TEXT,
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (org_id, job)
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS privileged_access (
+          org_id        VARCHAR(18) NOT NULL,
+          user_id       VARCHAR(18) NOT NULL,
+          permission    VARCHAR(80) NOT NULL,
+          source_type   VARCHAR(32) NOT NULL,
+          source_name   TEXT NOT NULL,
+          user_name     TEXT,
+          username      TEXT,
+          first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (org_id, user_id, permission, source_type, source_name)
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS audit_events (
+          org_id          VARCHAR(18) NOT NULL,
+          id              VARCHAR(18) NOT NULL,
+          action          TEXT,
+          section         TEXT,
+          display         TEXT,
+          created_date    TIMESTAMPTZ NOT NULL,
+          created_by_id   VARCHAR(18),
+          created_by_name TEXT,
+          delegate_user   TEXT,
+          PRIMARY KEY (org_id, id)
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_audit_events_org_date ON audit_events(org_id, created_date DESC)
       `);
 
       console.log('[Database] Schema initialized');
@@ -340,5 +453,111 @@ export class DatabaseService {
       'UPDATE slack_org_links SET alert_channel_id = $3 WHERE team_id = $1 AND org_id = $2',
       [teamId, orgId, channelId]
     );
+  }
+
+  // --------------- Per-org job state ---------------
+
+  async getJobState(orgId: string, job: string): Promise<string | null> {
+    const result = await this.pool.query<{ value: string | null }>(
+      'SELECT value FROM org_job_state WHERE org_id = $1 AND job = $2',
+      [orgId, job]
+    );
+    return result.rows[0]?.value ?? null;
+  }
+
+  async setJobState(orgId: string, job: string, value: string): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO org_job_state (org_id, job, value, updated_at) VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (org_id, job) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [orgId, job, value]
+    );
+  }
+
+  // --------------- Privileged access snapshot ---------------
+
+  async getPrivilegedAccess(orgId: string): Promise<PrivilegedGrantRow[]> {
+    const result = await this.pool.query<PrivilegedGrantRow>('SELECT * FROM privileged_access WHERE org_id = $1', [orgId]);
+    return result.rows;
+  }
+
+  /** Applies a snapshot diff in one transaction. */
+  async applyPrivilegedAccessDiff(orgId: string, added: PrivilegedGrantInput[], removed: PrivilegedGrantInput[]): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const g of removed) {
+        await client.query(
+          `DELETE FROM privileged_access
+           WHERE org_id = $1 AND user_id = $2 AND permission = $3 AND source_type = $4 AND source_name = $5`,
+          [orgId, g.userId, g.permission, g.sourceType, g.sourceName]
+        );
+      }
+      for (const g of added) {
+        await client.query(
+          `INSERT INTO privileged_access (org_id, user_id, permission, source_type, source_name, user_name, username)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING`,
+          [orgId, g.userId, g.permission, g.sourceType, g.sourceName, g.userName, g.username]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  // --------------- Audit archive ---------------
+
+  /** Inserts archive rows, skipping ones already stored. Returns the number of new rows. */
+  async insertAuditEvents(orgId: string, events: AuditEventInput[]): Promise<number> {
+    const COLUMNS = 9;
+    const BATCH = 500;
+    let inserted = 0;
+    for (let i = 0; i < events.length; i += BATCH) {
+      const values: unknown[] = [];
+      const rows = events.slice(i, i + BATCH).map((e, j) => {
+        values.push(orgId, e.id, e.action, e.section, e.display, e.createdDate, e.createdById, e.createdByName, e.delegateUser);
+        const base = j * COLUMNS;
+        return `(${Array.from({ length: COLUMNS }, (_, k) => `$${base + k + 1}`).join(', ')})`;
+      });
+      const result = await this.pool.query(
+        `INSERT INTO audit_events
+           (org_id, id, action, section, display, created_date, created_by_id, created_by_name, delegate_user)
+         VALUES ${rows.join(', ')}
+         ON CONFLICT (org_id, id) DO NOTHING`,
+        values
+      );
+      inserted += result.rowCount ?? 0;
+    }
+    return inserted;
+  }
+
+  async searchAuditEvents(params: AuditSearchParams): Promise<{ rows: AuditEventRow[]; total: number }> {
+    const { where, values } = buildAuditSearchWhere(params);
+    const limit = Math.min(Math.max(Math.trunc(params.limit ?? 50), 1), 200);
+    const [rows, count] = await Promise.all([
+      this.pool.query<AuditEventRow>(`SELECT * FROM audit_events WHERE ${where} ORDER BY created_date DESC LIMIT ${limit}`, values),
+      this.pool.query<{ total: string }>(`SELECT COUNT(*) AS total FROM audit_events WHERE ${where}`, values),
+    ]);
+    return { rows: rows.rows, total: Number(count.rows[0]?.total ?? 0) };
+  }
+
+  async getAuditArchiveStats(orgId: string): Promise<{ oldest: Date | null; newest: Date | null; count: number }> {
+    const result = await this.pool.query<{ oldest: Date | null; newest: Date | null; count: string }>(
+      'SELECT MIN(created_date) AS oldest, MAX(created_date) AS newest, COUNT(*) AS count FROM audit_events WHERE org_id = $1',
+      [orgId]
+    );
+    const row = result.rows[0];
+    return { oldest: row?.oldest ?? null, newest: row?.newest ?? null, count: Number(row?.count ?? 0) };
+  }
+
+  async deleteAuditEventsOlderThan(days: number): Promise<number> {
+    const result = await this.pool.query(
+      "DELETE FROM audit_events WHERE created_date < NOW() - make_interval(days => $1::int)",
+      [days]
+    );
+    return result.rowCount ?? 0;
   }
 }
