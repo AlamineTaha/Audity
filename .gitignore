@@ -20,3 +20,6 @@ cert.txt
 
 # Google Cloud service-account keys
 ehc-*.json
+
+# Claude Code agent worktrees
+.claude/worktrees/

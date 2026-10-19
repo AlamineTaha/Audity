@@ -4,10 +4,9 @@ import { resolveTenant } from '../middleware/tenantAuth';
 import { authService } from '../services/container';
 import { getTool } from '../tools';
 import { TenantContext } from '../types';
-import { hasConversation, loadConversation, runAgent, runTool, saveConversation, savePendingAction, takePendingAction, PendingAction } from './agent';
+import { loadConversation, runAgent, runTool, saveConversation, savePendingAction, takePendingAction, PendingAction } from './agent';
 import { AlertRef, confirmationBlocks, contextBlock, markdownBlock } from './blocks';
 import { botTokenForTeam, installationStore, slackDb } from './store';
-import { isAlertThread } from './alerts';
 
 type SlackClient = webApi.WebClient;
 
@@ -24,6 +23,9 @@ export const SLACK_BOT_SCOPES = [
   'im:history',
   'im:write',
 ];
+
+const STOP_TTL_SEC = 300;
+const stopKey = (channel: string, threadTs: string) => `slack_stop:${channel}:${threadTs}`;
 
 const baseUrl = () => process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
 
@@ -79,24 +81,36 @@ async function handleUserMessage(params: {
     return;
   }
 
+  // DMs show the agent-view status; channels get a placeholder that is replaced by the answer.
+  const isDm = channel.startsWith('D');
   await setSessionStatus(client, channel, threadTs, 'processing');
+  const placeholder = isDm
+    ? null
+    : await client.chat.postMessage({ channel, thread_ts: threadTs, text: ':hourglass_flowing_sand: _Looking into it…_' });
+  const deliver = async (message: { text: string; blocks?: KnownBlock[] }) => {
+    if (placeholder?.ts) await client.chat.update({ channel, ts: placeholder.ts, ...message });
+    else await client.chat.postMessage({ channel, thread_ts: threadTs, ...message });
+  };
+
   try {
     const history = await loadConversation(teamId, channel, threadTs);
     const reply = await runAgent(tenant, history, text, userId, baseUrl());
     await saveConversation(teamId, channel, threadTs, history);
 
+    const stop = stopKey(channel, threadTs);
+    if (await authService.getCachedValue(stop)) {
+      await authService.deleteCachedValue(stop);
+      return;
+    }
+
     const blocks: KnownBlock[] = [markdownBlock(reply.text)];
     for (const action of reply.pendingActions) {
       blocks.push(...confirmationBlocks(action, getTool(action.toolName)?.title ?? action.toolName));
     }
-    await client.chat.postMessage({ channel, thread_ts: threadTs, text: reply.text.slice(0, 3000), blocks });
+    await deliver({ text: reply.text.slice(0, 3000), blocks });
   } catch (error) {
     console.error('[Slack] Agent turn failed:', error);
-    await client.chat.postMessage({
-      channel,
-      thread_ts: threadTs,
-      text: `Sorry, something went wrong: ${error instanceof Error ? error.message : 'unknown error'}`,
-    });
+    await deliver({ text: `Sorry, something went wrong: ${error instanceof Error ? error.message : 'unknown error'}` });
   } finally {
     await setSessionStatus(client, channel, threadTs, 'active');
   }
@@ -108,32 +122,28 @@ const HELP = [
   '• `/auditdelta alerts here` — send change alerts to this channel',
   '• `/auditdelta status` — show connected orgs and alert channels',
   '• `/auditdelta disconnect` — disconnect the default org from this workspace',
-  'Then just DM me or @mention me: _"What changed in the last 24 hours?"_, _"Who can export reports?"_, _"Compare the last two versions of Lead_Routing"_.',
+  'Then DM me, or @mention me in a channel or thread (I only answer when mentioned there): _"What changed in the last 24 hours?"_, _"Who can export reports?"_, _"Compare the last two versions of Lead_Routing"_.',
 ].join('\n');
 
 function registerListeners(app: App): void {
-  // DMs (agent view), plus follow-ups in channel threads AuditDelta is already part of
-  // (alert threads and threads where it was mentioned) — no @mention needed there.
+  // DMs (agent view). In channels and threads the bot only answers when @mentioned,
+  // so teammates can discuss an alert without it jumping in.
   app.message(async ({ message, client, context }) => {
-    if (message.subtype !== undefined || !('text' in message) || !message.text || !context.teamId) return;
-    const threadTs = message.thread_ts ?? message.ts;
-    if (message.channel_type !== 'im') {
-      if (!message.thread_ts) return;
-      // Mentions are handled by the app_mention listener.
-      if (context.botUserId && message.text.includes(`<@${context.botUserId}>`)) return;
-      const active =
-        (await hasConversation(context.teamId, message.channel, message.thread_ts)) ||
-        (await isAlertThread(context.teamId, message.channel, message.thread_ts));
-      if (!active) return;
-    }
+    if (message.channel_type !== 'im' || message.subtype !== undefined || !('text' in message) || !message.text) return;
+    if (!context.teamId) return;
     await handleUserMessage({
       client,
       teamId: context.teamId,
       channel: message.channel,
-      threadTs,
+      threadTs: message.thread_ts ?? message.ts,
       userId: message.user,
       text: message.text,
     });
+  });
+
+  // The user pressed Stop in the agent view: drop the answer that is still being prepared.
+  app.event('agent_session_stopped', async ({ event }) => {
+    await authService.setCachedValue(stopKey(event.channel, event.thread_ts), '1', STOP_TTL_SEC);
   });
 
   app.event('app_mention', async ({ event, client, context }) => {

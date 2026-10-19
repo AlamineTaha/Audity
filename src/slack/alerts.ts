@@ -4,15 +4,6 @@ import { alertBlocks } from './blocks';
 import { slackDb } from './store';
 
 const THREAD_TTL_SEC = 36 * 60 * 60;
-const ALERT_ROOT_TTL_SEC = 7 * 24 * 60 * 60;
-
-const alertRootKey = (teamId: string, channel: string, ts: string) => `slack_alert_root:${teamId}:${channel}:${ts}`;
-
-/** Thread replies under an alert are conversations with AuditDelta even without an @mention. */
-export async function isAlertThread(teamId: string, channel: string, threadTs: string): Promise<boolean> {
-  return (await authService.getCachedValue(alertRootKey(teamId, channel, threadTs))) !== null;
-}
-
 const slackErrorCode = (error: unknown) => (error as { data?: { error?: string } }).data?.error;
 
 /**
@@ -54,7 +45,6 @@ export async function publishChangeToSlack(orgId: string, text: string, componen
 
     if (!threadTs && result.ts) {
       await authService.setCachedValue(threadKey, result.ts, THREAD_TTL_SEC);
-      await authService.setCachedValue(alertRootKey(link.team_id, channel, result.ts), orgId, ALERT_ROOT_TTL_SEC);
     }
     delivered = true;
   }
