@@ -48,14 +48,14 @@ const PROCESS_MATCHERS: Record<string, (r: SetupAuditTrail) => boolean> = {
   },
 };
 
-// Same categories as PROCESS_MATCHERS, evaluated by Salesforce (SOQL LIKE is case-insensitive).
+// Server-side pre-filter for PROCESS_MATCHERS (SOQL LIKE is case-insensitive). Only Action is
+// filterable on SetupAuditTrail; Section checks stay in PROCESS_MATCHERS, which still runs after.
 const SOQL_CONDITIONS: Record<string, string> = {
-  Flow: "Action LIKE '%flow%' OR Action LIKE '%interactiondef%' OR Section LIKE '%flow%'",
+  Flow: "Action LIKE '%flow%' OR Action LIKE '%interactiondef%'",
   Permission: "Action LIKE '%perm%' OR Action LIKE '%profile%' OR Action LIKE '%role%'",
-  Layout: "Action LIKE '%layout%' OR Section LIKE '%layout%'",
+  Layout: "Action LIKE '%layout%'",
   ValidationRule: "Action LIKE '%validation%'",
   CustomField: "Action LIKE '%customfield%' OR Action LIKE '%formula%' OR Action LIKE 'changedCF%' OR Action LIKE 'createdCF%' OR Action LIKE 'deletedCF%'",
-  Object: "Action LIKE '%entity%' OR Action LIKE '%customobject%' OR Section LIKE 'Customize%'",
 };
 
 const MAX_REPORT_RECORDS = 2000;
