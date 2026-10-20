@@ -125,8 +125,6 @@ export function buildPrivilegeAlert(
   return { text: lines.join('\n'), severity };
 }
 
-const soqlString = (value: string) => `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
-
 async function queryAll<T extends Record<string, unknown>>(conn: Connection, soql: string): Promise<T[]> {
   const records: T[] = [];
   let result = await conn.query<T>(soql);
@@ -210,7 +208,7 @@ export class PrivilegeService {
     const soql =
       'SELECT Action, Display, CreatedDate, CreatedBy.Name FROM SetupAuditTrail ' +
       `WHERE CreatedDate >= ${since.toISOString()} AND (Action LIKE '%PermSet%' OR Action LIKE '%PermissionSet%' ` +
-      `OR Action LIKE '%profile%' OR Section = ${soqlString('Manage Users')}) ORDER BY CreatedDate DESC LIMIT 200`;
+      `OR Action LIKE '%profile%') ORDER BY CreatedDate DESC LIMIT 200`;
     const result = await conn.query<{ Action: string; Display?: string; CreatedDate: string; CreatedBy?: { Name?: string } }>(soql);
     return result.records.map((r) => ({
       action: r.Action,
