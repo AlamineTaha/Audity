@@ -18,10 +18,18 @@ export interface ToolResultBody {
   [key: string]: unknown;
 }
 
+export interface ToolImage {
+  filename: string;
+  title: string;
+  png: Buffer;
+}
+
 export interface ToolResult {
   /** HTTP status for the REST surface; defaults to 200 (or 500 when success=false and unset). */
   status?: number;
   body: ToolResultBody;
+  /** Charts. Kept outside `body` so REST JSON stays unchanged; MCP and Slack deliver them. */
+  images?: ToolImage[];
 }
 
 export interface ToolDefinition<S extends z.ZodObject = z.ZodObject> {

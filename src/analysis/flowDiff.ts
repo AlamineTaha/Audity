@@ -320,6 +320,29 @@ function changeFindings(oldFlow: JsonObject, newFlow: JsonObject, elements: Elem
   return findings;
 }
 
+/** Key used for flow-level properties (run mode, process type, …) in ownership attribution. */
+export const FLOW_PROPERTIES_KEY = 'properties:flow';
+
+export const elementKey = (type: string, name: string) => `${type}:${name}`;
+
+/** `${elementKey}|${path}`; paths match FieldChange.path for that element (or FLOW_PROPERTIES_KEY). */
+export const logicFieldKey = (owner: string, path: string) => `${owner}|${path}`;
+
+/**
+ * Every meaningful field of a flow (layout excluded), keyed with `logicFieldKey`.
+ * Field-level keys let ownership credit a one-word label edit as one field, not a whole element.
+ */
+export function logicFields(metadata: Json): Set<string> {
+  const flow = isObject(metadata) ? metadata : {};
+  const fields = new Set<string>();
+  for (const { type, el } of elementsOf(flow).values()) {
+    const owner = elementKey(type, String(el.name ?? type));
+    for (const path of flatten(el).keys()) fields.add(logicFieldKey(owner, path));
+  }
+  for (const path of flatten(scalarProps(flow)).keys()) fields.add(logicFieldKey(FLOW_PROPERTIES_KEY, path));
+  return fields;
+}
+
 export function diffFlowVersions(
   oldMetadata: Json,
   newMetadata: Json,

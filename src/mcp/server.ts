@@ -31,6 +31,7 @@ function buildServer(tenant: TenantContext, baseUrl: string): McpServer {
           content: [
             { type: 'text' as const, text: displayText ?? result.body.error ?? 'Done.' },
             { type: 'text' as const, text: JSON.stringify(data) },
+            ...(result.images ?? []).map((img) => ({ type: 'image' as const, data: img.png.toString('base64'), mimeType: 'image/png' })),
           ],
           isError: !result.body.success,
         };
