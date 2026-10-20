@@ -225,7 +225,9 @@ export class MonitorService {
 
       console.log(`[Monitor] Change check completed. Found ${changesFound} change(s)`);
       if (changes.length > 0) {
-        console.log(`[Monitor] Changes detected:`, changes.map((c: { type: string; action: string }) => `${c.type}: ${c.action}`).join(', '));
+        const byType = new Map<string, number>();
+        for (const c of changes) byType.set(`${c.type}: ${c.action}`, (byType.get(`${c.type}: ${c.action}`) ?? 0) + 1);
+        console.log(`[Monitor] Changes detected:`, [...byType].map(([k, n]) => (n > 1 ? `${k} ×${n}` : k)).join(', '));
       }
       return { success: true, changesFound, errors, changes };
     } catch (error) {
@@ -671,14 +673,8 @@ export class MonitorService {
       .map((r) => this.extractVersionFromDisplay(r.Display || ''))
       .filter((v): v is number => v !== undefined);
     const activatedVersion = activatedVersions.length ? Math.max(...activatedVersions) : undefined;
-    const maxVersion = await this.salesforceService.getFlowMaxVersion(orgId, flowName);
-
-    if (activatedVersion !== undefined && activatedVersion !== maxVersion) {
-      console.log(`[Monitor] Skipping Flow ${flowName}: activated v${activatedVersion} is not latest (v${maxVersion})`);
-      return;
-    }
-
-    const delta = await this.salesforceService.getFlowDelta(orgId, flowName);
+    // Diff what was activated against the version before it; newer drafts don't matter.
+    const delta = await this.getActivationDelta(orgId, flowName, activatedVersion);
     if (!delta) {
       console.warn(`[Monitor] No flow delta for ${flowName}`);
       return;
@@ -746,6 +742,26 @@ export class MonitorService {
     await this.publishChange(orgId, summaryText, ruleName, category);
     await this.authService.markValidationRuleProcessed(orgId, ruleName);
     console.log(`[Monitor] Published Validation Rule for ${objectName}.${ruleName}`);
+  }
+
+  private async getActivationDelta(orgId: string, flowName: string, activatedVersion: number | undefined): Promise<{
+    previous: unknown;
+    current: unknown;
+    previousVersion: number;
+    currentVersion: number;
+    definitionId: string;
+  } | null> {
+    if (activatedVersion === undefined || activatedVersion < 2) {
+      return this.salesforceService.getFlowDelta(orgId, flowName);
+    }
+    const versions = await this.salesforceService.getFlowVersionsByNumber(orgId, flowName, activatedVersion - 1, activatedVersion);
+    return {
+      previous: versions.versionA.metadata,
+      current: versions.versionB.metadata,
+      previousVersion: versions.versionA.version,
+      currentVersion: versions.versionB.version,
+      definitionId: versions.definitionId,
+    };
   }
 
   private buildFlowMessage(
