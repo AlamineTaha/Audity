@@ -1,5 +1,6 @@
 import { App, ExpressReceiver, BlockAction, ButtonAction, webApi } from '@slack/bolt';
 import type { KnownBlock } from '@slack/types';
+import type { ToolImage } from '../tools/types';
 import { resolveTenant } from '../middleware/tenantAuth';
 import { authService } from '../services/container';
 import { getTool } from '../tools';
@@ -18,6 +19,7 @@ export const SLACK_BOT_SCOPES = [
   'channels:read',
   'chat:write',
   'commands',
+  'files:write',
   'groups:history',
   'groups:read',
   'im:history',
@@ -58,6 +60,30 @@ export async function ensureInChannel(client: SlackClient, channel: string): Pro
   } catch (error) {
     console.warn(`[Slack] Could not ensure membership in ${channel}:`, (error as { data?: { error?: string } }).data?.error ?? error);
     return 'unknown';
+  }
+}
+
+let warnedMissingFileScope = false;
+
+/** Charts go into the same thread right after the answer; a missing files:write scope is reported once in the thread. */
+async function postCharts(client: SlackClient, channel: string, threadTs: string, images: ToolImage[]): Promise<void> {
+  try {
+    await client.files.uploadV2({
+      channel_id: channel,
+      thread_ts: threadTs,
+      file_uploads: images.map((img) => ({ file: img.png, filename: img.filename, title: img.title })),
+    });
+  } catch (error) {
+    const code = (error as { data?: { error?: string } }).data?.error ?? (error as Error).message;
+    if (!warnedMissingFileScope) {
+      console.error(`[Slack] Chart upload failed (${code}). The app needs the files:write scope: update the manifest and reinstall.`);
+      warnedMissingFileScope = true;
+    }
+    await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: `_I made ${images.length} chart(s) but couldn't post them (${code}). An admin needs to add the \`files:write\` scope to the AuditDelta Slack app and reinstall it._`,
+    });
   }
 }
 
@@ -108,6 +134,7 @@ async function handleUserMessage(params: {
       blocks.push(...confirmationBlocks(action, getTool(action.toolName)?.title ?? action.toolName));
     }
     await deliver({ text: reply.text.slice(0, 3000), blocks });
+    if (reply.images.length) await postCharts(client, channel, threadTs, reply.images);
   } catch (error) {
     console.error('[Slack] Agent turn failed:', error);
     await deliver({ text: `Sorry, something went wrong: ${error instanceof Error ? error.message : 'unknown error'}` });

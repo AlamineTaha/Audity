@@ -229,6 +229,17 @@ export class DatabaseService {
       await client.query(`
         CREATE INDEX IF NOT EXISTS idx_audit_events_org_date ON audit_events(org_id, created_date DESC)
       `);
+      // Non-draft Flow versions are immutable, so their metadata can be cached indefinitely.
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS flow_version_cache (
+          org_id          VARCHAR(18) NOT NULL,
+          flow_version_id VARCHAR(18) NOT NULL,
+          version_number  INTEGER NOT NULL,
+          metadata        JSONB NOT NULL,
+          cached_at       TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (org_id, flow_version_id)
+        )
+      `);
 
       console.log('[Database] Schema initialized');
     } finally {
@@ -559,5 +570,33 @@ export class DatabaseService {
       [days]
     );
     return result.rowCount ?? 0;
+  }
+
+  // --------------- Flow version cache ---------------
+
+  async getCachedFlowVersions(orgId: string, versionIds: string[]): Promise<Map<string, unknown>> {
+    if (versionIds.length === 0) return new Map();
+    const result = await this.pool.query<{ flow_version_id: string; metadata: unknown }>(
+      'SELECT flow_version_id, metadata FROM flow_version_cache WHERE org_id = $1 AND flow_version_id = ANY($2)',
+      [orgId, versionIds]
+    );
+    return new Map(result.rows.map((r) => [r.flow_version_id, r.metadata]));
+  }
+
+  async cacheFlowVersion(orgId: string, versionId: string, versionNumber: number, metadata: unknown): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO flow_version_cache (org_id, flow_version_id, version_number, metadata)
+       VALUES ($1, $2, $3, $4) ON CONFLICT (org_id, flow_version_id) DO NOTHING`,
+      [orgId, versionId, versionNumber, JSON.stringify(metadata)]
+    );
+  }
+
+  /** Archive rows in a time window, oldest first; only the columns insights need. */
+  async getAuditEventsSince(orgId: string, since: Date): Promise<Array<Pick<AuditEventRow, 'action' | 'section' | 'display' | 'created_by_name' | 'created_date'>>> {
+    const result = await this.pool.query<Pick<AuditEventRow, 'action' | 'section' | 'display' | 'created_by_name' | 'created_date'>>(
+      'SELECT action, section, display, created_by_name, created_date FROM audit_events WHERE org_id = $1 AND created_date >= $2 ORDER BY created_date',
+      [orgId, since]
+    );
+    return result.rows;
   }
 }

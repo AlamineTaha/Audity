@@ -8,6 +8,7 @@ import { metadataTools } from './metadata';
 import { permissionTools } from './permissions';
 import { reportTools } from './reports';
 import { governanceTools } from './governance';
+import { insightTools } from './insights';
 
 export const allTools: ToolDefinition[] = [
   ...changeTools,
@@ -17,6 +18,7 @@ export const allTools: ToolDefinition[] = [
   ...metadataTools,
   ...reportTools,
   ...governanceTools,
+  ...insightTools,
 ] as ToolDefinition[];
 
 export function getTool(name: string): ToolDefinition | undefined {

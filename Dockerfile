@@ -21,6 +21,9 @@ FROM node:22-alpine AS runtime
 
 WORKDIR /app
 
+# Alpine ships no fonts; chart PNGs (resvg) need one to render any text.
+RUN apk add --no-cache font-dejavu
+
 # Copy package files
 COPY package.json package-lock.json* ./
 
