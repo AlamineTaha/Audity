@@ -705,11 +705,12 @@ export class SalesforceService {
           OR Action = 'PublishKnowledge'
         )
       ORDER BY CreatedDate ASC
-      LIMIT 200
+      LIMIT 2000
     `;
 
     try {
-      const result = await conn.query<any>(soql);
+      // One bulk save can write thousands of entries; read the whole burst in one cycle.
+      const result = await conn.query<any>(soql, { autoFetch: true, maxFetch: 2000 });
       return result.records.map((record: any) => ({
         Id: record.Id,
         Action: record.Action,

@@ -20,6 +20,10 @@ export class MonitorService {
   private checkIntervalMinutes: number;
   /** Poll lock: prevents duplicate processing when pollAuditTrail is called while already polling */
   private isPolling = false;
+  /** Safety net: whatever goes wrong upstream, one cycle never floods a channel. */
+  private static readonly MAX_ALERTS_PER_CYCLE = 15;
+  private alertsThisCycle = new Map<string, number>();
+  private suppressedThisCycle = new Map<string, number>();
   private orgCycleHooks: Array<{ name: string; run: (orgId: string) => Promise<void> }> = [];
 
   constructor(
@@ -59,6 +63,12 @@ export class MonitorService {
     category: 'Security' | 'Automation' | 'Schema' = 'Schema',
     threadTs?: string
   ): Promise<void> {
+    const sent = this.alertsThisCycle.get(orgId) ?? 0;
+    if (sent >= MonitorService.MAX_ALERTS_PER_CYCLE) {
+      this.suppressedThisCycle.set(orgId, (this.suppressedThisCycle.get(orgId) ?? 0) + 1);
+      return;
+    }
+    this.alertsThisCycle.set(orgId, sent + 1);
     try {
       if (await publishChangeToSlack(orgId, summaryText, component, category)) return;
     } catch (error) {
@@ -289,6 +299,8 @@ export class MonitorService {
     }> = [];
 
     let advanceHwmTo: string | null = null;
+    this.alertsThisCycle.set(orgId, 0);
+    this.suppressedThisCycle.set(orgId, 0);
 
     try {
       let auditRecords: SetupAuditTrail[];
@@ -343,6 +355,12 @@ export class MonitorService {
 
       // Snapshot aggregation: group by metadata component (Map<MetadataName, AuditRecord[]>)
       const { groups, ungrouped } = this.groupByMetadataKey(recordsToProcess);
+      // One save can write thousands of permission entries: alert once per person per cycle.
+      const permissionRecords = [...groups.entries()].filter(([key]) => key.startsWith('Permission:'));
+      if (permissionRecords.length > 1) {
+        for (const [key] of permissionRecords) groups.delete(key);
+        groups.set('Permission:all', permissionRecords.flatMap(([, records]) => records));
+      }
 
       for (const [metadataKey, records] of groups) {
         const [metadataType] = metadataKey.split(':').concat(['']);
@@ -503,6 +521,17 @@ export class MonitorService {
       await this.authService.setAuditHighWaterMark(orgId, advanceHwmTo);
     }
 
+    const suppressed = this.suppressedThisCycle.get(orgId) ?? 0;
+    if (suppressed > 0) {
+      console.warn(`[Monitor] Org ${orgId}: ${suppressed} alert(s) suppressed this cycle (cap ${MonitorService.MAX_ALERTS_PER_CYCLE})`);
+      await publishChangeToSlack(
+        orgId,
+        `*[AUDITDELTA] ${suppressed} more change alert(s) were not posted* to keep this channel readable — this cycle hit the limit of ${MonitorService.MAX_ALERTS_PER_CYCLE}.\nAsk me _"what changed in the last hour?"_ for a summary.`,
+        'alert-overflow',
+        'Schema'
+      ).catch((error) => console.error('[Monitor] Overflow notice failed:', error));
+    }
+
     return { count: changesProcessed, changes };
   }
 
@@ -551,10 +580,13 @@ export class MonitorService {
   }
 
   private extractPermissionName(display: string): string | null {
-    const m = display.match(/(?:Permission Set|Profile):\s*(.+?)(?:\s|$)/i) ||
+    // Real formats: "Changed permission set X: …", "Permission set group X: assigned to …", "Changed profile X: …".
+    const m = display.match(/(?:permission set group|permission set|profile)\s+["“]?([^:"”]+?)["”]?\s*:/i) ||
+      display.match(/(?:Permission Set|Profile):\s*(.+?)(?:\s|$)/i) ||
       display.match(/assigned\s+(.+?)\s+to/i);
     return m?.[1]?.trim() || null;
   }
+
 
   private extractObjectName(display: string, section: string): string | null {
     const secMatch = section.match(/Customize\s+([A-Za-z0-9_]+)/i);
@@ -633,7 +665,12 @@ export class MonitorService {
     const flowName = this.extractFlowName(oldest.Display || newest.Display || '');
     if (!flowName) return;
 
-    const activatedVersion = this.extractVersionFromDisplay(newest.Display || '');
+    // Use activation entries only: a deactivation of the previous version is logged in the same second.
+    const activatedVersions = allRecords
+      .filter((r) => (r.Action || '').toLowerCase().startsWith('activatedinteractiondef'))
+      .map((r) => this.extractVersionFromDisplay(r.Display || ''))
+      .filter((v): v is number => v !== undefined);
+    const activatedVersion = activatedVersions.length ? Math.max(...activatedVersions) : undefined;
     const maxVersion = await this.salesforceService.getFlowMaxVersion(orgId, flowName);
 
     if (activatedVersion !== undefined && activatedVersion !== maxVersion) {
@@ -734,19 +771,10 @@ export class MonitorService {
    * Check if audit record is a Flow change
    */
   private isFlowChange(record: SetupAuditTrail): boolean {
-    const action = (record.Action || '').toLowerCase();
-    const flowActions = [
-      'activatedinteractiondefversion',
-      'deactivatedinteractiondefversion',
-      'createdinteractiondefversion',
-      'deletedinteractiondefversion',
-      'activatedinteractiondefinition',
-      'deactivatedinteractiondefinition',
-      'createdinteractiondefinition',
-      'deletedinteractiondefinition',
-    ];
-    return flowActions.includes(action);
+    // Prefix match: system-mode activations are logged as "activatedinteractiondefversionWithSystemMode…".
+    return /^(activated|deactivated|created|deleted)interactiondef(version|inition)/.test((record.Action || '').toLowerCase());
   }
+
 
   /**
    * Check if audit record is a Permission change
@@ -831,6 +859,38 @@ export class MonitorService {
    * All types (PermSetAssign, PermSetEnableUserPerm, PermSetEntityPermChanged, etc.)
    * are grouped and sent to the LLM in one call. Message matches the Flow format.
    */
+  private static readonly MAX_PERMISSION_LINES = 40;
+
+  /**
+   * Small batches go to the AI line by line. Large ones (bulk saves write one entry per field or
+   * object) are summarized as counts per permission set and action, with a few examples each.
+   */
+  private summarizePermissionRecords(records: SetupAuditTrail[]): {
+    lines: Array<{ action: string; display: string }>;
+    componentCount: number;
+  } {
+    const groups = new Map<string, { action: string; component: string; displays: string[] }>();
+    for (const r of records) {
+      const component = this.extractPermissionName(r.Display || '') ?? 'unknown';
+      const key = `${component}|${r.Action}`;
+      const group = groups.get(key) ?? { action: r.Action, component, displays: [] };
+      group.displays.push(r.Display || r.Action || '');
+      groups.set(key, group);
+    }
+    const componentCount = new Set([...groups.values()].map((g) => g.component)).size;
+    if (records.length <= MonitorService.MAX_PERMISSION_LINES) {
+      return { lines: records.map((r) => ({ action: r.Action, display: r.Display || r.Action || '' })), componentCount };
+    }
+    const lines = [...groups.values()]
+      .sort((a, b) => b.displays.length - a.displays.length)
+      .slice(0, MonitorService.MAX_PERMISSION_LINES)
+      .map((g) => ({
+        action: `${g.action} ×${g.displays.length}`,
+        display: `${g.component} — e.g. ${g.displays.slice(0, 3).map((d) => d.replace(/^.*?:\s*/, '')).join(' | ')}`,
+      }));
+    return { lines, componentCount };
+  }
+
   private async processPermissionBatch(
     orgId: string,
     records: SetupAuditTrail[],
@@ -843,19 +903,14 @@ export class MonitorService {
         (a, b) => new Date(a.CreatedDate).getTime() - new Date(b.CreatedDate).getTime()
       );
 
-      const analysis = await this.aiService.analyzePermissionBatch(
-        sorted.map(r => ({
-          action: r.Action,
-          display: r.Display || r.Action || '',
-        })),
-        userName,
-        settings
-      );
+      const { lines, componentCount } = this.summarizePermissionRecords(sorted);
+      const analysis = await this.aiService.analyzePermissionBatch(lines, userName, settings);
 
       const newest = sorted[sorted.length - 1];
 
       const summaryText =
-        `*[PERMISSION] ${records.length} change${records.length > 1 ? 's' : ''}*\n\n` +
+        `*[PERMISSION] ${records.length} change${records.length > 1 ? 's' : ''}` +
+        `${componentCount > 1 ? ` across ${componentCount} permission sets/profiles` : ''}*\n\n` +
         `${analysis}\n\n` +
         `*Changed by:* ${userName}\n` +
         `*Time:* ${new Date(newest.CreatedDate).toLocaleString()}\n` +
