@@ -50,3 +50,18 @@ export async function publishChangeToSlack(orgId: string, text: string, componen
   }
   return delivered;
 }
+
+/** One-time notice when Salesforce access is lost: alert channel, or a DM to whoever linked the org. */
+export async function notifyReauthRequired(orgId: string, reason: string): Promise<void> {
+  for (const link of await slackDb().getSlackLinksForOrg(orgId)) {
+    const client = await slackClientForTeam(link.team_id);
+    const channel = link.alert_channel_id ?? link.linked_by;
+    if (!client || !channel) continue;
+    await client.chat.postMessage({
+      channel,
+      text:
+        `:warning: *AuditDelta lost access to Salesforce org \`${orgId}\`* (${reason}).\n` +
+        'Change monitoring and questions about this org are paused. Run `/auditdelta connect` here to reconnect.',
+    });
+  }
+}

@@ -112,6 +112,7 @@ export class MonitorService {
     if (this.orgCycleHooks.length === 0) return;
     const orgIds = await this.getRegisteredOrgIds();
     for (const orgId of orgIds) {
+      if (await this.authService.isReauthRequired(orgId)) continue;
       for (const hook of this.orgCycleHooks) {
         try {
           await hook.run(orgId);
@@ -195,6 +196,10 @@ export class MonitorService {
       }
 
       for (const orgId of orgIds) {
+        if (await this.authService.isReauthRequired(orgId)) {
+          errors.push(`Org ${orgId} must be reconnected (/auditdelta connect); monitoring is paused for it.`);
+          continue;
+        }
         try {
           const result = await this.processOrgChanges(orgId, hours, forceImmediate, debug);
           changesFound += result.count;
