@@ -41,6 +41,8 @@ export interface FlowDiff {
 }
 
 const LAYOUT_KEYS = new Set(['locationX', 'locationY', 'processMetadataValues']);
+// Lifecycle state, not authored logic: an older version reads "Obsolete" once a newer one is activated.
+const LIFECYCLE_PROPS = new Set(['status']);
 const IDENTITY_KEYS = ['name', 'field', 'assignToReference', 'leftValueReference'];
 const MAX_VALUE_CHARS = 240;
 const SEVERITY_ORDER: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
@@ -107,7 +109,7 @@ function elementsOf(flow: JsonObject): Map<string, { type: string; el: JsonObjec
 function scalarProps(flow: JsonObject): JsonObject {
   const props: JsonObject = {};
   for (const [k, v] of Object.entries(flow)) {
-    if (k === 'start' || LAYOUT_KEYS.has(k)) continue;
+    if (k === 'start' || LAYOUT_KEYS.has(k) || LIFECYCLE_PROPS.has(k)) continue;
     if (Array.isArray(v) && asArray(v).some((e) => typeof e.name === 'string')) continue;
     props[k] = v;
   }
