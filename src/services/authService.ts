@@ -32,6 +32,19 @@ interface PendingAuthorization {
 
 export class OAuthStateError extends Error {}
 
+/** Salesforce revoked or expired the refresh token: only a new sign-in fixes it. */
+export class SalesforceReauthRequiredError extends Error {
+  constructor(readonly orgId: string, readonly reason: string) {
+    super(
+      `AuditDelta lost access to Salesforce org ${orgId} (${reason}). ` +
+        'Reconnect it by running /auditdelta connect in Slack (or opening /auth/authorize).'
+    );
+  }
+}
+
+const REAUTH_FLAG_TTL_SEC = 30 * 24 * 60 * 60;
+type ReauthHandler = (orgId: string, reason: string) => Promise<void>;
+
 export class SalesforceAuthService {
   private redisClient: RedisClientType;
   private clientId: string;
@@ -39,6 +52,9 @@ export class SalesforceAuthService {
   private redirectUri: string;
   private loginUrl: string;
   private db: DatabaseService | null = null;
+  /** One refresh per org at a time: parallel refreshes with one refresh token get it revoked. */
+  private refreshInFlight = new Map<string, Promise<OrgSettings>>();
+  private reauthHandlers: ReauthHandler[] = [];
 
   constructor() {
     this.clientId = process.env.SF_CLIENT_ID || '';
@@ -231,6 +247,7 @@ export class SalesforceAuthService {
       });
     }
     await this.saveOrgSettings(orgSettings);
+    await this.deleteCachedValue(`org_reauth:${orgId}`);
 
     return { orgSettings, apiKey, slackLink: pending.slackLink };
   }
@@ -389,9 +406,22 @@ export class SalesforceAuthService {
 
   // --------------- Token refresh ---------------
 
-  async refreshSession(orgId: string): Promise<OrgSettings> {
+  /**
+   * @param staleAccessToken The token that just failed. If the stored token already differs,
+   *   another request refreshed in the meantime and that token is reused.
+   */
+  async refreshSession(orgId: string, staleAccessToken?: string): Promise<OrgSettings> {
+    const inFlight = this.refreshInFlight.get(orgId);
+    if (inFlight) return inFlight;
+    const refresh = this.doRefreshSession(orgId, staleAccessToken).finally(() => this.refreshInFlight.delete(orgId));
+    this.refreshInFlight.set(orgId, refresh);
+    return refresh;
+  }
+
+  private async doRefreshSession(orgId: string, staleAccessToken?: string): Promise<OrgSettings> {
     const settings = await this.getOrgSettings(orgId);
     if (!settings) throw new Error(`No settings found for orgId: ${orgId}`);
+    if (staleAccessToken && settings.accessToken && settings.accessToken !== staleAccessToken) return settings;
     if (!settings.refreshToken) throw new Error(`No refresh token for orgId: ${orgId}`);
 
     // The org's own instance accepts token requests, which also covers sandboxes and My Domains.
@@ -408,7 +438,12 @@ export class SalesforceAuthService {
     });
 
     if (!refreshResponse.ok) {
-      throw new Error(`Token refresh failed: ${refreshResponse.status}`);
+      const errorBody = await refreshResponse.json().catch(() => ({})) as { error?: string; error_description?: string };
+      if (errorBody.error === 'invalid_grant') {
+        await this.markReauthRequired(orgId, errorBody.error_description || 'refresh token revoked or expired');
+        throw new SalesforceReauthRequiredError(orgId, errorBody.error_description || 'refresh token revoked or expired');
+      }
+      throw new Error(`Token refresh failed: ${refreshResponse.status} ${errorBody.error ?? ''}`.trim());
     }
 
     const refreshData = await refreshResponse.json() as {
@@ -432,28 +467,41 @@ export class SalesforceAuthService {
     return updatedSettings;
   }
 
-  /** jsforce refreshes on INVALID_SESSION_ID itself; the 'refresh' hook persists the new token. */
+  // --------------- Lost access (refresh token revoked/expired) ---------------
+
+  onReauthRequired(handler: ReauthHandler): void {
+    this.reauthHandlers.push(handler);
+  }
+
+  async isReauthRequired(orgId: string): Promise<boolean> {
+    return (await this.getCachedValue(`org_reauth:${orgId}`)) !== null;
+  }
+
+  private async markReauthRequired(orgId: string, reason: string): Promise<void> {
+    const alreadyFlagged = await this.isReauthRequired(orgId);
+    await this.setCachedValue(`org_reauth:${orgId}`, reason, REAUTH_FLAG_TTL_SEC);
+    if (alreadyFlagged) return;
+    console.error(`[Auth] Org ${orgId} needs to be reconnected: ${reason}`);
+    for (const handler of this.reauthHandlers) {
+      await handler(orgId, reason).catch((err) => console.error('[Auth] Reauth notification failed:', err));
+    }
+  }
+
+  /** Refreshes go through refreshSession, so concurrent connections never race on the refresh token. */
   async getConnection(orgId: string): Promise<jsforce.Connection> {
+    const reason = await this.getCachedValue(`org_reauth:${orgId}`);
+    if (reason) throw new SalesforceReauthRequiredError(orgId, reason);
     const settings = await this.getOrgSettings(orgId);
     if (!settings) throw new Error(`No settings found for orgId: ${orgId}`);
-    const conn = new jsforce.Connection({
-      oauth2: new jsforce.OAuth2({
-        clientId: this.clientId,
-        clientSecret: this.clientSecret || undefined,
-        redirectUri: this.redirectUri,
-        loginUrl: settings.instanceUrl,
-      }),
+    return new jsforce.Connection({
       accessToken: settings.accessToken,
-      refreshToken: settings.refreshToken,
       instanceUrl: settings.instanceUrl,
       version: SF_API_VERSION,
+      refreshFn: (conn, callback) => {
+        this.refreshSession(orgId, conn.accessToken ?? undefined)
+          .then((updated) => callback(null, updated.accessToken))
+          .catch((error) => callback(error));
+      },
     });
-    conn.on('refresh', (accessToken: string) => {
-      const updated = { ...settings, accessToken };
-      this.saveOrgSettings(updated)
-        .then(() => this.db?.updateTokens(orgId, accessToken))
-        .catch((err) => console.error(`[Auth] Failed to persist refreshed token for ${orgId}:`, err));
-    });
-    return conn;
   }
 }

@@ -1,4 +1,4 @@
-import { SalesforceAuthService } from './authService';
+import { SalesforceAuthService, SalesforceReauthRequiredError } from './authService';
 import { FlowMetadata, SetupAuditTrail } from '../types';
 import { DependencyService } from './dependencyService';
 
@@ -46,6 +46,7 @@ export class SalesforceService {
           const conn = await this.authService.getConnection(orgId);
           return await queryFn(conn);
         } catch (refreshError) {
+          if (refreshError instanceof SalesforceReauthRequiredError) throw refreshError;
           console.error(`[Token Refresh] Failed to refresh token for orgId ${orgId}:`, refreshError);
           throw new Error(`Token refresh failed: ${refreshError instanceof Error ? refreshError.message : 'Unknown error'}`);
         }

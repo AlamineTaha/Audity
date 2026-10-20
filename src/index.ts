@@ -12,6 +12,7 @@ import { DatabaseService } from './services/databaseService';
 import { auditArchiveService, authService, monitorService, privilegeService, setDatabase } from './services/container';
 import { initTenantAuth } from './middleware/tenantAuth';
 import { initSlackStore } from './slack/store';
+import { notifyReauthRequired } from './slack/alerts';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const POLLING_ENABLED = String(process.env.POLLING_ENABLED ?? 'true').toLowerCase() === 'true';
@@ -50,6 +51,7 @@ async function startServer() {
     // 3. Initialize tenant auth middleware
     initTenantAuth(dbService, authService);
     initSlackStore(dbService);
+    authService.onReauthRequired(notifyReauthRequired);
     setDatabase(dbService);
     monitorService.addOrgCycleHook('audit-archive', (orgId) => auditArchiveService.sync(orgId));
     monitorService.addOrgCycleHook('privileged-access', (orgId) => privilegeService.check(orgId));
