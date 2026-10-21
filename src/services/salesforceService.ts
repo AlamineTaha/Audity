@@ -3274,43 +3274,60 @@ export class SalesforceService {
    * @returns Custom Field metadata with formula, or null if not found
    */
   /**
-   * Convert a field label to DeveloperName format
-   * Replaces spaces with underscores, removes __c if present, and handles special characters
-   * Examples: "Formula Test" -> "Formula_Test__c", "CustomField__c" -> "CustomField__c"
+   * Object API name, label or plural label ("Leads") → API name. EntityDefinition is metadata-level,
+   * so it works regardless of the integration user's object access. SOQL here allows no OR.
    */
-  private labelToDeveloperName(label: string): string {
-    if (!label) return label;
-    
-    // If it already looks like a DeveloperName (starts with capital, contains only alphanumeric/underscore)
-    // and ends with __c, use as-is
-    if (/^[A-Z][A-Za-z0-9_]*__c$/.test(label)) {
-      return label;
-    }
-    
-    // Remove __c suffix if present (we'll add it back if needed)
-    let devName = label.replace(/__c$/i, '');
-    
-    // Replace spaces and special characters with underscores
-    devName = devName.replace(/[^A-Za-z0-9_]/g, '_');
-    
-    // Remove multiple consecutive underscores
-    devName = devName.replace(/_+/g, '_');
-    
-    // Remove leading/trailing underscores
-    devName = devName.replace(/^_+|_+$/g, '');
-    
-    // Capitalize first letter (Salesforce DeveloperName convention)
-    if (devName.length > 0) {
-      devName = devName.charAt(0).toUpperCase() + devName.slice(1);
-    }
-    
-    // If it doesn't end with __c, add it (assuming it's a custom field)
-    if (!devName.endsWith('__c')) {
-      devName = devName + '__c';
-    }
-    
-    return devName;
+  async resolveObjectApiName(orgId: string, nameOrLabel: string): Promise<string | null> {
+    return (await this.resolveObject(orgId, nameOrLabel))?.apiName ?? null;
   }
+
+  /** durableId is what Tooling's TableEnumOrId holds: the API name for standard objects, the 01I… Id for custom ones. */
+  private async resolveObject(orgId: string, nameOrLabel: string): Promise<{ apiName: string; durableId: string } | null> {
+    const conn = await this.authService.getConnection(orgId);
+    const value = nameOrLabel.trim().replace(/'/g, "\\'");
+    for (const field of ['QualifiedApiName', 'Label', 'PluralLabel']) {
+      const result = await conn.query<{ QualifiedApiName: string; DurableId: string }>(
+        `SELECT QualifiedApiName, DurableId FROM EntityDefinition WHERE ${field} = '${value}' LIMIT 1`
+      );
+      if (result.records.length) return { apiName: result.records[0].QualifiedApiName, durableId: result.records[0].DurableId };
+    }
+    return null;
+  }
+
+  /**
+   * Custom field by label or API name → API name plus the Tooling DeveloperName (no "__c", no
+   * namespace). Uses Tooling FieldDefinition: fields deployed without field-level security are
+   * invisible to describe calls but still listed here.
+   */
+  async resolveCustomField(orgId: string, objectNameOrLabel: string, fieldNameOrLabel: string): Promise<{
+    objectApiName: string;
+    tableEnumOrId: string;
+    fieldApiName: string;
+    developerName: string;
+    namespace?: string;
+  } | null> {
+    const object = await this.resolveObject(orgId, objectNameOrLabel);
+    if (!object) return null;
+    const objectApiName = object.apiName;
+    const conn = await this.authService.getConnection(orgId);
+    const result = await conn.tooling.query<{ QualifiedApiName: string; Label: string; DeveloperName: string; NamespacePrefix: string | null }>(
+      `SELECT QualifiedApiName, Label, DeveloperName, NamespacePrefix FROM FieldDefinition ` +
+        `WHERE EntityDefinition.QualifiedApiName = '${objectApiName.replace(/'/g, "\\'")}'`
+    );
+    const wanted = fieldNameOrLabel.trim().toLowerCase();
+    const field = result.records.find(
+      (f) => /__c$/i.test(f.QualifiedApiName) && (f.QualifiedApiName.toLowerCase() === wanted || f.Label.toLowerCase() === wanted)
+    );
+    if (!field) return null;
+    return {
+      objectApiName,
+      tableEnumOrId: object.durableId,
+      fieldApiName: field.QualifiedApiName,
+      developerName: field.DeveloperName,
+      namespace: field.NamespacePrefix ?? undefined,
+    };
+  }
+
 
   /**
    * Get Formula Field metadata from Salesforce using Tooling API
@@ -3325,28 +3342,25 @@ export class SalesforceService {
     orgId: string,
     fieldName: string,
     objectName: string
-  ): Promise<{ formula?: string; label?: string; type?: string } | null> {
+  ): Promise<{ objectApiName: string; fieldApiName: string; formula?: string; label?: string; type?: string } | null> {
     const conn = await this.authService.getConnection(orgId);
     const tooling = conn.tooling;
 
     try {
-      // Convert fieldName to DeveloperName format if it's a label
-      // If fieldName already contains __c or is in API format, use as-is
-      // Otherwise, convert label to DeveloperName
-      const developerName = fieldName.includes('__c') || /^[A-Z][A-Za-z0-9_]+$/.test(fieldName)
-        ? fieldName
-        : this.labelToDeveloperName(fieldName);
+      // Audit trail entries name fields and objects by label; Tooling needs API names.
+      const resolved = await this.resolveCustomField(orgId, objectName, fieldName);
+      if (!resolved) return null;
 
-      // Sanitize inputs for SOQL
-      const sanitizedDevName = developerName.replace(/'/g, "''");
-      const sanitizedObjectName = objectName.replace(/'/g, "''");
+      const sanitizedDevName = resolved.developerName.replace(/'/g, "''");
+      const sanitizedObjectName = resolved.tableEnumOrId.replace(/'/g, "''");
+      const namespaceFilter = resolved.namespace ? ` AND NamespacePrefix = '${resolved.namespace.replace(/'/g, "''")}'` : '';
 
       // Use DeveloperName and TableEnumOrId instead of FullName (FullName is not filterable)
       const soql = `
         SELECT Id, FullName, Metadata
         FROM CustomField
         WHERE DeveloperName = '${sanitizedDevName}'
-          AND TableEnumOrId = '${sanitizedObjectName}'
+          AND TableEnumOrId = '${sanitizedObjectName}'${namespaceFilter}
         LIMIT 1
       `;
 
@@ -3358,6 +3372,8 @@ export class SalesforceService {
 
       const metadata = result.records[0].Metadata || {};
       return {
+        objectApiName: resolved.objectApiName,
+        fieldApiName: resolved.fieldApiName,
         formula: metadata.formula || undefined,
         label: metadata.label || undefined,
         type: metadata.type || undefined,

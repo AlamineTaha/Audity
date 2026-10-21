@@ -845,14 +845,10 @@ export class MonitorService {
    * Uses exact 2026 Salesforce Action codes (case-sensitive)
    */
   private isFormulaFieldChange(record: SetupAuditTrail): boolean {
-    const action = record.Action;
-    const formulaFieldActions = [
-      'createdCFFormula',        // Custom Field Formula creation
-      'changedCFFormula',        // Custom Field Formula modification
-      'deletedCFFormula'         // Custom Field Formula deletion
-    ];
-    return formulaFieldActions.includes(action);
+    // createdCFFormula, createdCFFormulaCustom (custom objects), changedCFFormula, deletedCFFormula…
+    return /^(created|changed|deleted)cfformula/i.test(record.Action || '');
   }
+
 
   /**
    * Check if audit record is a Metadata change (Page Layouts, Custom Fields, etc.)
@@ -860,15 +856,12 @@ export class MonitorService {
    * Excludes formula fields (handled separately)
    */
   private isMetadataChange(record: SetupAuditTrail): boolean {
-    const action = record.Action;
-    const metadataActions = [
-      'accountlayout',           // Page Layout changes
-      'createdCustomField',      // Custom Field creation (non-formula)
-      'changedCustomField',      // Custom Field modification (non-formula)
-      'deletedCustomField'       // Custom Field deletion
-    ];
-    return metadataActions.includes(action);
+    const action = record.Action || '';
+    // Field actions are logged as createdCF, changedCF, changedCFDevName, createdCF_RSF, createdCFMasterDetailCustom…
+    if (/^(created|changed|deleted)cf/i.test(action)) return true;
+    return ['accountlayout', 'createdCustomField', 'changedCustomField', 'deletedCustomField'].includes(action);
   }
+
 
   /**
    * Process a batch of permission changes from the same user.
@@ -1062,33 +1055,33 @@ export class MonitorService {
       }
 
       const fieldName = fieldMatch[1].trim();
-      let objectName = 'Unknown';
-      const objectMatch = display.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/);
-      if (objectMatch && objectMatch[1]) {
-        objectName = objectMatch[1];
-      } else {
-        objectName = this.extractObjectNameFromSection(section) || 'Unknown';
-      }
+      // Standard objects: section "Customize Leads"; custom objects: display "… on AI Agent Conversations".
+      const objectLabel =
+        display.match(/\s+on\s+(.+?)\s*$/i)?.[1] ??
+        display.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/)?.[1] ??
+        section.match(/Customize\s+(.+)$/i)?.[1] ??
+        'Unknown';
 
-      const fieldMetadata = await this.salesforceService.getFormulaFieldMetadata(orgId, fieldName, objectName);
+      const fieldMetadata = await this.salesforceService.getFormulaFieldMetadata(orgId, fieldName, objectLabel);
       if (!fieldMetadata) {
         await this.publishFallbackNotification(orgId, `Formula Field: ${fieldName}`, display, auditRecord, settings);
         return;
       }
 
+      const objectName = fieldMetadata.objectApiName;
       const analysis = await this.aiService.analyzeFormulaField(
-        fieldName, objectName, fieldMetadata.formula, fieldMetadata.label, settings
+        fieldMetadata.fieldApiName, objectName, fieldMetadata.formula, fieldMetadata.label, settings
       );
 
-      const summaryText = `*[FORMULA FIELD] ${objectName}.${fieldName}*\n\n` +
+      const summaryText = `*[FORMULA FIELD] ${objectName}.${fieldMetadata.fieldApiName}*\n\n` +
         `${analysis}\n\n` +
         `*Changed by:* ${auditRecord.CreatedBy?.Name || 'Unknown'}\n` +
         `*Time:* ${new Date(auditRecord.CreatedDate).toLocaleString()}\n` +
         `*View in Salesforce:* ${settings.instanceUrl}/lightning/setup/ObjectManager/${objectName}/FieldsAndRelationships/view`;
 
       const category = this.getCategoryForMetadataType('CustomField');
-      await this.publishChange(orgId, summaryText, `${objectName}.${fieldName}`, category);
-      console.log(`[Monitor] Published Formula Field for ${objectName}.${fieldName}`);
+      await this.publishChange(orgId, summaryText, `${objectName}.${fieldMetadata.fieldApiName}`, category);
+      console.log(`[Monitor] Published Formula Field for ${objectName}.${fieldMetadata.fieldApiName}`);
     } catch (error) {
       console.error(`[Monitor] Error processing formula field change:`, error);
       await this.publishFallbackNotification(orgId, 'Formula Field Change', display, auditRecord, settings);
@@ -1107,7 +1100,7 @@ export class MonitorService {
       let changeType = 'METADATA';
       if (action === 'accountlayout' || action?.includes('layout')) {
         changeType = 'PAGE LAYOUT';
-      } else if (action?.includes('CustomField')) {
+      } else if (action?.includes('CustomField') || /^(created|changed|deleted)cf/i.test(action || '')) {
         changeType = 'CUSTOM FIELD';
       }
       
