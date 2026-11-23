@@ -1,23 +1,31 @@
 /**
  * Deploy Watch: follows every deployment/validation in connected orgs (CLI, CI, DevOps Center,
- * change sets — anything that creates a DeployRequest) and reports it in the org's Slack deploy
- * channel: one message that updates with live progress, then the final status, with an AI
- * explanation of failures in the thread.
+ * change sets — anything that creates a DeployRequest) and shows it live in the org's Slack
+ * deploy channel. Salesforce has no push event for deploys, so new deploys are discovered every
+ * few seconds and running ones are refreshed every LIVE tick: one Slack message that updates in
+ * place (clock, progress, live feed, Cancel / Quick deploy buttons), then the final status, with an
+ * AI explanation of failures in the thread.
  */
 
 import type { KnownBlock } from '@slack/types';
 import { webApi } from '@slack/bolt';
-import { authService } from '../services/container';
+import type { Connection } from 'jsforce';
+import { authService, getDatabase } from '../services/container';
 import { slackDb } from '../slack/store';
 import { slackClientForTeam } from '../slack/app';
 import {
   DeploySnapshot,
   FINAL_STATUSES,
+  FeedEntry,
+  elapsedClock,
   explainFailure,
   fetchDetails,
+  fetchLiveFeed,
+  getDeploy,
   headline,
   progressLines,
   queryDeploys,
+  quickDeployable,
 } from './deployAnalysis';
 
 type SlackClient = webApi.WebClient;
@@ -34,22 +42,40 @@ interface WatchState {
   final: boolean;
 }
 
-const STATE_TTL_SEC = 3 * 24 * 60 * 60;
-const LOOKBACK_MS = 6 * 60 * 60 * 1000;
-const stateKey = (orgId: string, id: string) => `deploy_watch:${orgId}:${id}`;
-const sinceKey = (orgId: string) => `deploy_watch_since:${orgId}`;
+interface ActiveDeploy {
+  orgId: string;
+  deployId: string;
+  targets: Array<{ teamId: string; channel: string }>;
+  state: WatchState | null;
+  ticks: number;
+  discoveredAt: number;
+  feed: { entries: FeedEntry[]; failures: FeedEntry[] };
+}
 
-const fingerprint = (d: DeploySnapshot) =>
-  [d.status, d.componentsDeployed, d.componentErrors, d.testsCompleted, d.testErrors, d.stateDetail ?? ''].join('|');
+const STATE_RETENTION_DAYS = 3;
+const LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const SINCE_JOB = 'deploy_watch_since';
+const PRUNE_EVERY_MS = 6 * 60 * 60 * 1000;
+const FEED_LINES = 6;
+/** Above this many concurrent deploys, refresh less often to stay within Slack rate limits. */
+const BUSY_THRESHOLD = 4;
 
 export class DeployWatchService {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
+  private lastPrune = 0;
+  private lastDiscovery = 0;
+  private active = new Map<string, ActiveDeploy>();
 
-  start(intervalSec: number): void {
+  constructor(
+    private readonly liveSec = 3,
+    private readonly discoverSec = 10
+  ) {}
+
+  start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.tick(), intervalSec * 1000);
-    console.log(`[DeployWatch] Watching deployments every ${intervalSec}s`);
+    this.timer = setInterval(() => void this.tick(), this.liveSec * 1000);
+    console.log(`[DeployWatch] Live: discovery every ${this.discoverSec}s, running deploys refreshed every ${this.liveSec}s`);
   }
 
   stop(): void {
@@ -61,56 +87,76 @@ export class DeployWatchService {
     if (this.running) return;
     this.running = true;
     try {
-      for (const orgId of await authService.getAllOrgIds()) {
-        if (await authService.isReauthRequired(orgId)) continue;
-        await this.checkOrg(orgId).catch((error) => console.error(`[DeployWatch] Org ${orgId} failed:`, error?.message ?? error));
+      if (Date.now() - this.lastPrune > PRUNE_EVERY_MS) {
+        this.lastPrune = Date.now();
+        await getDatabase().pruneDeployWatchState(STATE_RETENTION_DAYS).catch((error) => console.error('[DeployWatch] Prune failed:', error));
+      }
+      if (Date.now() - this.lastDiscovery >= this.discoverSec * 1000) {
+        this.lastDiscovery = Date.now();
+        for (const orgId of await authService.getAllOrgIds()) {
+          if (await authService.isReauthRequired(orgId)) continue;
+          await this.discover(orgId).catch((error) => console.error(`[DeployWatch] Discovery failed for ${orgId}:`, error?.message ?? error));
+        }
+      }
+      const busy = this.active.size > BUSY_THRESHOLD;
+      for (const deploy of [...this.active.values()]) {
+        // Just posted by discovery in this tick; refresh it next tick.
+        if (deploy.discoveredAt === this.lastDiscovery) continue;
+        deploy.ticks++;
+        if (busy && deploy.ticks % 2 === 1) continue;
+        await this.refresh(deploy).catch((error) => console.error(`[DeployWatch] Refresh failed for ${deploy.deployId}:`, error?.message ?? error));
       }
     } finally {
       this.running = false;
     }
   }
 
-  private async checkOrg(orgId: string): Promise<void> {
+  private async discover(orgId: string): Promise<void> {
     const links = (await slackDb().getSlackLinksForOrg(orgId)).filter((l) => l.deploy_channel_id);
     if (links.length === 0) return;
+    const targets = links.map((l) => ({ teamId: l.team_id, channel: l.deploy_channel_id as string }));
 
-    // Deploys that finished before watching started are history, not news.
-    let since = await authService.getCachedValue(sinceKey(orgId));
-    if (!since) {
-      since = new Date().toISOString();
-      await authService.setCachedValue(sinceKey(orgId), since, 365 * 24 * 60 * 60);
-    }
+    // Deploys that finished before watching started are history, not news. Kept in Postgres
+    // (Heroku Redis has no persistence); the Redis read is a one-time migration.
+    const db = getDatabase();
+    let since = (await db.getJobState(orgId, SINCE_JOB)) ?? (await authService.getCachedValue(`deploy_watch_since:${orgId}`));
+    if (!since) since = new Date().toISOString();
+    await db.setJobState(orgId, SINCE_JOB, since);
 
     const conn = await authService.getConnection(orgId);
     const lookback = new Date(Date.now() - LOOKBACK_MS).toISOString().replace(/\.\d{3}Z$/, 'Z');
     for (const deploy of await queryDeploys(conn, lookback)) {
-      const raw = await authService.getCachedValue(stateKey(orgId, deploy.id));
-      const state: WatchState | null = raw ? JSON.parse(raw) : null;
+      const key = `${orgId}:${deploy.id}`;
+      if (this.active.has(key)) continue;
+      const state = await db.getDeployWatchState<WatchState>(orgId, deploy.id);
       if (state?.final) continue;
-      const isFinal = FINAL_STATUSES.has(deploy.status);
-      if (!state && isFinal && (deploy.completedDate ?? deploy.createdDate) < since) continue;
-      if (state && state.fingerprint === fingerprint(deploy) && !isFinal) continue;
-      await this.report(orgId, conn, deploy, state, links.map((l) => ({ teamId: l.team_id, channel: l.deploy_channel_id as string })));
+      if (!state && FINAL_STATUSES.has(deploy.status) && (deploy.completedDate ?? deploy.createdDate) < since) continue;
+      const entry: ActiveDeploy = { orgId, deployId: deploy.id, targets, state, ticks: 0, discoveredAt: this.lastDiscovery, feed: { entries: [], failures: [] } };
+      this.active.set(key, entry);
+      await this.refresh(entry, deploy, conn);
     }
   }
 
-  private async report(
-    orgId: string,
-    conn: Awaited<ReturnType<typeof authService.getConnection>>,
-    deploy: DeploySnapshot,
-    previous: WatchState | null,
-    targets: Array<{ teamId: string; channel: string }>
-  ): Promise<void> {
+  private async refresh(entry: ActiveDeploy, known?: DeploySnapshot, knownConn?: Connection): Promise<void> {
+    const conn = knownConn ?? (await authService.getConnection(entry.orgId));
+    const deploy = known ?? (await getDeploy(conn, entry.deployId));
+    if (!deploy) {
+      this.active.delete(`${entry.orgId}:${entry.deployId}`);
+      return;
+    }
     const isFinal = FINAL_STATUSES.has(deploy.status);
-    const instanceUrl = conn.instanceUrl;
-    const blocks = messageBlocks(deploy, instanceUrl);
+    // Per-component results: every other tick while running (they're heavier), always at the end.
+    if (isFinal || entry.ticks % 2 === 0) {
+      entry.feed = await fetchLiveFeed(conn, deploy.id).catch(() => entry.feed);
+    }
+
+    const blocks = messageBlocks(deploy, conn.instanceUrl, entry.feed, entry.orgId, entry.ticks);
     const text = headline(deploy).replace(/[*:]/g, '');
     const messages: PostedMessage[] = [];
-
-    for (const target of targets) {
+    for (const target of entry.targets) {
       const client = await slackClientForTeam(target.teamId);
       if (!client) continue;
-      const existing = previous?.messages.find((m) => m.teamId === target.teamId && m.channel === target.channel);
+      const existing = entry.state?.messages.find((m) => m.teamId === target.teamId && m.channel === target.channel);
       try {
         if (existing) {
           await client.chat.update({ channel: existing.channel, ts: existing.ts, blocks, text });
@@ -120,33 +166,33 @@ export class DeployWatchService {
           if (posted.ts) messages.push({ teamId: target.teamId, channel: target.channel, ts: posted.ts });
         }
       } catch (error) {
-        console.error(`[DeployWatch] Slack post failed for ${deploy.id}:`, (error as { data?: { error?: string } }).data?.error ?? error);
+        console.error(`[DeployWatch] Slack update failed for ${deploy.id}:`, (error as { data?: { error?: string } }).data?.error ?? error);
+        if (existing) messages.push(existing);
       }
     }
 
-    const state: WatchState = { messages, fingerprint: fingerprint(deploy), final: isFinal };
-    await authService.setCachedValue(stateKey(orgId, deploy.id), JSON.stringify(state), STATE_TTL_SEC);
-    if (!isFinal || messages.length === 0) return;
+    entry.state = { messages, fingerprint: `${deploy.status}|${deploy.componentsDeployed}|${deploy.testsCompleted}`, final: isFinal };
+    await getDatabase().saveDeployWatchState(entry.orgId, deploy.id, entry.state);
+    if (!isFinal) return;
 
+    this.active.delete(`${entry.orgId}:${entry.deployId}`);
     console.log(`[DeployWatch] ${deploy.id} ${deploy.status} (${deploy.checkOnly ? 'validation' : 'deploy'}) by ${deploy.createdByName}`);
-    const failed = deploy.status === 'Failed' || deploy.status === 'SucceededPartial';
-    let threadText: string | null = null;
-    if (failed) {
-      const details = await fetchDetails(conn, deploy.id).catch((error) => {
-        console.error(`[DeployWatch] Details failed for ${deploy.id}:`, error?.message ?? error);
-        return null;
-      });
-      threadText = details ? await explainFailure(conn, deploy, details) : deploy.errorMessage ?? 'Salesforce did not return failure details.';
-    }
+    if (deploy.status !== 'Failed' && deploy.status !== 'SucceededPartial') return;
+    await this.explainInThread(conn, deploy, messages);
+  }
 
-    // Successes stay quiet (the updated message says it all); failures get the analysis in the thread.
-    if (!failed || !threadText) return;
+  private async explainInThread(conn: Connection, deploy: DeploySnapshot, messages: PostedMessage[]): Promise<void> {
+    const details = await fetchDetails(conn, deploy.id).catch((error) => {
+      console.error(`[DeployWatch] Details failed for ${deploy.id}:`, error?.message ?? error);
+      return null;
+    });
+    const analysis = details ? await explainFailure(conn, deploy, details) : deploy.errorMessage ?? 'Salesforce did not return failure details.';
     const kind = deploy.checkOnly ? 'validation' : 'deployment';
     for (const message of messages) {
       const client = await slackClientForTeam(message.teamId);
       if (!client) continue;
       const mention = await this.deployerMention(client, conn, deploy.createdById);
-      const body = `${mention ? `${mention}, your ${kind} failed.\n\n` : ''}${threadText}`;
+      const body = `${mention ? `${mention}, your ${kind} failed.\n\n` : ''}${analysis}`;
       await client.chat
         .postMessage({ channel: message.channel, thread_ts: message.ts, text: body.slice(0, 3000), blocks: sections(body), unfurl_links: false })
         .catch((error) => console.error(`[DeployWatch] Thread reply failed for ${deploy.id}:`, error?.data?.error ?? error));
@@ -154,7 +200,7 @@ export class DeployWatchService {
   }
 
   /** <@U…> for the Salesforce user who started the deploy, matched by email; null if unknown. */
-  private async deployerMention(client: SlackClient, conn: Awaited<ReturnType<typeof authService.getConnection>>, userId: string): Promise<string | null> {
+  private async deployerMention(client: SlackClient, conn: Connection, userId: string): Promise<string | null> {
     const cacheKey = `deploy_watch_user:${userId}`;
     const cached = await authService.getCachedValue(cacheKey);
     if (cached) return cached === '-' ? null : `<@${cached}>`;
@@ -179,15 +225,70 @@ function sections(text: string): KnownBlock[] {
   return blocks;
 }
 
-function messageBlocks(d: DeploySnapshot, instanceUrl: string): KnownBlock[] {
+function feedLines(feed: ActiveDeploy['feed'], isFinal: boolean): string[] {
+  // At the end, failures matter more than the last successes.
+  const shown = isFinal && feed.failures.length ? feed.failures.slice(0, FEED_LINES) : feed.entries.slice(0, FEED_LINES);
+  const lines = shown.map((e) => `${e.ok ? ':white_check_mark:' : ':x:'} \`${e.label}\``);
+  const hidden = (isFinal && feed.failures.length ? feed.failures.length : feed.entries.length) - shown.length;
+  if (hidden > 0) lines.push(`_…and ${hidden} more_`);
+  return lines;
+}
+
+function messageBlocks(d: DeploySnapshot, instanceUrl: string, feed: ActiveDeploy['feed'], orgId: string, tick: number): KnownBlock[] {
+  const isFinal = FINAL_STATUSES.has(d.status);
+  const kind = d.checkOnly ? 'Validation' : 'Deployment';
+  // The alternating hourglass and the ticking clock make it visibly live.
+  const title = isFinal
+    ? `${headline(d)}`
+    : `${tick % 2 === 0 ? ':hourglass_flowing_sand:' : ':hourglass:'} *${kind} ${d.status === 'Pending' ? 'queued' : d.status === 'Canceling' ? 'canceling' : 'in progress'}* · :stopwatch: ${elapsedClock(d)}`;
+  const blocks: KnownBlock[] = [
+    { type: 'section', text: { type: 'mrkdwn', text: `${title}\n${progressLines(d).filter((l) => !l.startsWith('_')).join('\n')}` } },
+  ];
+  if (!isFinal && d.stateDetail) {
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*Now:* ${d.stateDetail}` }] });
+  }
+  const lines = feedLines(feed, isFinal);
+  if (lines.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } });
+
+  const value = JSON.stringify({ o: orgId, d: d.id });
+  if (!isFinal) {
+    blocks.push({
+      type: 'actions',
+      block_id: 'deploy_actions',
+      elements: [{
+        type: 'button', style: 'danger', action_id: 'auditdelta_deploy_cancel', value,
+        text: { type: 'plain_text', text: `Cancel ${kind.toLowerCase()}` },
+        confirm: {
+          title: { type: 'plain_text', text: `Cancel this ${kind.toLowerCase()}?` },
+          text: { type: 'mrkdwn', text: `Salesforce stops \`${d.id}\` and rolls back anything already deployed.` },
+          confirm: { type: 'plain_text', text: 'Cancel it' },
+          deny: { type: 'plain_text', text: 'Keep running' },
+        },
+      }],
+    });
+  } else if (quickDeployable(d)) {
+    blocks.push({
+      type: 'actions',
+      block_id: 'deploy_actions',
+      elements: [{
+        type: 'button', style: 'primary', action_id: 'auditdelta_deploy_quick', value,
+        text: { type: 'plain_text', text: 'Quick deploy' },
+        confirm: {
+          title: { type: 'plain_text', text: 'Quick deploy this validation?' },
+          text: { type: 'mrkdwn', text: `Deploys the validated components of \`${d.id}\` to the org now, without re-running tests.` },
+          confirm: { type: 'plain_text', text: 'Deploy' },
+          deny: { type: 'plain_text', text: 'Not now' },
+        },
+      }],
+    });
+  }
+
   const context = [
     `by *${d.createdByName}*`,
     d.changeSetName ? `change set *${d.changeSetName}*` : null,
     d.testLevel ? `tests: ${d.testLevel}` : null,
     `<${instanceUrl}/lightning/setup/DeployStatus/home|\`${d.id}\`>`,
   ].filter(Boolean);
-  return [
-    { type: 'section', text: { type: 'mrkdwn', text: `${headline(d)}\n${progressLines(d).join('\n')}` } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `AuditDelta Deploy Watch · ${context.join(' · ')}` }] },
-  ];
+  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `AuditDelta Deploy Watch · ${context.join(' · ')}` }] });
+  return blocks;
 }

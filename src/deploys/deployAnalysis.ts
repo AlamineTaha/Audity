@@ -334,11 +334,17 @@ Write in Slack mrkdwn: *bold* section titles, "• " bullets, \`names\` in backt
   }
 }
 
+// Measured from creation, so the clock never jumps back when a queued deploy starts.
 export function durationText(d: DeploySnapshot): string {
-  const start = d.startDate ?? d.createdDate;
+  const start = d.createdDate;
   const end = d.completedDate ?? new Date().toISOString();
   const sec = Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000));
   return sec >= 60 ? `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s` : `${sec}s`;
+}
+
+/** Salesforce only allows quick deploy for validations that ran (and passed) Apex tests. */
+export function quickDeployable(d: DeploySnapshot): boolean {
+  return d.checkOnly && d.status === 'Succeeded' && d.testsTotal > 0;
 }
 
 export function headline(d: DeploySnapshot): string {
@@ -350,7 +356,7 @@ export function headline(d: DeploySnapshot): string {
     case 'Canceling':
       return `:hourglass_flowing_sand: *${kind} ${d.status === 'Canceling' ? 'canceling' : 'in progress'}* · ${durationText(d)}`;
     case 'Succeeded':
-      return `:white_check_mark: *${kind} succeeded* · ${d.componentsTotal} component(s) · ${d.testsTotal} test(s) · ${durationText(d)}${d.checkOnly ? ' · ready to quick deploy' : ''}`;
+      return `:white_check_mark: *${kind} succeeded* · ${d.componentsTotal} component(s) · ${d.testsTotal} test(s) · ${durationText(d)}${quickDeployable(d) ? ' · ready to quick deploy' : ''}`;
     case 'SucceededPartial':
       return `:warning: *${kind} partially succeeded* · ${d.componentErrors} component error(s) · ${durationText(d)}`;
     case 'Failed':
@@ -371,4 +377,53 @@ export function progressLines(d: DeploySnapshot): string[] {
   if (d.testsTotal > 0) lines.push(`Tests ${bar(d.testsCompleted, d.testsTotal)}${d.testErrors ? ` · :x: ${d.testErrors} failure(s)` : ''}`);
   if (d.stateDetail && !FINAL_STATUSES.has(d.status)) lines.push(`_${d.stateDetail}_`);
   return lines;
+}
+
+// ---------------- Live feed ----------------
+
+export interface FeedEntry {
+  ok: boolean;
+  label: string;
+  at: string;
+}
+
+/** Components and tests finished so far, newest first (from checkDeployStatus details). */
+export async function fetchLiveFeed(conn: Connection, deployId: string): Promise<{ entries: FeedEntry[]; failures: FeedEntry[] }> {
+  const result = (await conn.metadata.checkDeployStatus(deployId, true)) as unknown as {
+    details?: {
+      componentSuccesses?: unknown;
+      componentFailures?: unknown;
+      runTestResult?: { successes?: unknown; failures?: unknown };
+    };
+  };
+  const details = result.details ?? {};
+  const entries: FeedEntry[] = [];
+  for (const c of asArray(details.componentSuccesses as Record<string, unknown>[])) {
+    if (!c.componentType || c.fullName === 'package.xml') continue;
+    entries.push({ ok: true, label: `${c.componentType} ${c.fullName}`, at: String(c.createdDate ?? '') });
+  }
+  const failures: FeedEntry[] = [];
+  for (const c of asArray(details.componentFailures as Record<string, unknown>[])) {
+    const where = c.lineNumber ? ` (line ${c.lineNumber})` : '';
+    const entry = { ok: false, label: `${c.componentType || 'Component'} ${c.fullName}${where} — ${String(c.problem || '').slice(0, 90)}`, at: String(c.createdDate ?? '') };
+    failures.push(entry);
+    entries.push(entry);
+  }
+  for (const t of asArray(details.runTestResult?.failures as Record<string, unknown>[])) {
+    const entry = { ok: false, label: `Test ${t.name}.${t.methodName} — ${String(t.message || '').split('\n')[0].slice(0, 90)}`, at: '' };
+    failures.push(entry);
+    entries.push(entry);
+  }
+  for (const t of asArray(details.runTestResult?.successes as Record<string, unknown>[])) {
+    entries.push({ ok: true, label: `Test ${t.name}.${t.methodName}`, at: '' });
+  }
+  entries.sort((a, b) => (b.at || '').localeCompare(a.at || ''));
+  return { entries, failures };
+}
+
+export function elapsedClock(d: DeploySnapshot): string {
+  const start = d.createdDate;
+  const end = FINAL_STATUSES.has(d.status) && d.completedDate ? d.completedDate : new Date().toISOString();
+  const sec = Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000));
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 }

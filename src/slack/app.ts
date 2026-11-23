@@ -3,6 +3,7 @@ import type { KnownBlock } from '@slack/types';
 import type { ToolImage } from '../tools/types';
 import { resolveTenant } from '../middleware/tenantAuth';
 import { authService } from '../services/container';
+import { SF_API_VERSION } from '../services/authService';
 import { getTool } from '../tools';
 import { TenantContext } from '../types';
 import { loadConversation, runAgent, runTool, saveConversation, savePendingAction, takePendingAction, PendingAction } from './agent';
@@ -321,6 +322,38 @@ function registerListeners(app: App): void {
       text: `Explain the ${ref.category} change to "${ref.component}" that this alert is about: what changed, who is affected, and the risk. Use the tools to check the actual metadata.`,
     });
   });
+
+  // Deploy Watch buttons. Slack signs these requests; we still check the org belongs to this workspace.
+  const deployAction = (kind: 'cancel' | 'quick') =>
+    async ({ ack, body, action, client, context }: { ack: () => Promise<void>; body: BlockAction; action: ButtonAction; client: SlackClient; context: { teamId?: string } }) => {
+      await ack();
+      const { o: orgId, d: deployId } = JSON.parse(action.value ?? '{}') as { o?: string; d?: string };
+      const channel = body.channel?.id;
+      const ts = body.message?.ts;
+      if (!orgId || !deployId || !channel || !ts || !context.teamId) return;
+      const linked = (await slackDb().getSlackLinksForTeam(context.teamId)).some((l) => l.org_id === orgId);
+      const say = (text: string) => client.chat.postMessage({ channel, thread_ts: ts, text });
+      if (!linked) {
+        await say(':no_entry: This org is not connected to this workspace.');
+        return;
+      }
+      try {
+        const conn = await authService.getConnection(orgId);
+        const base = `/services/data/v${SF_API_VERSION}/metadata/deployRequest`;
+        if (kind === 'cancel') {
+          await conn.request({ method: 'PATCH', url: `${base}/${deployId}`, body: JSON.stringify({ deployResult: { status: 'Canceling' } }), headers: { 'Content-Type': 'application/json' } });
+          await say(`:no_entry_sign: Cancel requested by <@${body.user.id}> — the message above updates when Salesforce stops it.`);
+        } else {
+          const started = (await conn.request({ method: 'POST', url: base, body: JSON.stringify({ validatedDeployRequestId: deployId }), headers: { 'Content-Type': 'application/json' } })) as { id?: string };
+          await say(`:rocket: Quick deploy started by <@${body.user.id}>${started.id ? ` — \`${started.id}\`, followed live in this channel` : ''}.`);
+        }
+      } catch (error) {
+        const message = (error as { message?: string }).message ?? 'unknown error';
+        await say(`:x: ${kind === 'cancel' ? 'Cancel' : 'Quick deploy'} failed: ${message}`);
+      }
+    };
+  app.action<BlockAction<ButtonAction>>('auditdelta_deploy_cancel', deployAction('cancel'));
+  app.action<BlockAction<ButtonAction>>('auditdelta_deploy_quick', deployAction('quick'));
 
   app.action<BlockAction<ButtonAction>>('auditdelta_ack', async ({ ack, body, client }) => {
     await ack();

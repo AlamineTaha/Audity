@@ -352,17 +352,25 @@ export class SalesforceAuthService {
     return count;
   }
 
-  // --------------- Audit trail high-water mark (no TTL: survives restarts) ---------------
+  // --------------- Audit trail high-water mark (Postgres; Heroku Redis has no persistence) ---------------
 
   async getAuditHighWaterMark(orgId: string): Promise<Date | null> {
+    const stored = this.db ? await this.db.getJobState(orgId, 'audit_hwm') : null;
+    if (stored) return new Date(stored);
+    // One-time migration: marks written to Redis before the move to Postgres.
     await this.connect();
-    const value = await this.redisClient.get(`audit_hwm:${orgId}`);
-    return value ? new Date(value) : null;
+    const legacy = await this.redisClient.get(`audit_hwm:${orgId}`);
+    return legacy ? new Date(legacy) : null;
   }
 
   async setAuditHighWaterMark(orgId: string, createdDate: string): Promise<void> {
+    const value = new Date(createdDate).toISOString();
+    if (this.db) {
+      await this.db.setJobState(orgId, 'audit_hwm', value);
+      return;
+    }
     await this.connect();
-    await this.redisClient.set(`audit_hwm:${orgId}`, new Date(createdDate).toISOString());
+    await this.redisClient.set(`audit_hwm:${orgId}`, value);
   }
 
   // --------------- Org enumeration ---------------
