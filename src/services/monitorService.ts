@@ -1044,7 +1044,12 @@ export class MonitorService {
     const section = auditRecord.Section || '';
 
     try {
-      const fieldMatch = display.match(/(?:field|formula field):\s*(.+?)(?:\s*\(|$)/i) ||
+      // Changes: 'Changed formula of AD Test Revenue Band custom field from "…" to "…"'.
+      // Creations: 'Created custom formula field: AD Test Priority (Text)'.
+      // Custom objects: 'Created custom formula field AI Agent Name (Text) on AI Agent Conversations' (no colon).
+      const fieldMatch = display.match(/formula of\s+(.+?)\s+custom field\b/i) ||
+                         display.match(/custom formula field:?\s+(.+?)\s*\(/i) ||
+                         display.match(/(?:field|formula field):\s*(.+?)(?:\s*\(|$)/i) ||
                          display.match(/\.([A-Za-z0-9_]+__c)/) ||
                          display.match(/^([A-Za-z0-9_\s]+?)(?:\s*\(|$)/);
 
@@ -1056,8 +1061,10 @@ export class MonitorService {
 
       const fieldName = fieldMatch[1].trim();
       // Standard objects: section "Customize Leads"; custom objects: display "… on AI Agent Conversations".
+      // The "… on <Object>" suffix only exists on creations; change entries quote the formula, which may contain " on ".
+      const describesFormula = /\bfrom\s+"/i.test(display);
       const objectLabel =
-        display.match(/\s+on\s+(.+?)\s*$/i)?.[1] ??
+        (describesFormula ? undefined : display.match(/\s+on\s+(.+?)\s*$/i)?.[1]) ??
         display.match(/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/)?.[1] ??
         section.match(/Customize\s+(.+)$/i)?.[1] ??
         'Unknown';
