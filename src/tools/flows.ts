@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { authService, salesforceService, aiService } from '../services/container';
+import { flowDiagramImages } from '../charts/flowDiagram';
 import { defineTool, fail, ok, ToolResult, zInt } from './types';
 
 function errorResult(error: unknown, logLabel: string): ToolResult {
@@ -155,21 +156,26 @@ export const analyzeFlowChangesTool = defineTool({
         displayText += `\n${versionNumbersToday.length} change(s) detected today. ${revertPrompt}`;
       }
 
-      return ok({
-        displayText,
-        flowName: diff.flowName,
-        summary: diff.summary,
-        changes: diff.changes,
-        revertOptions: {
-          summary: `${versionNumbersToday.length} change(s) detected today.`,
-          versionsToday: versionNumbersToday,
-          recommendedStableVersion,
-          revertPrompt,
-        },
-        dependencies,
-        riskAnalysis,
-        revertImpact,
-      });
+      const images = await flowDiagramImages(diff.flowName ?? flowName, versions.previous, versions.current);
+
+      return {
+        ...ok({
+          displayText,
+          flowName: diff.flowName,
+          summary: diff.summary,
+          changes: diff.changes,
+          revertOptions: {
+            summary: `${versionNumbersToday.length} change(s) detected today.`,
+            versionsToday: versionNumbersToday,
+            recommendedStableVersion,
+            revertPrompt,
+          },
+          dependencies,
+          riskAnalysis,
+          revertImpact,
+        }),
+        images,
+      };
     } catch (error) {
       console.error('Error in analyze-flow endpoint:', error);
       const errorMessage = error instanceof Error ? error.message : 'Internal server error';

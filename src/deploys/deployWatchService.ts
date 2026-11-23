@@ -150,7 +150,8 @@ export class DeployWatchService {
       entry.feed = await fetchLiveFeed(conn, deploy.id).catch(() => entry.feed);
     }
 
-    const blocks = messageBlocks(deploy, conn.instanceUrl, entry.feed, entry.orgId, entry.ticks);
+    const styled = deployMessage(deploy, conn.instanceUrl, entry.feed, entry.orgId, entry.ticks);
+    const { blocks, attachments } = styled;
     const text = headline(deploy).replace(/[*:]/g, '');
     const messages: PostedMessage[] = [];
     for (const target of entry.targets) {
@@ -159,10 +160,10 @@ export class DeployWatchService {
       const existing = entry.state?.messages.find((m) => m.teamId === target.teamId && m.channel === target.channel);
       try {
         if (existing) {
-          await client.chat.update({ channel: existing.channel, ts: existing.ts, blocks, text });
+          await client.chat.update({ channel: existing.channel, ts: existing.ts, blocks, attachments, text });
           messages.push(existing);
         } else {
-          const posted = await client.chat.postMessage({ channel: target.channel, blocks, text, unfurl_links: false });
+          const posted = await client.chat.postMessage({ channel: target.channel, blocks, attachments, text, unfurl_links: false });
           if (posted.ts) messages.push({ teamId: target.teamId, channel: target.channel, ts: posted.ts });
         }
       } catch (error) {
@@ -232,6 +233,28 @@ function feedLines(feed: ActiveDeploy['feed'], isFinal: boolean): string[] {
   const hidden = (isFinal && feed.failures.length ? feed.failures.length : feed.entries.length) - shown.length;
   if (hidden > 0) lines.push(`_…and ${hidden} more_`);
   return lines;
+}
+
+const STATUS_COLORS: Record<string, string> = {
+  Pending: '#1D9BD1',
+  InProgress: '#1D9BD1',
+  Canceling: '#868686',
+  Succeeded: '#2EB67D',
+  SucceededPartial: '#ECB22E',
+  Failed: '#E01E5A',
+  Canceled: '#868686',
+};
+
+/** Header outside, live content inside a status-colored border (blue → green / red / grey). */
+export function deployMessage(d: DeploySnapshot, instanceUrl: string, feed: ActiveDeploy['feed'], orgId: string, tick: number): {
+  blocks: KnownBlock[];
+  attachments: Array<{ color: string; blocks: KnownBlock[] }>;
+} {
+  const kind = d.checkOnly ? 'Validation' : 'Deployment';
+  return {
+    blocks: [{ type: 'header', text: { type: 'plain_text', text: `🚀 ${kind} · ${d.createdByName}`.slice(0, 148), emoji: true } }],
+    attachments: [{ color: STATUS_COLORS[d.status] ?? '#1D9BD1', blocks: messageBlocks(d, instanceUrl, feed, orgId, tick) }],
+  };
 }
 
 function messageBlocks(d: DeploySnapshot, instanceUrl: string, feed: ActiveDeploy['feed'], orgId: string, tick: number): KnownBlock[] {

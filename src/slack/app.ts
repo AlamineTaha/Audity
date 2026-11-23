@@ -9,6 +9,7 @@ import { TenantContext } from '../types';
 import { loadConversation, runAgent, runTool, saveConversation, savePendingAction, takePendingAction, PendingAction } from './agent';
 import { AlertRef, confirmationBlocks, contextBlock, markdownBlock } from './blocks';
 import { botTokenForTeam, installationStore, slackDb } from './store';
+import { registerHome } from './home';
 
 type SlackClient = webApi.WebClient;
 
@@ -360,9 +361,21 @@ function registerListeners(app: App): void {
     const channel = body.channel?.id;
     const ts = body.message?.ts;
     if (!channel || !ts) return;
-    const blocks = ((body.message?.blocks ?? []) as KnownBlock[]).filter((b) => b.block_id !== 'alert_actions');
-    blocks.push(contextBlock(`:white_check_mark: Acknowledged by <@${body.user.id}> · <!date^${Math.floor(Date.now() / 1000)}^{date_short_pretty} {time}|now>`));
-    await client.chat.update({ channel, ts, blocks, text: body.message?.text ?? 'Acknowledged' });
+    const acked = contextBlock(`:white_check_mark: Acknowledged by <@${body.user.id}> · <!date^${Math.floor(Date.now() / 1000)}^{date_short_pretty} {time}|now>`);
+    const message = body.message as { blocks?: KnownBlock[]; attachments?: Array<{ color?: string; blocks?: KnownBlock[] }>; text?: string } | undefined;
+    // Designed alerts keep their actions inside the colored attachment; older ones at the top level.
+    const attachments = (message?.attachments ?? []).map((a) => {
+      const inner = (a.blocks ?? []).filter((b) => b.block_id !== 'alert_actions');
+      return { color: a.color, blocks: a.blocks?.some((b) => b.block_id === 'alert_actions') ? [...inner, acked] : inner };
+    });
+    const blocks = ((message?.blocks ?? []) as KnownBlock[]).filter((b) => b.block_id !== 'alert_actions');
+    if (!attachments.length) blocks.push(acked);
+    await client.chat.update({ channel, ts, blocks, attachments, text: message?.text ?? 'Acknowledged' });
+  });
+
+  // Link buttons still send an action; acknowledge it so Slack doesn't show an error.
+  app.action('auditdelta_view', async ({ ack }) => {
+    await ack();
   });
 }
 
@@ -441,6 +454,7 @@ export function createSlackReceiver(): ExpressReceiver | null {
   });
   const app = new App({ receiver, deferInitialization: true, ...(oauth ? {} : { token: process.env.SLACK_BOT_TOKEN }) });
   registerListeners(app);
+  registerHome(app);
   // A bad token must not take the API down; Slack features stay unavailable until fixed.
   app.init().catch((error) => console.error('[Slack] Initialization failed (check SLACK_BOT_TOKEN):', error?.data?.error ?? error));
   app.error(async (error) => {
