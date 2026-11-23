@@ -147,6 +147,7 @@ const HELP = [
   '*AuditDelta* — Salesforce change governance in Slack.',
   '• `/auditdelta connect [sandbox|https://yourdomain.my.salesforce.com]` — connect a Salesforce org',
   '• `/auditdelta alerts here` — send change alerts to this channel',
+  '• `/auditdelta deploys here` · `deploys off` — follow deployments and validations in this channel',
   '• `/auditdelta status` — show connected orgs and alert channels',
   '• `/auditdelta disconnect` — disconnect the default org from this workspace',
   'Then DM me, or @mention me in a channel or thread (I only answer when mentioned there): _"What changed in the last 24 hours?"_, _"Who can export reports?"_, _"Compare the last two versions of Lead_Routing"_.',
@@ -228,6 +229,28 @@ function registerListeners(app: App): void {
         });
         return;
       }
+      case 'deploys': {
+        const links = await slackDb().getSlackLinksForTeam(teamId);
+        const link = links.find((l) => l.is_default) ?? links[0];
+        if (!link) {
+          await respond({ response_type: 'ephemeral', text: 'Connect an org first with `/auditdelta connect`.' });
+          return;
+        }
+        if ((rest[0] ?? 'here').toLowerCase() === 'off') {
+          await slackDb().setSlackDeployChannel(teamId, link.org_id, null);
+          await respond({ response_type: 'in_channel', text: `:mute: Deploy Watch is off for org \`${link.org_id}\`.` });
+          return;
+        }
+        const membership = await ensureInChannel(client, command.channel_id);
+        await slackDb().setSlackDeployChannel(teamId, link.org_id, command.channel_id);
+        await respond({
+          response_type: 'in_channel',
+          text:
+            `:rocket: Deployments and validations for org \`${link.org_id}\` will be followed here — live progress, final status, and an explanation of any failure.` +
+            (membership === 'needs_invite' ? ' This is a private channel: run `/invite @AuditDelta` so I can post here.' : ''),
+        });
+        return;
+      }
       case 'status': {
         const links = await slackDb().getSlackLinksForTeam(teamId);
         const lines = await Promise.all(
@@ -238,7 +261,8 @@ function registerListeners(app: App): void {
               const member = info?.channel?.is_member;
               alerts = `<#${l.alert_channel_id}>${member === false ? ' :warning: I am not in this channel — `/invite @AuditDelta`' : ''}`;
             }
-            return `• \`${l.org_id}\`${l.is_default ? ' (default)' : ''} — alerts: ${alerts}`;
+            const deploys = l.deploy_channel_id ? `<#${l.deploy_channel_id}>` : '_off_';
+            return `• \`${l.org_id}\`${l.is_default ? ' (default)' : ''} — alerts: ${alerts} · deploys: ${deploys}`;
           })
         );
         const text = lines.length ? lines.join('\n') : 'No org connected. Run `/auditdelta connect`.';

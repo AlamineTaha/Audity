@@ -102,6 +102,8 @@ export interface SlackOrgLinkRow {
   team_id: string;
   org_id: string;
   alert_channel_id: string | null;
+  /** Channel for Deploy Watch notifications; null = deploy notifications off. */
+  deploy_channel_id: string | null;
   is_default: boolean;
   linked_by: string | null;
   created_at: Date;
@@ -189,6 +191,7 @@ export class DatabaseService {
           PRIMARY KEY (team_id, org_id)
         )
       `);
+      await client.query(`ALTER TABLE slack_org_links ADD COLUMN IF NOT EXISTS deploy_channel_id VARCHAR(32)`);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS org_job_state (
@@ -457,6 +460,13 @@ export class DatabaseService {
   async getSlackLinksForOrg(orgId: string): Promise<SlackOrgLinkRow[]> {
     const result = await this.pool.query<SlackOrgLinkRow>('SELECT * FROM slack_org_links WHERE org_id = $1', [orgId]);
     return result.rows;
+  }
+
+  async setSlackDeployChannel(teamId: string, orgId: string, channelId: string | null): Promise<void> {
+    await this.pool.query(
+      'UPDATE slack_org_links SET deploy_channel_id = $3 WHERE team_id = $1 AND org_id = $2',
+      [teamId, orgId, channelId]
+    );
   }
 
   async setSlackAlertChannel(teamId: string, orgId: string, channelId: string): Promise<void> {

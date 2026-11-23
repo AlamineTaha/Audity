@@ -12,7 +12,8 @@
     "start": "node dist/index.js",
     "heroku-postbuild": "npm run build",
     "lint": "eslint src/**/*.ts",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "demo": "node demo/run-scenario.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.134.0",

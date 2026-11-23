@@ -13,9 +13,12 @@ import { auditArchiveService, authService, monitorService, privilegeService, set
 import { initTenantAuth } from './middleware/tenantAuth';
 import { initSlackStore } from './slack/store';
 import { notifyReauthRequired } from './slack/alerts';
+import { DeployWatchService } from './deploys/deployWatchService';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const POLLING_ENABLED = String(process.env.POLLING_ENABLED ?? 'true').toLowerCase() === 'true';
+
+const deployWatch = new DeployWatchService();
 
 async function startServer() {
   let server: Server | null = null;
@@ -24,6 +27,7 @@ async function startServer() {
   const shutdown = async (signal: string) => {
     console.log(`${signal} received, shutting down gracefully...`);
     monitorService.stop();
+    deployWatch.stop();
     if (server) {
       server.close((err) => {
         if (err) console.error('Error closing server:', err);
@@ -56,6 +60,12 @@ async function startServer() {
     monitorService.addOrgCycleHook('audit-archive', (orgId) => auditArchiveService.sync(orgId));
     monitorService.addOrgCycleHook('privileged-access', (orgId) => privilegeService.check(orgId));
     console.log('[Startup] Tenant auth middleware initialized');
+
+    // Deploy Watch: follows deployments/validations for orgs with a Slack deploy channel.
+    if (process.env.DEPLOY_WATCH_ENABLED !== 'false') {
+      const intervalSec = parseInt(process.env.DEPLOY_WATCH_INTERVAL_SEC || '60', 10);
+      deployWatch.start(Number.isFinite(intervalSec) && intervalSec >= 15 ? intervalSec : 60);
+    }
 
     // 4. Start change monitoring
     if (POLLING_ENABLED) {
