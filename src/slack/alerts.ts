@@ -1,6 +1,6 @@
 import { authService } from '../services/container';
 import { ensureInChannel, slackClientForTeam } from './app';
-import { alertBlocks } from './blocks';
+import { alertMessage } from './design';
 import { slackDb } from './store';
 
 const THREAD_TTL_SEC = 36 * 60 * 60;
@@ -22,13 +22,8 @@ export async function publishChangeToSlack(orgId: string, text: string, componen
 
     const threadKey = `slack_alert_thread:${link.team_id}:${orgId}:${component}`;
     const threadTs = await authService.getCachedValue(threadKey);
-    const message = {
-      channel,
-      thread_ts: threadTs ?? undefined,
-      text: text.slice(0, 3000),
-      blocks: alertBlocks(text, { orgId, component, category }),
-      unfurl_links: false,
-    };
+    const styled = alertMessage(text, { orgId, category, value: JSON.stringify({ orgId, component, category }).slice(0, 2000) });
+    const message = { channel, thread_ts: threadTs ?? undefined, ...styled, unfurl_links: false };
 
     let result;
     try {

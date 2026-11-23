@@ -58,19 +58,3 @@ export interface AlertRef {
   component: string;
   category: string;
 }
-
-export function alertBlocks(text: string, ref: AlertRef): KnownBlock[] {
-  const value = JSON.stringify(ref).slice(0, 2000);
-  return [
-    ...mrkdwnSections(text),
-    {
-      type: 'actions',
-      block_id: 'alert_actions',
-      elements: [
-        { type: 'button', text: { type: 'plain_text', text: 'Explain impact' }, action_id: 'auditdelta_explain', value },
-        { type: 'button', text: { type: 'plain_text', text: 'Acknowledge' }, action_id: 'auditdelta_ack', value },
-      ],
-    },
-    contextBlock(`AuditDelta · ${ref.category} · org ${ref.orgId}`),
-  ];
-}

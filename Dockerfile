@@ -21,8 +21,6 @@ FROM node:22-alpine AS runtime
 
 WORKDIR /app
 
-# Alpine ships no fonts; chart PNGs (resvg) need one to render any text.
-RUN apk add --no-cache font-dejavu
 
 # Copy package files
 COPY package.json package-lock.json* ./
@@ -32,6 +30,9 @@ RUN npm ci --omit=dev
 
 # Copy compiled output from builder
 COPY --from=builder /app/dist ./dist
+
+# Bundled Inter font: charts render identically everywhere without system fonts.
+COPY assets ./assets
 
 # Expose port (Heroku sets PORT; default 3000 for local)
 ENV PORT=3000

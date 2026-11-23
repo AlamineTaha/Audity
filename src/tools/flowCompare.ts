@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { authService, salesforceService, aiService } from '../services/container';
+import { flowDiagramImages } from '../charts/flowDiagram';
 import { defineTool, ok, fail, zInt, zBool } from './types';
 
 export const compareFlowVersionsTool = defineTool({
@@ -88,8 +89,10 @@ export const compareFlowVersionsTool = defineTool({
       const flowUrl = `${settings.instanceUrl}/builder_platform_interaction/flowBuilder.app?flowDefId=${versions.definitionId}`;
       const displayText = `Flow: ${versions.label} — Version ${older.version} vs Version ${newer.version}\n\n${comparison}\n\nOpen in Flow Builder: ${flowUrl}`;
 
+      const images = await flowDiagramImages(versions.developerName, older.metadata, newer.metadata, older.version, newer.version);
+
       console.log(`[CompareFlow][SUCCESS] orgId=${orgId} flowName=${flowName} mode=compare`);
-      return ok({ displayText });
+      return { ...ok({ displayText }), images };
     } catch (error) {
       console.error('[CompareFlow][UNHANDLED] Error in compare-flow-versions endpoint:', error);
       return fail(500, error instanceof Error ? error.message : 'Internal server error');
