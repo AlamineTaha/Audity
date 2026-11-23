@@ -203,6 +203,17 @@ export class DatabaseService {
         )
       `);
       await client.query(`
+        CREATE TABLE IF NOT EXISTS deploy_watch_state (
+          org_id      VARCHAR(18) NOT NULL,
+          deploy_id   VARCHAR(18) NOT NULL,
+          messages    JSONB NOT NULL DEFAULT '[]',
+          fingerprint TEXT NOT NULL DEFAULT '',
+          final       BOOLEAN NOT NULL DEFAULT FALSE,
+          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (org_id, deploy_id)
+        )
+      `);
+      await client.query(`
         CREATE TABLE IF NOT EXISTS privileged_access (
           org_id        VARCHAR(18) NOT NULL,
           user_id       VARCHAR(18) NOT NULL,
@@ -492,6 +503,34 @@ export class DatabaseService {
        ON CONFLICT (org_id, job) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
       [orgId, job, value]
     );
+  }
+
+  // --------------- Deploy Watch ---------------
+
+  async getDeployWatchState<T>(orgId: string, deployId: string): Promise<T | null> {
+    const result = await this.pool.query<{ messages: unknown; fingerprint: string; final: boolean }>(
+      'SELECT messages, fingerprint, final FROM deploy_watch_state WHERE org_id = $1 AND deploy_id = $2',
+      [orgId, deployId]
+    );
+    return (result.rows[0] as T | undefined) ?? null;
+  }
+
+  async saveDeployWatchState(orgId: string, deployId: string, state: { messages: unknown; fingerprint: string; final: boolean }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO deploy_watch_state (org_id, deploy_id, messages, fingerprint, final, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (org_id, deploy_id) DO UPDATE SET
+         messages = EXCLUDED.messages, fingerprint = EXCLUDED.fingerprint, final = EXCLUDED.final, updated_at = NOW()`,
+      [orgId, deployId, JSON.stringify(state.messages), state.fingerprint, state.final]
+    );
+  }
+
+  async pruneDeployWatchState(olderThanDays: number): Promise<number> {
+    const result = await this.pool.query(
+      `DELETE FROM deploy_watch_state WHERE updated_at < NOW() - make_interval(days => $1)`,
+      [olderThanDays]
+    );
+    return result.rowCount ?? 0;
   }
 
   // --------------- Privileged access snapshot ---------------

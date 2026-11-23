@@ -302,6 +302,28 @@ const scenarios = {
         'classes/AD_Test_LeadRouterService.cls-meta.xml': apexMeta,
       }),
   },
+  'deploy-big': {
+    about: 'Check-only validation of many classes, long enough to watch the live progress (nothing is saved)',
+    expect: 'Deploy channel: live message with ticking clock, progress bar and component feed, then ✅ + Quick deploy button',
+    run: () => {
+      const count = Number(process.env.DEMO_BIG_COUNT || 200);
+      const files = {};
+      for (let i = 1; i <= count; i++) {
+        const name = `AD_Test_Batch_${String(i).padStart(3, '0')}`;
+        files[`classes/${name}.cls`] = `public with sharing class ${name} {
+    public static Integer weight(Lead l) {
+        Integer w = ${i};
+        if (l.Rating == 'Hot') w += 10;
+        if (String.isNotBlank(l.Phone)) w += 5;
+        return w;
+    }
+}
+`;
+        files[`classes/${name}.cls-meta.xml`] = apexMeta;
+      }
+      validate(files);
+    },
+  },
   'deploy-ok': {
     about: 'Check-only validation that succeeds (nothing is saved)',
     expect: 'Deploy channel: ":white_check_mark: Validation succeeded · ready to quick deploy"',
@@ -352,7 +374,7 @@ function findAssignment() {
 const stories = {
   story: ['flow-risky', 'vr-change', 'formula-change', 'apex-change'],
   'story-fix': ['flow-fix', 'flow-normal'],
-  'story-deploy': ['deploy-ok', 'deploy-fail'],
+  'story-deploy': ['deploy-big', 'deploy-fail'],
 };
 
 function help() {
